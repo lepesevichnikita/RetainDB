@@ -435,6 +435,22 @@ If `RETAINDB_API_KEY` is set, protected deployments require `Authorization: Bear
 | `POST` | `/v1/sources/:id/sync` | Trigger source sync |
 | `GET` | `/v1/sources/:id` | Inspect source status |
 
+Server graph endpoints:
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/v1/entities` | Create or update a project entity and store its embedding in pgvector |
+| `POST` | `/v1/relations` | Create or update an edge between project entities |
+| `POST` | `/v1/graph/search` | Find up to `top_k` embedded seeds and follow up to 50 edges per hop in both directions, for 1–3 hops; traversal-only entities have score `0` |
+| `GET` | `/v1/memory/graph` | Return memory nodes, stored relationships, and chronological session edges |
+| `GET` | `/v1/memory/graph/conversation/:sessionId` | Read the same memory graph for one conversation |
+
+In `/v1/context/query`, `include_graph: true` adds chunks linked by the entity graph and preserves the matched entities and relationships in each result's `metadata.graph`, even if vector or lexical search found the same chunk. `graph_depth` accepts 1–3. Graph queries bypass the response cache and respect project, source, chunk-type, metadata, and active-version filters.
+
+Entity and edge IDs are stable within the project. Extraction records claims per source chunk, so staged, failed, superseded, and deleted content does not replace the active graph. Graph search, export, and entity counts use the same visibility rule. Manually written entities and edges remain independent of source versions; extraction does not replace their annotations.
+
+Entity extraction runs only on eligible documents ingested with automatic extraction enabled and a configured inference provider. Native hook capture skips it. The migration preserves existing graph rows and backfills explicit legacy entity-to-chunk links. Old automatic edges without recorded provenance stay hidden until extraction confirms them. The migration does not extract from existing documents, and importing vector embeddings alone does not create graph edges.
+
 Local-only runtime endpoints:
 
 | Method | Path | Description |
@@ -515,6 +531,7 @@ The self-hosted server can index external knowledge sources into agent context:
 | `OPENAI_API_KEY` | unset | Enables OpenAI-backed server embeddings |
 | `EMBEDDING_MODE` | `auto` | Server embedding mode |
 | `EXTRACTION_MODEL` | `gpt-4o-mini` | Server extraction model |
+| `DISABLE_AUTO_EXTRACTION` | `false` | Skip automatic entity extraction during document ingestion |
 | `PORT` | `3000` | Server HTTP port |
 | `DISABLE_SCHEDULER` | `false` | Disable server background sync |
 

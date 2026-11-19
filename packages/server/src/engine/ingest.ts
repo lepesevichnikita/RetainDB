@@ -250,8 +250,9 @@ export async function ingestDocument(input: IngestDocumentInput) {
 
     for (const chunk of searchableChunks) {
       const stored = insertedLeafChunkIds.find((entry) => entry.tempId === chunk.tempId);
-      extractEntities(projectId, chunk.content, chunk.chunkType, chunk.metadata, stored?.chunkId).catch((error) => {
-        console.warn(`[Ingest] Entity extraction failed for chunk ${stored?.chunkId ?? chunk.tempId} (non-critical, continuing):`, error?.message ?? error);
+      if (!stored) continue;
+      extractEntities(projectId, stored.chunkId, chunk.content, chunk.chunkType).catch((error) => {
+        console.warn(`[Ingest] Entity extraction failed for chunk ${stored.chunkId} (non-critical, continuing):`, error?.message ?? error);
       });
     }
   }

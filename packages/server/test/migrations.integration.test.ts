@@ -39,6 +39,15 @@ async function migrateDeploy(url: URL) {
   });
 }
 
+async function applyMigrationsBefore(client: ReturnType<typeof postgres>, stopAt: string) {
+  const migrations = (await readdir(migrationRoot, { withFileTypes: true }))
+    .filter((entry) => entry.isDirectory() && entry.name < stopAt)
+    .map((entry) => entry.name).sort();
+  for (const migration of migrations) {
+    await client.unsafe(await readFile(new URL(`${migration}/migration.sql`, migrationRoot), "utf8")).simple();
+  }
+}
+
 run("migrate deploy creates a complete schema and provisions the default organization", { timeout: 60_000 }, async () => {
   await withDatabase(async (url, client) => {
     await migrateDeploy(url);
@@ -79,13 +88,7 @@ run("the package registry migration is idempotent over an existing table", { tim
 
 run("bootstrap preserves an organization that already occupies the default slug", { timeout: 60_000 }, async () => {
   await withDatabase(async (_url, client) => {
-    const migrations = (await readdir(migrationRoot, { withFileTypes: true }))
-      .filter((entry) => entry.isDirectory() && entry.name < preparation)
-      .map((entry) => entry.name)
-      .sort();
-    for (const migration of migrations) {
-      await client.unsafe(await readFile(new URL(`${migration}/migration.sql`, migrationRoot), "utf8")).simple();
-    }
+    await applyMigrationsBefore(client, preparation);
     await client`INSERT INTO users (id, email, "updatedAt") VALUES ('owner', 'owner@example.test', NOW())`;
     await client`INSERT INTO organizations (id, name, slug, "ownerId", "updatedAt")
       VALUES ('existing', 'Existing', 'default', 'owner', NOW())`;
@@ -100,9 +103,49 @@ run("bootstrap preserves an organization that already occupies the default slug"
     assert.equal(rows[0].ownerId, null);
     assert.equal(rows[1].slug, "default");
     await assert.rejects(
-      client`INSERT INTO organizations (id, name, slug, "ownerId", "updatedAt")
-        VALUES ('invalid', 'Invalid', 'invalid', NULL, NOW())`,
+      client`INSERT INTO organizations (id, name, slug, "ownerId", "updatedAt") VALUES ('invalid', 'Invalid', 'invalid', NULL, NOW())`,
       (error: unknown) => error instanceof Error && "code" in error && error.code === "23514",
     );
+  });
+});
+
+run("graph migration preserves legacy rows without inventing edge provenance", { timeout: 60_000 }, async () => {
+  await withDatabase(async (_url, client) => {
+    const migration = "20261119000000_entity_graph_provenance";
+    await applyMigrationsBefore(client, migration);
+    const embedding = `[1,${Array<number>(1023).fill(0).join(",")}]`;
+    await client`INSERT INTO projects (id, "orgId", name, slug, "updatedAt") VALUES ('p', 'default', 'Legacy', 'legacy', NOW())`;
+    await client`INSERT INTO sources (id, "projectId", "orgId", name, type, "updatedAt") VALUES ('s', 'p', 'default', 'Guide', 'text', NOW())`;
+    await client`INSERT INTO documents (id, "sourceId", "projectId", title, "updatedAt") VALUES ('d', 's', 'p', 'Guide', NOW())`;
+    await client`INSERT INTO chunks (id, "projectId", "documentId", content, "updatedAt") VALUES ('c', 'p', 'd', 'Restore the snapshot', NOW())`;
+    await client`
+      INSERT INTO entities (id, "projectId", name, type, "entityType", description, "sourceChunkId", embedding, "updatedAt")
+      VALUES ('manual', 'p', 'Manual', 'concept', 'concept', NULL, NULL, ${embedding}::vector, NOW()),
+        ('a', 'p', 'Snapshot', 'concept', 'concept', 'Snapshot description', 'c', ${embedding}::vector, NOW()),
+        ('b', 'p', 'Checksum', 'concept', 'concept', NULL, 'c', NULL, NOW())
+    `;
+    await client`
+      INSERT INTO entity_relations (id, "projectId", "fromEntityId", "toEntityId", "relationType", metadata)
+      VALUES ('derived', 'p', 'a', 'b', 'references', '{"autoExtracted":true}'),
+        ('annotated', 'p', 'manual', 'a', 'references', '{"reviewed":true}')
+    `;
+
+    const sql = await readFile(new URL(`${migration}/migration.sql`, migrationRoot), "utf8");
+    await client.unsafe(sql).simple();
+    const entities = await client`SELECT id, "isManual" FROM entities ORDER BY id`;
+    assert.deepEqual([...entities], [{ id: "a", isManual: false }, { id: "b", isManual: false }, { id: "manual", isManual: true }]);
+    const [mention] = await client`SELECT "chunkId", description, vector_dims(embedding) AS dimensions FROM entity_mentions WHERE "entityId" = 'a'`;
+    assert.deepEqual(mention, { chunkId: "c", description: "Snapshot description", dimensions: 1024 });
+    assert.equal((await client`SELECT "relationId" FROM entity_relation_mentions`).length, 0);
+
+    // The upgrade must not recreate claims removed after migration.
+    await client`DELETE FROM entity_mentions WHERE "entityId" = 'a'`;
+    await client.unsafe(sql).simple();
+    assert.deepEqual([...(await client`SELECT "entityId" FROM entity_mentions`)], [{ entityId: "b" }]);
+    const relations = await client`SELECT id, metadata, "isManual" FROM entity_relations ORDER BY id`;
+    assert.deepEqual([...relations], [
+      { id: "annotated", metadata: { reviewed: true }, isManual: true },
+      { id: "derived", metadata: { autoExtracted: true }, isManual: false },
+    ]);
   });
 });

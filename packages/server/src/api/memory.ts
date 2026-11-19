@@ -1802,6 +1802,8 @@ memoryRoutes.get(
   }
 );
 
+const memoryGraphLimit = z.string().regex(/^-?\d+$/).transform((value) => Math.min(Math.max(Number(value), 1), 1000));
+
 // Memory Graph - Node/edge graph for visualization and debugging
 memoryRoutes.get(
   "/v1/memory/graph",
@@ -1813,7 +1815,7 @@ memoryRoutes.get(
       user_id: z.string().optional(),
       session_id: z.string().optional(),
       include_inactive: z.string().optional(),
-      limit: z.string().optional(),
+      limit: memoryGraphLimit.default("300"),
     })
   ),
   async (c) => {
@@ -1824,7 +1826,6 @@ memoryRoutes.get(
       const project = await ensureProject(auth.orgId, query.project, auth.isAdmin);
 
       const includeInactive = query.include_inactive === "true";
-      const limit = Math.min(Math.max(parseInt(query.limit || "300", 10), 1), 1000);
 
       const memories = await prisma.memory.findMany({
         where: {
@@ -1834,7 +1835,7 @@ memoryRoutes.get(
           ...(includeInactive ? {} : { isActive: true }),
         },
         orderBy: { createdAt: "desc" },
-        take: limit,
+        take: query.limit,
         select: {
           id: true,
           content: true,
@@ -1864,15 +1865,8 @@ memoryRoutes.get(
       }
 
       const memoryIds = memories.map((m) => m.id);
-      const idSet = new Set(memoryIds);
-
-      const relationEdgesRaw = await prisma.memoryRelation.findMany({
-        where: {
-          OR: [
-            { fromMemoryId: { in: memoryIds } },
-            { toMemoryId: { in: memoryIds } },
-          ],
-        },
+      const relations = await prisma.memoryRelation.findMany({
+        where: { fromMemoryId: { in: memoryIds }, toMemoryId: { in: memoryIds } },
         select: {
           id: true,
           fromMemoryId: true,
@@ -1883,17 +1877,15 @@ memoryRoutes.get(
         },
       });
 
-      const relationEdges = relationEdgesRaw
-        .filter((r) => idSet.has(r.fromMemoryId) && idSet.has(r.toMemoryId))
-        .map((r) => ({
-          id: r.id,
-          source: r.fromMemoryId,
-          target: r.toMemoryId,
-          type: r.relationType,
-          confidence: r.confidence,
-          reasoning: r.reasoning,
-          layer: "relation",
-        }));
+      const relationEdges = relations.map((r) => ({
+        id: r.id,
+        source: r.fromMemoryId,
+        target: r.toMemoryId,
+        type: r.relationType,
+        confidence: r.confidence,
+        reasoning: r.reasoning,
+        layer: "relation",
+      }));
 
       // Build lightweight chronological "conversation flow" edges.
       const bySession = new Map<string, typeof memories>();
@@ -1976,7 +1968,7 @@ memoryRoutes.get(
     z.object({
       project: z.string().optional(),
       include_inactive: z.string().optional(),
-      limit: z.string().optional(),
+      limit: memoryGraphLimit.optional(),
     })
   ),
   async (c) => {
@@ -1988,7 +1980,7 @@ memoryRoutes.get(
     if (query.project) target.searchParams.set("project", query.project);
     target.searchParams.set("session_id", sessionId);
     if (query.include_inactive) target.searchParams.set("include_inactive", query.include_inactive);
-    if (query.limit) target.searchParams.set("limit", query.limit);
+    if (query.limit !== undefined) target.searchParams.set("limit", String(query.limit));
 
     return c.redirect(target.toString(), 307);
   }

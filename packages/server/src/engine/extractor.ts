@@ -1,39 +1,43 @@
+import { z } from "zod";
 import { getOpenAIClient } from "./openai-client.js";
-import { prisma } from "../db/index.js";
-import { embedSingle } from "./embeddings.js";
+import { entityRelationType, saveChunkGraph, type ChunkGraph } from "./entity-graph-write.js";
 import { writeMemoryCanonical } from "./memory/write.js";
 
 // ═══════════════════════════════════════════════════════════════
 // ENTITY EXTRACTION (runs during ingestion)
 // ═══════════════════════════════════════════════════════════════
 
-interface ExtractedEntity {
-  name: string;
-  type: string; // function, class, module, concept, api_endpoint, config, service, etc.
-  description: string;
+const entityClaims = z.object({
+  entities: z.array(z.object({
+    name: z.string().trim().min(1), type: z.string().trim().min(1), description: z.string().optional(),
+  })),
+  relations: z.array(z.object({
+    from: z.string(), fromType: z.string(), to: z.string(), toType: z.string(), relation: z.string(),
+  })),
+});
+
+function parseGraphClaims(value: unknown): ChunkGraph {
+  const claims = entityClaims.parse(value);
+  return {
+    entities: claims.entities.slice(0, 20).map(({ type, ...entity }) => ({ ...entity, entityType: type })),
+    relations: claims.relations.slice(0, 30).flatMap(toGraphRelation),
+  };
 }
 
-interface ExtractedRelation {
-  from: string;
-  fromType: string;
-  to: string;
-  toType: string;
-  relation: string; // imports, calls, extends, depends_on, etc.
+function toGraphRelation({ from, fromType, to, toType, relation }: z.infer<typeof entityClaims>["relations"][number]) {
+  const type = entityRelationType.safeParse(relation);
+  if (!type.success) return [];
+  return [{
+    from: { name: from.trim(), entityType: fromType.trim() },
+    to: { name: to.trim(), entityType: toType.trim() },
+    type: type.data,
+  }];
 }
 
-export async function extractEntities(
-  projectId: string,
-  content: string,
-  chunkType: string,
-  metadata: Record<string, any> = {},
-  chunkId?: string
-): Promise<{ entities: number; relations: number }> {
-  // Skip small chunks
-  if (content.length < 100) return { entities: 0, relations: 0 };
-
+function entityPrompt(content: string, chunkType: string) {
   const isCode = ["code", "function", "class"].includes(chunkType);
 
-  const prompt = isCode
+  return isCode
     ? `Analyze this code and extract entities and relationships.
 
 Entities: functions, classes, interfaces, types, modules, variables, constants, API endpoints, services.
@@ -59,102 +63,18 @@ Respond with JSON only:
   "entities": [{"name": "...", "type": "concept|tool|service|api|technology|person|organization", "description": "one line"}],
   "relations": [{"from": "name", "fromType": "type", "to": "name", "toType": "type", "relation": "references|depends_on|related_to|part_of|supersedes"}]
 }`;
+}
 
-  try {
-    const res = await getOpenAIClient().chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0,
-      max_tokens: 1000,
-      response_format: { type: "json_object" },
-    });
-
-    const text = res.choices[0]?.message?.content?.trim() || "{}";
-    const parsed = JSON.parse(text);
-
-    const extractedEntities: ExtractedEntity[] = parsed.entities || [];
-    const extractedRelations: ExtractedRelation[] = parsed.relations || [];
-
-    let entityCount = 0;
-    let relationCount = 0;
-
-    // Upsert entities
-    const entityMap = new Map<string, string>(); // name:type -> id
-
-    for (const ent of extractedEntities.slice(0, 20)) {
-      if (!ent.name || !ent.type) continue;
-
-      const embedding = await embedSingle(`${ent.type}: ${ent.name} - ${ent.description || ""}`);
-      const embeddingStr = `[${embedding.join(",")}]`;
-
-      try {
-        await prisma.$queryRaw`
-          INSERT INTO "entities" (
-            id, "projectId", name, "entityType", description, "sourceChunkId", embedding,
-            "createdAt", "updatedAt"
-          )
-          VALUES (
-            gen_random_uuid(), ${projectId}, ${ent.name}, ${ent.type}, ${ent.description || ""},
-            ${chunkId || null}, ${embeddingStr}::vector, NOW(), NOW()
-          )
-          ON CONFLICT ("projectId", name, "entityType")
-          DO UPDATE SET
-            description = EXCLUDED.description,
-            "sourceChunkId" = EXCLUDED."sourceChunkId",
-            embedding = EXCLUDED.embedding,
-            "updatedAt" = NOW()
-        `;
-        entityMap.set(`${ent.name}:${ent.type}`, ent.name);
-        entityCount++;
-      } catch (err: any) {
-        console.error("[Extractor] Error upserting entity:", err.message);
-      }
-    }
-
-    // Upsert relations
-    for (const rel of extractedRelations.slice(0, 30)) {
-      if (!rel.from || !rel.to || !rel.relation) continue;
-
-      const fromId = entityMap.get(`${rel.from}:${rel.fromType}`);
-      const toId = entityMap.get(`${rel.to}:${rel.toType}`);
-
-      if (!fromId || !toId) continue;
-
-      // Validate relation type
-      const validRelations = [
-        "imports", "exports", "calls", "implements", "extends",
-        "references", "depends_on", "related_to", "part_of",
-        "contradicts", "supersedes",
-      ];
-      if (!validRelations.includes(rel.relation)) continue;
-
-      await prisma.entityRelation.upsert({
-        where: {
-          fromEntityId_toEntityId_relationType: {
-            fromEntityId: fromId,
-            toEntityId: toId,
-            relationType: rel.relation,
-          },
-        },
-        update: {
-          metadata: { autoExtracted: true },
-        },
-        create: {
-          projectId,
-          fromEntityId: fromId,
-          toEntityId: toId,
-          relationType: rel.relation,
-          metadata: { autoExtracted: true },
-        },
-      });
-
-      relationCount++;
-    }
-
-    return { entities: entityCount, relations: relationCount };
-  } catch {
-    return { entities: 0, relations: 0 };
-  }
+export async function extractEntities(projectId: string, chunkId: string, content: string, chunkType: string) {
+  const result = await getOpenAIClient().chat.completions.create({
+    model: process.env.EXTRACTION_MODEL || "gpt-4o-mini",
+    messages: [{ role: "user", content: entityPrompt(content, chunkType) }],
+    temperature: 0,
+    max_tokens: 1000,
+    response_format: { type: "json_object" },
+  });
+  const claims = parseGraphClaims(JSON.parse(result.choices[0]?.message?.content ?? "{}"));
+  return saveChunkGraph(projectId, chunkId, claims);
 }
 
 // ═══════════════════════════════════════════════════════════════

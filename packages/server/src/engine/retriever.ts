@@ -9,6 +9,7 @@ import { getFromCache, setInCache } from "./cache.js";
 import { recordRetrievalWorkloadSample, recordStageBreakdown } from "./latency-tracing.js";
 import { rerankWithInferenceService } from "./inference-client.js";
 import { selectOracleCandidateChunkIds } from "./oracle-select.js";
+import { searchGraphChunks } from "./entity-graph.js";
 
 let openaiClient: OpenAI | null = null;
 
@@ -212,6 +213,7 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
 
   const startTime = Date.now();
   const timing: NonNullable<ContextResponse["meta"]["timing"]> = {};
+  const cacheResults = useCache && !includeGraph;
   const cacheParams = {
     query,
     topK,
@@ -264,7 +266,7 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
       };
 
   // ─── Check Cache ─────────────────────────────────────────
-  if (useCache) {
+  if (cacheResults) {
     const t0 = Date.now();
     const cached = await checkCache(projectId, cacheParams);
     timing.cache_check_ms = Date.now() - t0;
@@ -458,14 +460,19 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
   }
 
   // ─── Graph Traversal ─────────────────────────────────────
+  let graph: Awaited<ReturnType<typeof searchGraphChunks>> | undefined;
   if (includeGraph) {
     const tGraph = Date.now();
-    const graphResults = await graphSearch(projectId, queryEmbedding, {
-      depth: Math.min(graphDepth, 2),
+    graph = await searchGraphChunks({
+      projectId,
+      embedding: queryEmbedding,
+      depth: graphDepth,
       topK: Math.min(Math.ceil(topK / 3), 10),
+      primaryChunkIds: [...new Set(allResults.filter((hit) => hit.source !== "memory" && hit.score >= threshold).map(({ id }) => id))],
+      chunkScope: { sourceIds: scopedSourceIds, chunkTypes, metadataFilter },
     });
     timing.graph_ms = Date.now() - tGraph;
-    allResults.push(...graphResults);
+    allResults.push(...graph.results);
   }
 
   // Cap candidate churn to keep worst-case work bounded.
@@ -539,6 +546,7 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
 
   // ─── Context packing ─────────────────────────────────────
   allResults = allResults.slice(0, topK);
+  if (graph) allResults = attachGraphEvidence(allResults, graph.evidence);
 
   const tPack = Date.now();
   let context = packContext(allResults, maxTokens);
@@ -565,7 +573,7 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
   }
 
   // ─── Cache results ───────────────────────────────────────
-  if (useCache && allResults.length > 0) {
+  if (cacheResults && allResults.length > 0) {
     const tSet = Date.now();
     await setCache(projectId, cacheParams, allResults, cacheTtlSeconds);
     timing.cache_set_ms = Date.now() - tSet;
@@ -1295,85 +1303,6 @@ async function memorySearch(
   }));
 }
 
-// ─── Graph Search ────────────────────────────────────────────
-
-async function graphSearch(
-  projectId: string,
-  queryEmbedding: number[],
-  opts: { depth: number; topK: number }
-): Promise<RetrievalResult[]> {
-  const embeddingStr = `[${queryEmbedding.join(",")}]`;
-
-  // Find most relevant entities using vector search
-  const relevantEntities = await prisma.$queryRaw`
-    SELECT
-      id, name, "entityType", description, metadata, "sourceChunkId",
-      1 - (embedding <=> ${embeddingStr}::vector) as similarity
-    FROM entities
-    WHERE "projectId" = ${projectId}
-    ORDER BY embedding <=> ${embeddingStr}::vector
-    LIMIT 5
-  `;
-
-  if ((relevantEntities as any[]).length === 0) return [];
-
-  // Traverse relationships
-  const entityIds = (relevantEntities as any[]).map((e) => e.id);
-
-  const relatedEntities = await prisma.$queryRaw`
-    SELECT
-      e.id, e.name, e."entityType", e.description, e.metadata, e."sourceChunkId",
-      er."relationType", er.weight
-    FROM entity_relations er
-    INNER JOIN entities e ON er."toEntityId" = e.id
-    WHERE er."projectId" = ${projectId}
-      AND er."fromEntityId" = ANY(${entityIds})
-    LIMIT ${opts.topK}
-  `;
-
-  // Get chunks for related entities
-  const chunkIds = [
-    ...(relevantEntities as any[]).map((e) => e.sourceChunkId).filter(Boolean),
-    ...(relatedEntities as any[]).map((e) => e.sourceChunkId).filter(Boolean),
-  ] as string[];
-
-  if (chunkIds.length === 0) return [];
-
-  const relatedChunks = await prisma.$queryRaw<any[]>`
-    SELECT
-      c.id,
-      c.content,
-      c.metadata,
-      c."chunkType"
-    FROM chunks c
-    INNER JOIN documents d ON d.id = c."documentId"
-    INNER JOIN sources s ON s.id = d."sourceId"
-    WHERE c.id = ANY(${chunkIds})
-      AND d."deletedAt" IS NULL
-      AND (
-        s."activeVersionId" IS NULL
-        OR d."sourceVersionId" = s."activeVersionId"
-      )
-    LIMIT ${opts.topK}
-  `;
-
-  return relatedChunks.map((c) => {
-    const entity = (relevantEntities as any[]).find((e) => e.sourceChunkId === c.id);
-    return {
-      id: c.id,
-      content: c.content,
-      score: entity ? entity.similarity * 0.8 : 0.5,
-      metadata: {
-        ...(c.metadata as any),
-        entityName: entity?.name,
-        entityType: entity?.entityType,
-      },
-      chunkType: c.chunkType || "text",
-      source: "graph" as const,
-    };
-  });
-}
-
 // ─── Reciprocal Rank Fusion ──────────────────────────────────
 
 function reciprocalRankFusion(
@@ -1573,6 +1502,13 @@ ${candidates.map((r, i) => `[${i}] ${r.content.slice(0, 300)}`).join("\n\n")}`;
 }
 
 // ─── Deduplication ───────────────────────────────────────────
+
+function attachGraphEvidence(results: RetrievalResult[], evidence: Awaited<ReturnType<typeof searchGraphChunks>>["evidence"]) {
+  return results.map((result) => {
+    const graph = result.source === "memory" ? undefined : evidence.get(result.id);
+    return graph ? { ...result, metadata: { ...result.metadata, graph } } : result;
+  });
+}
 
 function deduplicateResults(results: RetrievalResult[]): RetrievalResult[] {
   const seen = new Map<string, RetrievalResult>();

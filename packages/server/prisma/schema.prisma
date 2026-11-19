@@ -204,6 +204,8 @@ model Chunk {
   embeddings    Embedding[]
   chunkMemories ChunkMemory[]
   memories      Memory[]      @relation("MemorySourceChunk")
+  entityMentions EntityMention[]
+  entityRelationMentions EntityRelationMention[]
 
   @@index([documentId])
   @@index([contentHash])
@@ -330,6 +332,7 @@ model Entity {
   description String?
   aliases    String[]               @default([])
   embedding  Unsupported("vector")?
+  isManual   Boolean                @default(true)
   metadata   Json                   @default("{}")
   createdAt  DateTime               @default(now())
   updatedAt  DateTime               @updatedAt
@@ -338,6 +341,7 @@ model Entity {
   project          Project?         @relation(fields: [projectId], references: [id], onDelete: Cascade)
   outgoingRelations EntityRelation[] @relation("EntityFrom")
   incomingRelations EntityRelation[] @relation("EntityTo")
+  mentions EntityMention[]
 
   @@unique([projectId, name, entityType])
   @@index([projectId])
@@ -353,15 +357,41 @@ model EntityRelation {
   relationType String
   weight       Float    @default(1.0)
   metadata     Json     @default("{}")
+  isManual     Boolean  @default(true)
   createdAt    DateTime @default(now())
 
   project    Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
   fromEntity Entity   @relation("EntityFrom", fields: [fromEntityId], references: [id], onDelete: Cascade)
   toEntity   Entity   @relation("EntityTo", fields: [toEntityId], references: [id], onDelete: Cascade)
+  mentions   EntityRelationMention[]
 
   @@unique([fromEntityId, toEntityId, relationType])
   @@index([projectId])
   @@map("entity_relations")
+}
+
+model EntityMention {
+  entityId    String
+  chunkId     String
+  description String?
+  embedding   Unsupported("vector")?
+  entity      Entity @relation(fields: [entityId], references: [id], onDelete: Cascade)
+  chunk       Chunk  @relation(fields: [chunkId], references: [id], onDelete: Cascade)
+
+  @@id([entityId, chunkId])
+  @@index([chunkId])
+  @@map("entity_mentions")
+}
+
+model EntityRelationMention {
+  relationId String
+  chunkId    String
+  relation   EntityRelation @relation(fields: [relationId], references: [id], onDelete: Cascade)
+  chunk      Chunk          @relation(fields: [chunkId], references: [id], onDelete: Cascade)
+
+  @@id([relationId, chunkId])
+  @@index([chunkId])
+  @@map("entity_relation_mentions")
 }
 
 // ── Sessions & Messages ───────────────────────────────────────────────────────

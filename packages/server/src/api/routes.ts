@@ -28,6 +28,8 @@ import { syncWeb } from "../connectors/web.js";
 import { ingestDocument } from "../engine/ingest.js";
 import { fireWebhookEvent } from "../engine/webhooks.js";
 import { embedSingle } from "../engine/embeddings.js";
+import { ensureGraphEntityId, entityRelationType, saveGraphEntity, saveGraphRelation } from "../engine/entity-graph-write.js";
+import { countGraphEntities, searchEntityGraph } from "../engine/entity-graph.js";
 import { ingestSession as ingestMemorySession, searchMemories } from "../engine/memory/index.js";
 import { writeMemoryCanonical } from "../engine/memory/write.js";
 import { nanoid } from "nanoid";
@@ -1658,7 +1660,7 @@ api.get("/v1/projects/:id/stats", async (c) => {
     prisma.chunk.count({ where: { document: { projectId: project.id } } }),
     prisma.source.count({ where: { projectId: project.id } }),
     prisma.memory.count({ where: { projectId: project.id, isActive: true } }),
-    prisma.entity.count({ where: { projectId: project.id } }),
+    countGraphEntities(project.id),
   ]);
 
   return c.json({
@@ -3052,187 +3054,73 @@ api.post(
 
 api.post(
   "/v1/entities",
-  zValidator(
-    "json",
-    z.object({
-      project: z.string().optional(),
-      name: z.string().min(1),
-      entity_type: z.string().min(1),
-      description: z.string().optional(),
-      metadata: z.record(z.any()).optional(),
-    })
-  ),
+  zValidator("json", z.object({
+    project: z.string().optional(),
+    name: z.string().min(1),
+    entity_type: z.string().min(1),
+    description: z.string().optional(),
+    metadata: z.record(z.any()).optional(),
+  })),
   async (c) => {
-    const auth = c.get("auth") as AuthContext;
+    const auth = c.get("auth");
     const body = c.req.valid("json");
-
     const project = await ensureProject(auth.orgId, body.project, auth.isAdmin);
-
-    const embedding = await embedSingle(`${body.entity_type}: ${body.name}${body.description ? ` - ${body.description}` : ""}`);
-
-    const entity = await prisma.entity.upsert({
-      where: {
-        projectId_name_entityType: {
-          projectId: project.id,
-          name: body.name,
-          entityType: body.entity_type,
-        },
-      },
-      update: {
-        description: body.description,
-        metadata: body.metadata || {},
-        embedding,
-        updatedAt: new Date(),
-      } as any,
-      create: {
-        projectId: project.id,
-        name: body.name,
-        entityType: body.entity_type,
-        description: body.description,
-        metadata: body.metadata || {},
-        embedding,
-      } as any,
+    const entity = await saveGraphEntity({
+      projectId: project.id, name: body.name, entityType: body.entity_type,
+      description: body.description, metadata: body.metadata,
     });
-
     return c.json(entity, 201);
   }
 );
 
 api.post(
   "/v1/relations",
-  zValidator(
-    "json",
-    z.object({
-      project: z.string().optional(),
-      from_entity: z.string(),
-      from_type: z.string(),
-      to_entity: z.string(),
-      to_type: z.string(),
-      relation_type: z.enum([
-        "imports", "exports", "calls", "implements", "extends",
-        "references", "depends_on", "related_to", "part_of",
-        "contradicts", "supersedes",
-      ]),
-      weight: z.number().min(0).max(1).optional(),
-      metadata: z.record(z.any()).optional(),
-    })
-  ),
+  zValidator("json", z.object({
+    project: z.string().optional(),
+    from_entity: z.string().min(1),
+    from_type: z.string().min(1),
+    to_entity: z.string().min(1),
+    to_type: z.string().min(1),
+    relation_type: entityRelationType,
+    weight: z.number().min(0).max(1).optional(),
+    metadata: z.record(z.any()).optional(),
+  })),
   async (c) => {
-    const auth = c.get("auth") as AuthContext;
+    const auth = c.get("auth");
     const body = c.req.valid("json");
-
     const project = await ensureProject(auth.orgId, body.project, auth.isAdmin);
-
-    // Find or create entities
-    const findOrCreateEntity = async (name: string, type: string) => {
-      const existing = await prisma.entity.findFirst({
-        where: {
-          projectId: project.id,
-          name,
-          entityType: type,
-        },
-      });
-
-      if (existing) return existing;
-
-      const embedding = await embedSingle(`${type}: ${name}`);
-      return await prisma.entity.create({
-        data: { projectId: project.id, name, entityType: type, embedding } as any,
-      });
-    };
-
-    const fromEntity = await findOrCreateEntity(body.from_entity, body.from_type);
-    const toEntity = await findOrCreateEntity(body.to_entity, body.to_type);
-
-    const relation = await prisma.entityRelation.upsert({
-      where: {
-        fromEntityId_toEntityId_relationType: {
-          fromEntityId: fromEntity.id,
-          toEntityId: toEntity.id,
-          relationType: body.relation_type,
-        },
-      },
-      update: {
-        weight: body.weight,
-        metadata: body.metadata || {},
-      },
-      create: {
-        projectId: project.id,
-        fromEntityId: fromEntity.id,
-        toEntityId: toEntity.id,
-        relationType: body.relation_type,
-        weight: body.weight,
-        metadata: body.metadata || {},
-      },
+    const fromEntityId = await ensureGraphEntityId({ projectId: project.id, name: body.from_entity, entityType: body.from_type });
+    const toEntityId = await ensureGraphEntityId({ projectId: project.id, name: body.to_entity, entityType: body.to_type });
+    const relation = await saveGraphRelation({
+      projectId: project.id, fromEntityId, toEntityId, relationType: body.relation_type,
+      weight: body.weight, metadata: body.metadata,
     });
-
     return c.json(relation, 201);
   }
 );
 
 api.post(
   "/v1/graph/search",
-  zValidator(
-    "json",
-    z.object({
-      project: z.string().optional(),
-      query: z.string().min(1),
-      entity_types: z.array(z.string()).optional(),
-      depth: z.number().int().min(1).max(3).optional().default(1),
-      top_k: z.number().int().min(1).max(50).optional().default(10),
-    })
-  ),
+  zValidator("json", z.object({
+    project: z.string().optional(),
+    query: z.string().min(1),
+    entity_types: z.array(z.string()).optional(),
+    depth: z.number().int().min(1).max(3).optional().default(1),
+    top_k: z.number().int().min(1).max(50).optional().default(10),
+  })),
   async (c) => {
-    const auth = c.get("auth") as AuthContext;
+    const auth = c.get("auth");
     const body = c.req.valid("json");
-
     const project = await ensureProject(auth.orgId, body.project, auth.isAdmin);
-
-    const queryEmbedding = await embedSingle(body.query);
-
-    // Entity search with proper parameterization
-    const relevantEntities = await prisma.$queryRaw(Prisma.sql`
-      SELECT
-        id, name, "entityType", description, metadata,
-        1 - (embedding <=> ${queryEmbedding}::vector) as similarity
-      FROM entities
-      WHERE "projectId" = ${project.id}
-        ${body.entity_types && body.entity_types.length > 0 
-          ? Prisma.sql`AND "entityType" IN (${Prisma.join(body.entity_types)})` 
-          : Prisma.sql``}
-      ORDER BY embedding <=> ${queryEmbedding}::vector
-      LIMIT ${body.top_k}
-    `);
-
-    // Get relations for found entities
-    const entityIds = (relevantEntities as any[]).map((e: any) => e.id);
-    let rels: any[] = [];
-
-    if (entityIds.length > 0) {
-      rels = await prisma.entityRelation.findMany({
-        where: {
-          projectId: project.id,
-          OR: [
-            { fromEntityId: { in: entityIds } },
-            { toEntityId: { in: entityIds } },
-          ],
-        },
-        select: {
-          id: true,
-          fromEntityId: true,
-          toEntityId: true,
-          relationType: true,
-          weight: true,
-        },
-      });
-    }
-
+    const { entities, relations } = await searchEntityGraph({
+      projectId: project.id, embedding: await embedSingle(body.query),
+      depth: body.depth, topK: body.top_k, entityTypes: body.entity_types,
+    });
     return c.json({
-      entities: (relevantEntities as any[]).map((e: any) => ({
-        ...e,
-        score: Math.round(e.similarity * 1000) / 1000,
+      entities: entities.map((entity) => ({
+        ...entity, score: Math.round(entity.similarity * 1000) / 1000,
       })),
-      relations: rels,
+      relations,
     });
   }
 );

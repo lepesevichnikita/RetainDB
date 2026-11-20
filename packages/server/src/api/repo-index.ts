@@ -73,27 +73,29 @@ const db = prisma as any;
 /** The scope grant token. A credential only; the scope itself comes from the path. */
 const GRANT_HEADER = "X-RetainDB-Repo-Index-Grant";
 
-const GRANT_KIND = {
-  READER: "reader",
-  UPLOADER: "uploader",
-  CONNECTOR: "connector",
-  ADMIN: "admin",
-} as const;
+/**
+ * The grant kinds. Declared once: `repo-index-admin.ts` mints from this tuple and CAPABILITY below
+ * accepts it, so neither surface can hold a kind the other does not.
+ */
+export const GRANT_KINDS = ["reader", "uploader", "connector", "admin"] as const;
+
+/** One grant kind; the tuple above is the only place the set is written down. */
+export type GrantKind = (typeof GRANT_KINDS)[number];
 
 /**
  * What each route requires: a grant of any kind listed for an operation may perform it. The
  * routes read this table and nothing else, so the answer to "may this grant do this" lives in
- * one place. Every kind `repo-index-admin.ts` mints has to appear here: a kind that is mintable
- * but that no operation accepts is a credential that answers every request GRANT_MISSING.
+ * one place. Every kind in GRANT_KINDS has to appear here: a kind that is mintable but that no
+ * operation accepts is a credential that answers every request GRANT_MISSING.
  */
 export const CAPABILITY = {
-  OPEN_ATTEMPT: [GRANT_KIND.UPLOADER, GRANT_KIND.CONNECTOR],
-  PUT_PART: [GRANT_KIND.UPLOADER, GRANT_KIND.CONNECTOR],
-  FINALIZE: [GRANT_KIND.ADMIN],
-  ABANDON: [GRANT_KIND.ADMIN],
-  READ_RECEIPT: [GRANT_KIND.READER, GRANT_KIND.CONNECTOR],
-  READ_MANIFEST: [GRANT_KIND.READER, GRANT_KIND.CONNECTOR],
-} as const;
+  OPEN_ATTEMPT: ["uploader", "connector"],
+  PUT_PART: ["uploader", "connector"],
+  FINALIZE: ["admin"],
+  ABANDON: ["admin"],
+  READ_RECEIPT: ["reader", "connector"],
+  READ_MANIFEST: ["reader", "connector"],
+} as const satisfies Record<string, readonly GrantKind[]>;
 
 const AUTH_CODE = {
   GRANT_MISSING: "GRANT_MISSING",

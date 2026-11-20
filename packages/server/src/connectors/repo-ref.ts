@@ -102,6 +102,16 @@ export interface RefRunResult {
 
 const FETCH_CONCURRENCY = 8;
 
+/**
+ * Tree pages one run may enumerate.
+ *
+ * Bounded because a provider that keeps announcing another page would otherwise grow the
+ * manifest until memory runs out. `engine/repo-index/connector-run.ts` bounds its own paging
+ * loop the same way (`PUBLISHED_PAGES_MAX`, the same number), so both loops agree on one
+ * ceiling.
+ */
+export const TREE_PAGES_MAX = 100;
+
 /** A commit address is a full lowercase hex object id: exactly 40 for sha1, 64 for sha256. */
 const COMMIT_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
@@ -160,7 +170,7 @@ async function readTree(provider: RefProvider, commit: string): Promise<TreeRead
   const seen = new Set<string>();
   let page = 1;
   try {
-    for (;;) {
+    for (let read = 0; read < TREE_PAGES_MAX; read++) {
       const treePage = await provider.listTree(commit, page);
       for (const entry of treePage.entries) {
         // A repeated path would reach the publication fence as a duplicate, so the
@@ -180,6 +190,12 @@ async function readTree(provider: RefProvider, commit: string): Promise<TreeRead
       }
       page = treePage.nextPage;
     }
+    // The ceiling was reached with another page still announced. The entries read so far
+    // are a prefix of the tree, so the run is refused with its own failure instead of
+    // finishing quietly: a prefix published as the tree would report every file in the
+    // pages left unread as deleted. INCOMPLETE_TREE is the outcome for "the provider did
+    // not finish", and its failure text is what tells this refusal from a broken page.
+    return { ok: false, failure: `the tree of ${commit} did not finish within ${TREE_PAGES_MAX} pages` };
   } catch (error) {
     return { ok: false, failure: messageOf(error) };
   }

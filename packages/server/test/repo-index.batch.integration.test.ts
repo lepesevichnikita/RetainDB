@@ -1194,6 +1194,51 @@ run("a paused scope refuses every capability", { timeout: 30_000 }, async () => 
   assert.equal(receipt.code, PROMOTION_OUTCOME.SCOPE_PAUSED);
 });
 
+// Behaviour: the part write path reads the scope's own state, so an in-process caller cannot add a
+// part to a paused or withdrawn scope; it is refused with that state's code and stores no row. The
+// same scope accepts parts while it is active, which is the case every upload path runs.
+run("a paused scope refuses a part write while an active scope accepts parts", { timeout: 30_000 }, async () => {
+  const store = await import(storePath);
+  const { db, scope } = await fixture();
+  const opened = await store.openAttempt(attemptFor(scope.id, "attempt-1", { partCount: 2 }));
+  assert.equal(opened.code, store.STORE_CODE.ATTEMPT_OPEN);
+
+  const accepted = await store.putPart({
+    scopeId: scope.id,
+    attemptId: "attempt-1",
+    partNo: 1,
+    part: { upserts: ["src/a.ts"], tombstones: [] },
+  });
+  assert.equal(accepted.code, store.STORE_CODE.PART_ACCEPTED);
+
+  await db.repoIndexScope.update({ where: { id: scope.id }, data: { state: "paused" } });
+  const paused = await store.putPart({
+    scopeId: scope.id,
+    attemptId: "attempt-1",
+    partNo: 2,
+    part: { upserts: ["src/b.ts"], tombstones: [] },
+  });
+  assert.equal(paused.code, PROMOTION_OUTCOME.SCOPE_PAUSED);
+
+  await db.repoIndexScope.update({ where: { id: scope.id }, data: { state: "withdrawn" } });
+  const withdrawn = await store.putPart({
+    scopeId: scope.id,
+    attemptId: "attempt-1",
+    partNo: 2,
+    part: { upserts: ["src/b.ts"], tombstones: [] },
+  });
+  assert.equal(withdrawn.code, PROMOTION_OUTCOME.SCOPE_WITHDRAWN);
+
+  // A refusal is not a fence: the attempt is still open, and only the part written while the scope
+  // was active exists.
+  const generation = await db.repoIndexGeneration.findUniqueOrThrow({
+    where: { scopeId_attemptId: { scopeId: scope.id, attemptId: "attempt-1" } },
+  });
+  assert.equal(generation.status, "open");
+  const parts = await db.repoIndexPart.findMany({ where: { generationId: opened.generationId }, orderBy: { partNo: "asc" } });
+  assert.deepEqual(parts.map((part: any) => part.partNo), [1]);
+});
+
 // Behaviour: a revoked scope is refused as revoked over HTTP, not as withdrawn. The two states are
 // different outcomes, so a caller that reads SCOPE_WITHDRAWN stops retrying a scope that was only
 // revoked, and one that reads SCOPE_REVOKED knows its grant is gone.

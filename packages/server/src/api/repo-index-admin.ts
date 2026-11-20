@@ -49,6 +49,8 @@ import { z } from "zod";
 import { prisma } from "../db/index.js";
 import { hashGrantToken, mintGrantToken } from "../engine/repo-index/grant-token.js";
 import { resolveProjectReference } from "./helpers.js";
+// The grant kinds are declared once, by the router that accepts them; this surface only mints them.
+import { GRANT_KINDS } from "./repo-index.js";
 import type { AuthContext } from "../middleware/auth.js";
 import type { Context, Next } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
@@ -72,8 +74,12 @@ export function registerRepoIndexAdminRoutes(app: Hono<any>): void {
 // Same reason as in the store: the generated client can predate the repo-index models.
 const db = prisma as any;
 
-/** The capabilities a grant can carry. `connector` is reserved for the sync worker. */
-export const GRANT_KINDS = ["reader", "uploader", "connector", "admin"] as const;
+/**
+ * The capabilities a grant can carry, declared once in repo-index.ts next to the capability table
+ * that accepts them and re-exported here, where they are minted: `connector` is reserved for the
+ * sync worker, and callers and tests already import the tuple from this surface.
+ */
+export { GRANT_KINDS };
 
 /**
  * The kinds that carry the promotion decision, and therefore the only ones this surface refuses to

@@ -21,6 +21,10 @@
  * 3. A blob is read from the pinned commit's own tree. The working tree, the index and the
  *    branch tip are never consulted, so a read cannot answer content from a commit the run
  *    did not pin.
+ * 4. Every git invocation has a deadline. A wedged git would otherwise hold the publish
+ *    transaction, and the generation row lock, until that transaction's own budget ran out
+ *    and then answer as generic contention; past the deadline the call is killed and fails
+ *    as its own timeout, which is a different answer from "that path is not in the tree".
  */
 
 import { execFile } from "node:child_process";
@@ -36,6 +40,15 @@ const COMMIT_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
  */
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 
+/**
+ * Deadline of one git call.
+ *
+ * Ten seconds sits below the publish transaction's own 30s timeout (`TRANSACTION` in
+ * store.ts), so a wedged read is reported as the git timeout it is instead of being left to
+ * the transaction's budget and then answering as generic lock contention.
+ */
+const GIT_TIMEOUT_MS = 10_000;
+
 /** The entry types git itself reports; a symlink is a blob whose mode says so. */
 const GIT_ENTRY_TYPE: Record<string, RefEntryType> = { blob: "blob", tree: "tree", commit: "commit" };
 
@@ -48,16 +61,32 @@ const RECORD_SEPARATOR = 0x00;
 export interface GitRefProviderOptions {
   /** A work tree, a bare repository, or a `.git` directory git accepts as a repository. */
   repoDir: string;
+  /**
+   * Longest any one git call may run before it is killed and fails as a timeout. A deadline
+   * has to be a positive number of milliseconds: anything else bounds no call, so the
+   * provider refuses to be built rather than failing every read it is asked for.
+   */
+  timeoutMs?: number;
 }
 
 /** The connector's provider, reading one on-disk repository. */
 export function createGitRefProvider(options: GitRefProviderOptions): RefProvider {
   const repoDir = resolvePath(options.repoDir);
+  const timeoutMs = deadlineOf(options.timeoutMs);
   return {
-    resolveRef: (ref) => resolveRef(repoDir, ref),
-    listTree: (commit, page) => listTree(repoDir, commit, page),
-    readBlob: (commit, path) => readBlob(repoDir, commit, path),
+    resolveRef: (ref) => resolveRef(repoDir, ref, timeoutMs),
+    listTree: (commit, page) => listTree(repoDir, commit, page, timeoutMs),
+    readBlob: (commit, path) => readBlob(repoDir, commit, path, timeoutMs),
   };
+}
+
+/** The deadline every git call of one provider gets, or the reason there is none. */
+function deadlineOf(timeoutMs: number | undefined): number {
+  if (timeoutMs === undefined) return GIT_TIMEOUT_MS;
+  if (!(Number.isFinite(timeoutMs) && timeoutMs > 0)) {
+    throw new Error(`timeoutMs ${timeoutMs} is not a positive number of milliseconds, so it bounds no git call`);
+  }
+  return timeoutMs;
 }
 
 /**
@@ -68,11 +97,14 @@ export function createGitRefProvider(options: GitRefProviderOptions): RefProvide
  * and never a tag or tree id. Nothing is memoised: the connector resolves the same ref again
  * to learn whether it moved, and a cached answer would report a moved branch as fresh.
  */
-async function resolveRef(repoDir: string, ref: string): Promise<string> {
+async function resolveRef(repoDir: string, ref: string, timeoutMs: number): Promise<string> {
   let answer: string;
   try {
-    answer = (await git(repoDir, ["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`])).toString("utf8").trim();
+    answer = (await git(repoDir, ["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`], timeoutMs)).toString("utf8").trim();
   } catch (error) {
+    // A deadline is not an answer about the ref: reporting it as "could not be resolved"
+    // would hide a wedged git behind a missing branch, so the timeout keeps its own type.
+    if (error instanceof GitTimeoutError) throw error;
     throw new Error(`ref ${JSON.stringify(ref)} could not be resolved in ${repoDir}: ${error instanceof Error ? error.message : String(error)}`);
   }
   if (!COMMIT_SHA.test(answer)) {
@@ -93,12 +125,12 @@ async function resolveRef(repoDir: string, ref: string): Promise<string> {
  * `nextPage` is null only after every record parsed: an enumeration this adapter cannot
  * finish is thrown, never returned with the records that happened to parse.
  */
-async function listTree(repoDir: string, commit: string, page: number): Promise<RefTreePage> {
+async function listTree(repoDir: string, commit: string, page: number, timeoutMs: number): Promise<RefTreePage> {
   requireCommit("tree read", commit);
   // The tree is one page, so any other page is a caller reading a finished listing as if
   // more of it were coming; answering an empty page would look like the end of the tree.
   if (page !== 1) throw new Error(`the tree of ${commit} is one page, so page ${page} cannot be read`);
-  const stdout = await git(repoDir, ["ls-tree", "-r", "-z", "--full-tree", commit]);
+  const stdout = await git(repoDir, ["ls-tree", "-r", "-z", "--full-tree", commit], timeoutMs);
   return { entries: parseTree(stdout, commit), nextPage: null };
 }
 
@@ -110,9 +142,9 @@ async function listTree(repoDir: string, commit: string, page: number): Promise<
  * colon, so a name that begins with a colon stays that file rather than becoming a revision
  * expression.
  */
-async function readBlob(repoDir: string, commit: string, path: string): Promise<string> {
+async function readBlob(repoDir: string, commit: string, path: string, timeoutMs: number): Promise<string> {
   requireCommit("blob read", commit);
-  return (await git(repoDir, ["cat-file", "blob", `${commit}:${path}`])).toString("utf8");
+  return (await git(repoDir, ["cat-file", "blob", `${commit}:${path}`], timeoutMs)).toString("utf8");
 }
 
 /** Only a full object id names one immutable revision, so nothing else may address a fetch. */
@@ -163,20 +195,49 @@ function decodePath(bytes: Buffer, commit: string): string {
 }
 
 /**
- * Runs git in the repository and answers its raw stdout bytes.
+ * A git call that did not answer within its deadline.
+ *
+ * Its own type, name and code, because a deadline is not an answer about the repository: a
+ * caller that read it as "that path is not in the tree" would publish a manifest dropping a
+ * file the commit still holds, and a deletion is inferred from exactly what the tree lacks.
+ */
+export class GitTimeoutError extends Error {
+  readonly code = "GIT_TIMEOUT";
+
+  constructor(args: string[], repoDir: string, timeoutMs: number) {
+    super(`git ${args.join(" ")} timed out after ${timeoutMs}ms in ${repoDir}`);
+    this.name = "GitTimeoutError";
+  }
+}
+
+/**
+ * Runs git in the repository and answers its raw stdout bytes, or fails within `timeoutMs`.
  *
  * A non-zero exit, a signal or an answer over the buffer bound rejects with git's own stderr:
  * an unreadable repository has to reach the caller as a failure, never as an empty listing it
- * could publish.
+ * could publish. The deadline is enforced here with an explicit flag, so a killed call is
+ * reported as a timeout and cannot be confused with a command that ran and answered nothing;
+ * these invocations only read, so killing one leaves the repository untouched.
  */
-function git(repoDir: string, args: string[]): Promise<Buffer> {
+function git(repoDir: string, args: string[], timeoutMs: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    execFile("git", args, { cwd: repoDir, maxBuffer: GIT_MAX_BUFFER, encoding: "buffer" }, (error, stdout, stderr) => {
-      if (error) {
-        reject(new Error(`git ${args.join(" ")} failed in ${repoDir}: ${stderr.toString("utf8").trim() || error.message}`));
-        return;
-      }
-      resolve(Buffer.from(stdout));
-    });
+    let timedOut = false;
+    let deadline: NodeJS.Timeout | undefined;
+    const settle = (error: Error | null, stdout: Buffer, stderr: Buffer): void => {
+      if (deadline) clearTimeout(deadline);
+      if (error) reject(gitFailure(repoDir, args, timeoutMs, timedOut, error, stderr));
+      else resolve(Buffer.from(stdout));
+    };
+    const child = execFile("git", args, { cwd: repoDir, maxBuffer: GIT_MAX_BUFFER, encoding: "buffer" }, settle);
+    deadline = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, timeoutMs);
   });
+}
+
+/** The error one failed git call reports: a deadline is its own failure, not a generic one. */
+function gitFailure(repoDir: string, args: string[], timeoutMs: number, timedOut: boolean, error: Error, stderr: Buffer): Error {
+  if (timedOut) return new GitTimeoutError(args, repoDir, timeoutMs);
+  return new Error(`git ${args.join(" ")} failed in ${repoDir}: ${stderr.toString("utf8").trim() || error.message}`);
 }

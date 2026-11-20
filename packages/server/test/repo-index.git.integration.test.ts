@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { test } from "node:test";
 import {
   REF_RUN_OUTCOME,
+  TREE_PAGES_MAX,
   readCommittedRef,
   type RefProvider,
   type RefTreeEntry,
@@ -653,4 +654,112 @@ test("a clean run returns a complete manifest at the resolved commit", async () 
   ]);
   assert.deepEqual(result.deletions, ["src/old.ts"]);
   assert.ok(calls.blobs.every((call) => call.commit === SHA_PINNED));
+});
+
+// Behaviour: the ordinary path across several pages keeps working: a tree larger than
+// one page is enumerated whole, every page is read in order, an empty page is not taken
+// for the end, and the complete manifest still declares the one path that went away.
+test("a tree larger than one page is enumerated whole", async () => {
+  const contents: Record<string, string> = {
+    "src/a.ts": "export const a = 1;\n",
+    "src/b.ts": "export const b = 2;\n",
+    "docs/readme.md": "# readme\n",
+    "docs/guide.md": "# guide\n",
+    "config/app.json": '{"port":8080}\n',
+    "config/ci.json": '{"ci":true}\n',
+  };
+  const { provider, calls } = fakeProvider({
+    head: SHA_PINNED,
+    pages: [
+      [{ path: "src/a.ts", type: "blob", mode: "100644" }, { path: "src/b.ts", type: "blob", mode: "100644" }],
+      // A page with nothing on it still announces the next one, so only the pointer ends
+      // the enumeration; reading this as the end would publish two files as the whole tree.
+      [],
+      [{ path: "docs/readme.md", type: "blob", mode: "100644" }, { path: "docs/guide.md", type: "blob", mode: "100644" }],
+      [{ path: "config/app.json", type: "blob", mode: "100644" }, { path: "config/ci.json", type: "blob", mode: "100644" }],
+    ],
+    blobs: contents,
+  });
+
+  const result = await readCommittedRef(provider, { ref: "main", previousPaths: ["src/a.ts", "src/gone.ts"] });
+
+  assert.equal(result.outcome, REF_RUN_OUTCOME.COMPLETE);
+  assert.equal(result.complete, true);
+  assert.deepEqual(calls.tree.map((call) => call.page), [1, 2, 3, 4], "every page is read in order");
+  assert.deepEqual(calls.blobs.map((call) => call.path).sort(), Object.keys(contents).sort());
+  assert.deepEqual(result.manifest, [
+    { path: "config/app.json", digest: sha256(contents["config/app.json"]) },
+    { path: "config/ci.json", digest: sha256(contents["config/ci.json"]) },
+    { path: "docs/guide.md", digest: sha256(contents["docs/guide.md"]) },
+    { path: "docs/readme.md", digest: sha256(contents["docs/readme.md"]) },
+    { path: "src/a.ts", digest: sha256(contents["src/a.ts"]) },
+    { path: "src/b.ts", digest: sha256(contents["src/b.ts"]) },
+  ]);
+  assert.deepEqual(result.deletions, ["src/gone.ts"]);
+});
+
+// Behaviour: a provider that keeps announcing another page is refused at the page
+// ceiling instead of growing the manifest until memory runs out. The refusal is its own
+// failure, never a finished tree: the pages read so far are a prefix, so publishing them
+// would report every file the remaining pages hold as deleted.
+test("a provider that keeps announcing another page is refused at the ceiling", async () => {
+  // The number is part of the contract, not of this module alone: engine/repo-index/connector-run.ts
+  // bounds its own paging loop at PUBLISHED_PAGES_MAX = 100, and the review's requirement is that
+  // the two agree. Pinning it here fails if either loop drifts to a different ceiling.
+  assert.equal(TREE_PAGES_MAX, 100, "the tree ceiling matches the run's published-tree ceiling");
+
+  const asked: number[] = [];
+  const read: string[] = [];
+  const endless: RefProvider = {
+    async resolveRef() {
+      return SHA_PINNED;
+    },
+    async listTree(_commit: string, page: number) {
+      asked.push(page);
+      // The tripwire is what keeps a connector without a ceiling terminating: it answers
+      // one page past the bound, so an unbounded loop fails this test instead of hanging
+      // the suite, and a bounded one never asks.
+      if (page > TREE_PAGES_MAX) throw new Error(`page ${page} is past the ${TREE_PAGES_MAX} page ceiling`);
+      return { entries: [{ path: `src/f${page}.ts`, type: "blob", mode: "100644" }], nextPage: page + 1 };
+    },
+    async readBlob(_commit: string, path: string) {
+      // Content is served, so a connector that stopped silently would publish the pages it
+      // read as the whole tree instead of failing here for an unrelated reason.
+      read.push(path);
+      return `${path}\n`;
+    },
+  };
+
+  const result = await readCommittedRef(endless, { ref: "main", previousPaths: ["src/f1.ts"] });
+
+  assert.equal(result.outcome, REF_RUN_OUTCOME.INCOMPLETE_TREE);
+  assert.equal(result.complete, false);
+  assert.deepEqual(result.manifest, [], "a tree cut off at the ceiling is never published");
+  assert.deepEqual(result.deletions, [], "a tree cut off at the ceiling deletes nothing");
+  assert.match(result.failure ?? "", new RegExp(`did not finish within ${TREE_PAGES_MAX} pages`));
+  assert.deepEqual(read, [], "no blob of a tree that was never finished is read");
+  assert.deepEqual(
+    asked,
+    Array.from({ length: TREE_PAGES_MAX }, (_, index) => index + 1),
+    "the connector stopped at the ceiling instead of reading past it",
+  );
+});
+
+// Behaviour: the ceiling bounds a broken provider, not a big tree. A tree that fills every
+// page the ceiling allows is still enumerated whole and published complete, so the guard
+// cannot cut off a legitimate repository one page early.
+test("a tree that fills every page the ceiling allows still completes", async () => {
+  const pages = Array.from({ length: TREE_PAGES_MAX }, (_, index) => [
+    { path: `src/f${String(index + 1).padStart(3, "0")}.ts`, type: "blob" as const, mode: "100644" },
+  ]);
+  const blobs = Object.fromEntries(pages.map(([entry]) => [entry.path, `${entry.path}\n`]));
+  const { provider, calls } = fakeProvider({ head: SHA_PINNED, pages, blobs });
+
+  const result = await readCommittedRef(provider, { ref: "main" });
+
+  assert.equal(result.outcome, REF_RUN_OUTCOME.COMPLETE);
+  assert.equal(calls.tree.length, TREE_PAGES_MAX);
+  assert.deepEqual(calls.tree.map((call) => call.page), Array.from({ length: TREE_PAGES_MAX }, (_, index) => index + 1));
+  assert.equal(result.manifest.length, TREE_PAGES_MAX);
+  assert.equal(result.deletions.length, 0);
 });

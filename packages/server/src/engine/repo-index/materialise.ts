@@ -156,8 +156,11 @@ export function scopeSourceName(scopeId: string): string {
 /** Vectors per embedding request; a generation is several requests, never one unbounded call. */
 const EMBED_BATCH = 64;
 
-/** Same cap ingest applies to a stored chunk's search text. */
-const SEARCH_CONTENT_LIMIT = 20_000;
+/**
+ * The cap on a stored chunk's search text. engine/ingest.ts imports it, so the pipeline and this
+ * materialiser cannot write two different caps into `chunks.searchContent`.
+ */
+export const SEARCH_CONTENT_LIMIT = 20_000;
 
 /**
  * Splits the manifest into paths whose chunks this generation can reuse and paths it must embed.

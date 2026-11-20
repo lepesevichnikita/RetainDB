@@ -1,12 +1,14 @@
 import { createHash, randomUUID } from "crypto";
 import PQueue from "p-queue";
 import { prisma } from "../db/index.js";
-import { chunkText } from "./chunker.js";
+import { chunkText, type Chunk } from "./chunker.js";
 import { embed } from "./embeddings.js";
 import { extractEntities } from "./extractor.js";
 import type { IngestionProfile, ProfileConfig, StrategyOverride } from "./ingestion-profiles.js";
 // EMBEDDING_DIMENSIONS is the width of chunks.embedding (vector(1024)); a narrower vector cannot be stored.
 import { EMBEDDING_DIMENSIONS, isUsableVector } from "./repo-index/receipt.js";
+// The cap on a stored chunk's search text is declared once, with the repo-index writer that shares it.
+import { SEARCH_CONTENT_LIMIT } from "./repo-index/materialise.js";
 import { refreshSourceVersionCounts, resolveSourceVersionForWrite } from "./source-versions.js";
 
 const queue = new PQueue({ concurrency: 20 });
@@ -177,8 +179,7 @@ export async function ingestDocument(input: IngestDocumentInput) {
         },
       });
 
-  const insertedChunkIds: string[] = [];
-  const insertedLeafChunkIds: Array<{ tempId: string; chunkId: string }> = [];
+  let inserted: InsertedChunks;
   let readyDoc: typeof doc;
 
   try {
@@ -186,7 +187,6 @@ export async function ingestDocument(input: IngestDocumentInput) {
 
     const embeddings = await embedSearchableChunks(chunking.chunks, input.embedTexts);
     const embeddedByTempId = new Map(embeddings.map((entry) => [entry.tempId, entry.vector]));
-    const chunkInsertErrors: unknown[] = [];
 
     // Pre-assign UUIDs so parent IDs are known before any insert runs.
     const chunkDbIds = new Map<string, string>();
@@ -194,71 +194,13 @@ export async function ingestDocument(input: IngestDocumentInput) {
       chunkDbIds.set(chunk.tempId, randomUUID());
     }
 
-    const insertChunk = async (chunk: (typeof chunking.chunks)[number]) => {
-      const id = chunkDbIds.get(chunk.tempId)!;
-      const parentDbId = chunk.parentTempId ? chunkDbIds.get(chunk.parentTempId) || null : null;
-      const enrichedMetadata = {
-        ...chunk.metadata,
-        section_path: chunk.sectionPath || chunk.metadata.section_path || null,
-        heading_path: chunk.headingPath || chunk.metadata.heading_path || null,
-        parent_chunk_id: chunk.parentTempId || null,
-        content_kind: chunk.metadata.content_kind || (chunk.role === "parent" ? "parent_context" : chunk.role),
-      };
-      const metadataJson = JSON.stringify(enrichedMetadata);
-      // Only a non-searchable chunk may be stored without a vector; anything else
-      // would be published as searchable while being invisible to semantic search.
-      // Whether a vector is usable is decided once, in embedSearchableChunks: a
-      // searchable chunk that reaches here already holds a validated one.
-      const vector = chunk.searchable ? embeddedByTempId.get(chunk.tempId) : undefined;
-      const searchContent = buildSearchContent(title, chunk.headingPath, chunk.sectionPath, chunk.content);
-      const contentHash = createHash("sha256").update(chunk.content).digest("hex");
-      try {
-        if (vector && vector.length > 0) {
-          await prisma.$executeRaw`
-            INSERT INTO "chunks" (
-              id, "documentId", "projectId", content, "chunkType", "chunkIndex", metadata,
-              "tokenCount", tokens, "searchContent", "contentHash", "parentChunkId", "sectionPath",
-              "headingPath", embedding, "createdAt", "updatedAt"
-            )
-            VALUES (
-              ${id}::uuid, ${doc.id}, ${projectId}, ${chunk.content}, ${chunk.chunkType}, ${chunk.chunkIndex},
-              ${metadataJson}::jsonb, ${Math.ceil(chunk.content.length / 4)}, ${Math.ceil(chunk.content.length / 4)},
-              ${searchContent}, ${contentHash}, ${parentDbId}, ${chunk.sectionPath || null}, ${chunk.headingPath || null},
-              ${`[${vector.join(",")}]`}::vector, NOW(), NOW()
-            )
-          `;
-        } else {
-          await prisma.$executeRaw`
-            INSERT INTO "chunks" (
-              id, "documentId", "projectId", content, "chunkType", "chunkIndex", metadata,
-              "tokenCount", tokens, "searchContent", "contentHash", "parentChunkId", "sectionPath",
-              "headingPath", "createdAt", "updatedAt"
-            )
-            VALUES (
-              ${id}::uuid, ${doc.id}, ${projectId}, ${chunk.content}, ${chunk.chunkType}, ${chunk.chunkIndex},
-              ${metadataJson}::jsonb, ${Math.ceil(chunk.content.length / 4)}, ${Math.ceil(chunk.content.length / 4)},
-              ${searchContent}, ${contentHash}, ${parentDbId}, ${chunk.sectionPath || null}, ${chunk.headingPath || null},
-              NOW(), NOW()
-            )
-          `;
-        }
-        insertedChunkIds.push(id);
-        if (chunk.searchable) {
-          insertedLeafChunkIds.push({ tempId: chunk.tempId, chunkId: id });
-        }
-      } catch (error: any) {
-        chunkInsertErrors.push(error);
-      }
-    };
-
-    // Two-pass parallel insert: roots first, then children (preserves FK constraints).
-    const roots = chunking.chunks.filter((c) => !c.parentTempId);
-    const children = chunking.chunks.filter((c) => c.parentTempId);
-    await Promise.all(roots.map(insertChunk));
-    if (chunkInsertErrors.length === 0 && children.length > 0) await Promise.all(children.map(insertChunk));
-    if (chunkInsertErrors.length > 0) {
-      throw new AggregateError(chunkInsertErrors, "Failed to persist document chunks");
-    }
+    inserted = await insertDocumentChunks(chunking.chunks, {
+      documentId: doc.id,
+      projectId,
+      title,
+      vectors: embeddedByTempId,
+      ids: chunkDbIds,
+    });
 
     readyDoc = await prisma.document.update({
       where: { id: doc.id },
@@ -284,7 +226,7 @@ export async function ingestDocument(input: IngestDocumentInput) {
       .slice(0, 5);
 
     for (const chunk of searchableChunks) {
-      const stored = insertedLeafChunkIds.find((entry) => entry.tempId === chunk.tempId);
+      const stored = inserted.leafChunkIds.find((entry) => entry.tempId === chunk.tempId);
       if (!stored) continue;
       extractEntities(projectId, stored.chunkId, chunk.content, chunk.chunkType).catch((error) => {
         console.warn(`[Ingest] Entity extraction failed for chunk ${stored.chunkId} (non-critical, continuing):`, error?.message ?? error);
@@ -297,11 +239,102 @@ export async function ingestDocument(input: IngestDocumentInput) {
   return {
     ...readyDoc,
     documentId: doc.id,
-    chunksCreated: insertedChunkIds.length,
-    searchableChunksCreated: insertedLeafChunkIds.length,
+    chunksCreated: inserted.chunkIds.length,
+    searchableChunksCreated: inserted.leafChunkIds.length,
     chunkPlan: chunking.plan,
     chunkStats: chunking.stats,
   };
+}
+
+/** The chunk rows one document's insert wrote. */
+interface InsertedChunks {
+  /** Every row written in completion order, for the count this ingest reports. */
+  chunkIds: string[];
+  /** The searchable rows by tempId, for the entity extraction that follows a document. */
+  leafChunkIds: Array<{ tempId: string; chunkId: string }>;
+}
+
+/** What one document's insert records as it runs: the rows it wrote, and the ones it could not. */
+interface ChunkInsertProgress extends InsertedChunks {
+  errors: unknown[];
+}
+
+/** Every value a chunk row needs that does not change from chunk to chunk. */
+interface ChunkInsertTarget {
+  documentId: string;
+  projectId: string;
+  title: string;
+  /** The validated vector of each searchable chunk, by tempId. */
+  vectors: ReadonlyMap<string, number[]>;
+  /** The row id pre-assigned to each chunk, so a parent's id is known before its children insert. */
+  ids: ReadonlyMap<string, string>;
+}
+
+/**
+ * Writes every chunk of one document in two passes: roots first, then children, because a child
+ * carries the row id of its parent. Every row of a pass is attempted even when one fails, and the
+ * failures are thrown together, so the caller's cleanup answers with all of them instead of only
+ * the first: a document is published whole or marked ERROR, never half written.
+ */
+async function insertDocumentChunks(chunks: readonly Chunk[], target: ChunkInsertTarget): Promise<InsertedChunks> {
+  const progress: ChunkInsertProgress = { chunkIds: [], leafChunkIds: [], errors: [] };
+  await Promise.all(chunks.filter((chunk) => !chunk.parentTempId).map((chunk) => insertOneChunk(chunk, target, progress)));
+  const children = chunks.filter((chunk) => chunk.parentTempId);
+  if (progress.errors.length === 0 && children.length > 0) {
+    await Promise.all(children.map((chunk) => insertOneChunk(chunk, target, progress)));
+  }
+  if (progress.errors.length > 0) throw new AggregateError(progress.errors, "Failed to persist document chunks");
+  return { chunkIds: progress.chunkIds, leafChunkIds: progress.leafChunkIds };
+}
+
+/** One chunk row, with its failure collected so the rest of its pass still lands. */
+async function insertOneChunk(chunk: Chunk, target: ChunkInsertTarget, progress: ChunkInsertProgress): Promise<void> {
+  try {
+    await writeChunkRow(chunk, target);
+    const chunkId = target.ids.get(chunk.tempId)!;
+    progress.chunkIds.push(chunkId);
+    if (chunk.searchable) progress.leafChunkIds.push({ tempId: chunk.tempId, chunkId });
+  } catch (error) {
+    progress.errors.push(error);
+  }
+}
+
+/**
+ * One chunk row, with the vector that makes it findable. The embedding column is named once, for
+ * both kinds of chunk, so no statement can write a searchable row without a vector: a searchable
+ * chunk already holds the one embedSearchableChunks validated, and a chunk that is not searchable
+ * (parent context) is stored with no vector at all, because no similarity query could match it.
+ *
+ * The vector travels as a literal because Prisma has no client type for `Unsupported("vector")`.
+ */
+async function writeChunkRow(chunk: Chunk, target: ChunkInsertTarget): Promise<void> {
+  const id = target.ids.get(chunk.tempId)!;
+  const parentDbId = chunk.parentTempId ? target.ids.get(chunk.parentTempId) || null : null;
+  const metadataJson = JSON.stringify({
+    ...chunk.metadata,
+    section_path: chunk.sectionPath || chunk.metadata.section_path || null,
+    heading_path: chunk.headingPath || chunk.metadata.heading_path || null,
+    parent_chunk_id: chunk.parentTempId || null,
+    content_kind: chunk.metadata.content_kind || (chunk.role === "parent" ? "parent_context" : chunk.role),
+  });
+  const vector = chunk.searchable ? target.vectors.get(chunk.tempId) : undefined;
+  const embedding = vector && vector.length > 0 ? `[${vector.join(",")}]` : null;
+  const tokens = Math.ceil(chunk.content.length / 4);
+  const searchContent = buildSearchContent(target.title, chunk.headingPath, chunk.sectionPath, chunk.content);
+  const contentHash = createHash("sha256").update(chunk.content).digest("hex");
+  await prisma.$executeRaw`
+    INSERT INTO "chunks" (
+      id, "documentId", "projectId", content, "chunkType", "chunkIndex", metadata,
+      "tokenCount", tokens, "searchContent", "contentHash", "parentChunkId", "sectionPath",
+      "headingPath", embedding, "createdAt", "updatedAt"
+    )
+    VALUES (
+      ${id}::uuid, ${target.documentId}, ${target.projectId}, ${chunk.content}, ${chunk.chunkType}, ${chunk.chunkIndex},
+      ${metadataJson}::jsonb, ${tokens}, ${tokens},
+      ${searchContent}, ${contentHash}, ${parentDbId}, ${chunk.sectionPath || null}, ${chunk.headingPath || null},
+      ${embedding}::vector, NOW(), NOW()
+    )
+  `;
 }
 
 async function embedSearchableChunks(chunks: ReturnType<typeof chunkText>["chunks"], embedTexts = embed): Promise<EmbeddedChunk[]> {
@@ -335,7 +368,7 @@ function buildSearchContent(title: string, headingPath: string | undefined, sect
   const parts = [title, headingPath, sectionPath, content]
     .filter(Boolean)
     .join("\n");
-  return parts.slice(0, 20000);
+  return parts.slice(0, SEARCH_CONTENT_LIMIT);
 }
 
 async function updateSourceCounts(sourceId: string, sourceVersionId?: string | null) {

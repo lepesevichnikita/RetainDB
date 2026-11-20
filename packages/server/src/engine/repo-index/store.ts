@@ -351,7 +351,22 @@ async function storePart(tx: Transaction, input: PutPartInput): Promise<PutPartR
   const stored = await loadPart(attempt.id, input.partNo, tx);
   if (stored) return answerStoredPart(stored, requestHash);
   if (attempt.status !== "open") return { code: STORE_CODE.ATTEMPT_FENCED, partNo: input.partNo };
+  const refusal = await newPartRefusal(tx, input.scopeId);
+  if (refusal) return { code: refusal, partNo: input.partNo };
   return acceptPart(tx, attempt.id, input, requestHash);
+}
+
+/**
+ * The refusal a new part carries when the scope itself accepts none, or null when it may take one.
+ * openAttempt and the publish CAS already read this state; without the same read here an in-process
+ * caller could add parts to a paused or withdrawn scope. The scope row is read, not locked: a pause
+ * that commits after this read is still caught by the publication CAS, which compares the state in
+ * the same transaction that seals the generation.
+ */
+async function newPartRefusal(tx: Transaction, scopeId: string): Promise<StoreCode | null> {
+  const scope = (await tx.repoIndexScope.findUnique({ where: { id: scopeId } })) as ScopeRow | null;
+  if (!scope) return STORE_CODE.SCOPE_NOT_FOUND;
+  return isScopeReadable(scopeState(scope)) ? null : scopeRefusalCode(scope.state);
 }
 
 async function acceptPart(tx: Transaction, generationId: string, input: PutPartInput, requestHash: string): Promise<PutPartResult> {

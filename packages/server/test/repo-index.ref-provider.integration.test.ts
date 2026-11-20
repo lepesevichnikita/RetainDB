@@ -85,6 +85,34 @@ function digestOf(content: string): string {
   return createHash("sha256").update(content, "utf8").digest("hex");
 }
 
+/** How long the stalling stub pretends git is wedged. */
+const STALL_SECONDS = 2;
+
+/**
+ * Runs `call` with a `git` first on PATH that answers nothing for `STALL_SECONDS` and then
+ * exits as if it had. Long enough that a deadline of a few hundred milliseconds has to be
+ * what ends the call, short enough that the adapter without one still finishes and shows
+ * what it answers, instead of hanging the suite.
+ */
+async function underStallingGit<T>(call: () => Promise<T>): Promise<T> {
+  const dir = await mkdtemp(join(tmpdir(), "retaindb-stalling-git-"));
+  try {
+    const stub = join(dir, "git");
+    await writeFile(stub, `#!/bin/sh\nexec sleep ${STALL_SECONDS}\n`);
+    await chmod(stub, 0o755);
+    const previous = process.env.PATH;
+    process.env.PATH = `${dir}:${previous ?? ""}`;
+    try {
+      return await call();
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 // Behaviour: a ref answers the one full commit sha it points at right now. Nothing is
 // cached, because the connector re-resolves the ref to learn whether a branch moved.
 test("a ref resolves to the full commit sha it names, and re-resolves once the branch moves", async () => {
@@ -313,6 +341,74 @@ test("a fetch is addressed only by a full commit sha and only by the page the tr
   await assert.rejects(() => provider.readBlob("HEAD", "a.txt"), /full commit sha/);
   await assert.rejects(() => provider.listTree(commit.slice(0, 12), 1), /full commit sha/);
   await assert.rejects(() => provider.listTree(commit, 2), /page 2/);
+});
+
+// Behaviour: a git call that stops answering is killed at its deadline instead of holding
+// the publish transaction for its whole budget, and a timeout is its own failure, not the
+// answer "that path is not in the tree": absence and a deadline stay distinguishable, which
+// matters because a deletion is inferred from what the tree does not contain.
+test("a git call that hangs fails by the timeout, and a timeout is not a missing file", async () => {
+  const repo = await newRepo();
+  await write(repo, "a.txt", "one\n");
+  const commit = await commitAll(repo, "first");
+  const provider = createGitRefProvider({ repoDir: repo, timeoutMs: 300 });
+
+  // A path the commit does not hold: git answers "does not exist", which is an absence, so
+  // the deadline must not have swallowed that answer into a timeout.
+  const absent = await provider.readBlob(commit, "absent.txt").then(
+    () => assert.fail("a missing blob must not be read"),
+    (error: Error & { code?: string }) => error,
+  );
+  assert.match(absent.message, /does not exist in/);
+  assert.doesNotMatch(absent.message, /timed out/);
+  assert.notEqual(absent.name, "GitTimeoutError");
+  assert.notEqual(absent.code, "GIT_TIMEOUT");
+
+  // Every git invocation the adapter makes is bounded: the ref, the tree and the blob.
+  const calls: Array<() => Promise<unknown>> = [
+    () => provider.resolveRef("main"),
+    () => provider.listTree(commit, 1),
+    () => provider.readBlob(commit, "a.txt"),
+  ];
+  for (const call of calls) {
+    const started = Date.now();
+    const failure = await underStallingGit(call).then(
+      () => assert.fail("a stalled git must not answer"),
+      (error: Error & { code?: string }) => error,
+    );
+    assert.equal(failure.name, "GitTimeoutError", `git did not answer: ${failure.message}`);
+    assert.equal(failure.code, "GIT_TIMEOUT", `git did not answer: ${failure.message}`);
+    assert.match(failure.message, /timed out after 300ms/);
+    assert.ok(Date.now() - started < 1200, "the deadline cut the call short, not the stub's own exit");
+  }
+
+  // A timed-out blob read leaves the run incomplete and deletes nothing: reading the deadline
+  // as an absent file would publish a manifest that drops a file the commit still holds.
+  const stalling: RefProvider = {
+    resolveRef: (ref) => provider.resolveRef(ref),
+    listTree: (atCommit, page) => provider.listTree(atCommit, page),
+    readBlob: (atCommit, path) => underStallingGit(() => provider.readBlob(atCommit, path)),
+  };
+  const run = await readCommittedRef(stalling, { ref: "main", previousPaths: ["a.txt"] });
+  assert.equal(run.outcome, REF_RUN_OUTCOME.INCOMPLETE_TREE);
+  assert.equal(run.complete, false);
+  assert.match(run.failure ?? "", /timed out after 300ms/);
+  assert.deepEqual(run.manifest, []);
+  assert.deepEqual(run.deletions, []);
+});
+
+// Behaviour: a deadline that is not a positive count bounds nothing, so the provider refuses
+// to be built instead of timing out every read it is ever asked for.
+test("a deadline that is not a positive count is refused when the provider is built", async () => {
+  const repo = await newRepo();
+
+  for (const timeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.throws(
+      () => createGitRefProvider({ repoDir: repo, timeoutMs }),
+      /timeoutMs/,
+      `timeoutMs ${timeoutMs} is refused`,
+    );
+  }
 });
 
 after(async () => {

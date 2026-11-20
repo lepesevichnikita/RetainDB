@@ -331,7 +331,18 @@ test("the default request answers without an embedder and says the answer is par
   const response = await api.request("/v1/context/query", {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${credential}` },
-    body: JSON.stringify({ project: project.id, query: QUERY, top_k: 5, threshold: 0, use_cache: false, rerank: false }),
+    // include_graph and include_memories both need an embedding too: a client that asks for
+    // everything must not be turned into a 500 by an embedder it did not ask about.
+    body: JSON.stringify({
+      project: project.id,
+      query: QUERY,
+      top_k: 5,
+      threshold: 0,
+      use_cache: false,
+      rerank: false,
+      include_memories: true,
+      include_graph: true,
+    }),
   });
   const answer = { status: response.status, body: (await response.json()) as any };
   assert.equal(answer.status, 200, `the default request is answered, not a 500: ${JSON.stringify(answer.body).slice(0, 300)}`);

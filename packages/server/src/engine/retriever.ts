@@ -479,7 +479,7 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
 
   // ─── Graph Traversal ─────────────────────────────────────
   let graph: Awaited<ReturnType<typeof searchGraphChunks>> | undefined;
-  if (includeGraph) {
+  if (includeGraph && embeddingUnavailable === null) {
     const tGraph = Date.now();
     graph = await searchGraphChunks({
       projectId,

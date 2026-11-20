@@ -312,12 +312,16 @@ test("a publication that drops a path stops serving it", { timeout: 180_000 }, a
 });
 
 /**
- * Behaviour: a withdrawn scope stops being visible to a search that answered while it was active.
- * Withdrawal is terminal, so the content it published is retired with it, and the cached answer is
- * cleared in the same breath.
+ * Behaviour: a withdrawn scope stops being visible to a search that answered while it was active,
+ * and it stops being visible while every row it published stays in the database.
+ *
+ * The pair is the point. Withdrawal is terminal, so deleting the content it made searchable would be
+ * an irreversible answer; the content is therefore retired by the read path - a search may not return
+ * a chunk of a scope `isScopeReadable` refuses - and not by a delete. Both halves are asserted here:
+ * the answer is empty, and the rows are still there.
  */
-test("a withdrawn scope's cached answers are cleared (its rows are retained by policy)", { timeout: 180_000 }, async () => {
-  const { project, scope } = await fixtureScope();
+test("a withdrawn scope is invisible to search while its rows are retained", { timeout: 180_000 }, async () => {
+  const { client, project, scope } = await fixtureScope();
   const query = "who approves the quarterly access review";
 
   const published = await publish({
@@ -330,22 +334,35 @@ test("a withdrawn scope's cached answers are cleared (its rows are retained by p
   const cached = await search(project.id, query);
   assert.deepEqual(answeredPaths(cached), ["docs/access-review.md"], "the active scope answers the query");
 
+  // What the publication wrote, read from the database rather than assumed: the counts below are
+  // the rows a withdrawal has to leave behind.
+  const retained = await publishedRows(client, project.id, scope.id);
+  assert.deepEqual(retained, { sources: 1, documents: 1, chunks: 1, paths: 1 },
+    "the publication wrote one source, one document, its one chunk and its one manifest path");
+
   const app = await adminApp();
   const response = await app.request(`/v1/repo-index/admin/scopes/${scope.id}/withdraw`, { method: "POST" });
   assert.equal(response.status, 200, JSON.stringify(await response.clone().json()));
   assert.equal((await response.json()).code, "WITHDRAW_APPLIED");
 
-  // The cached answer must not survive the withdrawal: that is what this case is about.
+  // The cached answer must not survive the withdrawal.
   const after = await search(project.id, query);
   assert.equal(after.meta?.cacheHit ?? false, false, "the answer cached before the withdrawal is gone");
-  // KNOWN GAP, asserted rather than hidden: withdrawal clears the cached answer but RETAINS the
-  // published rows, so an uncached search still returns them. Hiding a withdrawn scope's content
-  // needs either a read-time scope-state filter or an explicit decision to delete rows on withdraw
-  // (which is terminal and irreversible). Until one is chosen this records the true behaviour
-  // rather than pretending the scope is invisible.
+
+  // Invisible: an uncached search returns none of it. This is the read-time filter, so the answer
+  // is empty for a recomputed search and not only for the one the cache used to serve.
   const withoutCache = await search(project.id, query, { useCache: false });
-  assert.deepEqual(answeredPaths(withoutCache), ["docs/access-review.md"],
-    "rows are retained after withdrawal pending an explicit retention decision");
+  assert.deepEqual(answeredPaths(withoutCache), [],
+    "a withdrawn scope's content is not returned by an uncached search");
+
+  // Retained: the invisibility came from filtering, so every row the publication wrote is still
+  // there. Comparing against the counts taken before the withdrawal is what makes this a statement
+  // about retention; asserting zero on both sides would pass on a database that never had them.
+  assert.deepEqual(await publishedRows(client, project.id, scope.id), retained,
+    "the withdrawal deletes nothing: every row it published is still in the database");
+
+  const scopeRow = await client.repoIndexScope.findUnique({ where: { id: scope.id }, select: { state: true } });
+  assert.equal(scopeRow.state, "withdrawn", "the scope row is what changed, not the content it published");
 });
 
 /**
@@ -381,6 +398,22 @@ test("a revoked grant invalidates the answer a search cached under it", { timeou
   assert.equal(after.meta.cacheHit, false, "the revoke cleared the cached answer for this project");
   assert.deepEqual(answeredPaths(after), ["docs/on-call.md"], "a revoked grant retires no content: the tree is still there");
 });
+
+/**
+ * The rows one publication leaves in the database, counted straight from the tables - so a claim
+ * that a withdrawal retained them is measured, not inferred from a search answering nothing.
+ *
+ * The four counts are the whole of what materialisation writes for a scope: its synthetic source,
+ * one document per manifest path, the searchable chunks of those documents, and the manifest rows.
+ */
+async function publishedRows(client: any, projectId: string, scopeId: string) {
+  return {
+    sources: await client.source.count({ where: { projectId } }),
+    documents: await client.document.count({ where: { projectId } }),
+    chunks: await client.chunk.count({ where: { projectId } }),
+    paths: await client.repoIndexPath.count({ where: { scopeId } }),
+  };
+}
 
 /** Every table this file writes to, counted for the rows it created. */
 async function countsOf(client: any) {

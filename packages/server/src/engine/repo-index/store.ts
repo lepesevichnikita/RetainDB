@@ -944,6 +944,22 @@ export function scopeStatusOf(state: string): ScopeStatus {
   return "revoked";
 }
 
+/** The states a scope row can carry, as the schema documents the column; anything else is unknown. */
+const SCOPE_STATE_VALUES = ["active", "paused", "withdrawn"] as const;
+
+/**
+ * The scope states a reader may see, in the form a SQL predicate needs: `state = ANY(...)`.
+ *
+ * Derived from the two functions the fence itself uses, never from a second list: `scopeStatusOf`
+ * decides what an unknown state means (this store reads it as `revoked`) and `isScopeReadable`
+ * decides whether a status is readable, so a search filtering on this list cannot disagree with the
+ * fence about a scope. The row fields other than the state are placeholders; scopeState reads the
+ * state alone.
+ */
+export const READABLE_SCOPE_STATES: readonly string[] = SCOPE_STATE_VALUES.filter((state) =>
+  isScopeReadable(scopeState({ id: "", state, activeGeneration: 0, projectId: "", orgId: "" })),
+);
+
 function attemptReceipt(row: GenerationRow): AttemptReceipt {
   return {
     scopeId: row.scopeId,

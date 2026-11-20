@@ -322,30 +322,17 @@ repoIndexAdminRoutes.post("/v1/repo-index/admin/scopes/:scopeId/withdraw", requi
 async function stateAnswer(c: Context<{ Variables: Variables }>, action: ScopeAction, scopeId: string) {
   const result = await applyScopeTransition(db as ScopeStore, c.get("auth"), scopeId, action);
   if (!result.scope) return answer(c, result.code);
-  // Withdraw is terminal, so the tree this scope published is retired with it: a withdrawn scope
-  // serves nothing, and the answers cached while it was active must not outlive the state that
-  // produced them. Pause and resume leave the published tree in place, so neither retires anything.
-  // Withdraw is terminal. Its cached answers must not outlive the state that produced them, so the
-  // project's answers are dropped here. The published rows are deliberately NOT deleted: the search
-  // path does not yet filter a non-readable scope, so this keeps the content for audit until that
-  // filter exists or the owner decides rows should be destroyed on withdraw. Pause and resume leave
-  // the published tree in place, so neither clears anything.
+  // Withdraw is terminal and deletes nothing: every row the scope published - its source, documents,
+  // chunks and paths - stays where it is, because a delete is the one answer it could not take back.
+  // What makes it invisible is the read path: engine/retriever.ts's visibleSourceSql excludes a chunk
+  // whose source belongs to a scope `isScopeReadable` refuses, inside the scoped set, so k results are
+  // chosen from the visible rows. A withdrawal does invalidate the answers cached while the scope was
+  // active, so they cannot outlive the state that produced them. Pause and resume leave the rows and
+  // the cache alone; they change no row, only the state those reads consult.
   if (result.scope.state === SCOPE_STATE.WITHDRAWN) await invalidateProjectAnswers(result.scope.projectId);
   return answer(c, result.code, { scope: serializeScope(result.scope) });
 }
 
-/**
- * Retires what a withdrawn scope made searchable, then drops this project's cached answers.
- *
- * The rows are dropped through the same deletion half materialisation owns: an empty path list
- * means the withdrawn tree keeps no document, and every chunk of it goes with the documents. The
- * order matters - the content goes first, so a search that runs while the caches are being cleared
- * reads a project that already holds none of it.
- */
-async function retireScope(scope: ScopeRow): Promise<void> {
-  await retireUnlistedPaths(db, { scopeId: scope.id, projectId: scope.projectId, paths: [] });
-  await invalidateProjectAnswers(scope.projectId);
-}
 
 /**
  * Refuses a request that did not authenticate with a deployment credential.

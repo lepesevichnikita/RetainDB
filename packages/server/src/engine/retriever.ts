@@ -11,6 +11,8 @@ import { rerankWithInferenceService } from "./inference-client.js";
 import { selectOracleCandidateChunkIds } from "./oracle-select.js";
 import { searchGraphChunks } from "./entity-graph.js";
 import { exactDistanceOrder } from "./vector-order.js";
+import { READABLE_SCOPE_STATES } from "./repo-index/store.js";
+import { REPO_INDEX_SOURCE_TYPE, scopeSourceName } from "./repo-index/materialise.js";
 
 let openaiClient: OpenAI | null = null;
 
@@ -956,6 +958,43 @@ function scoreSourceIntentMatch(
 
 // ─── Vector Search ───────────────────────────────────────────
 
+/**
+ * `repo-index:`, the prefix `scopeSourceName` puts in front of a scope's id. Taken from that
+ * function - it is `repo-index:<scopeId>`, so an empty id leaves exactly the prefix - so this
+ * filter and the materialiser cannot disagree about how a scope's source is named.
+ */
+const SCOPE_SOURCE_PREFIX = scopeSourceName("");
+
+/**
+ * The `sources`-side scope of a chunk search, over the `s` alias every chunk query in this module
+ * joins: the caller's own source narrowing, plus the rule that a repository scope no reader may see
+ * is not visible.
+ *
+ * The rows are retained and this predicate is what makes them invisible. Withdrawal is terminal, so
+ * deleting what it published would be an irreversible answer; a predicate can be revisited, and
+ * nothing here writes. A chunk is hidden exactly when its document belongs to a `repo_index` source
+ * whose scope exists and whose state `isScopeReadable` refuses - and a source naming no readable
+ * scope is hidden too, because a missing authority is not a permission.
+ *
+ * It belongs inside the scoped set rather than after the fetch: the scoped ranking takes its k from
+ * the rows this predicate selected, so a hidden row cannot occupy a slot a visible one should have.
+ */
+function visibleSourceSql(narrowedSourceIds: string[]): Prisma.Sql {
+  const narrowed = narrowedSourceIds.length > 0
+    ? Prisma.sql`AND d."sourceId" = ANY(${narrowedSourceIds})`
+    : Prisma.empty;
+  return Prisma.sql`${narrowed}AND (
+      s.type <> ${REPO_INDEX_SOURCE_TYPE}
+      OR EXISTS (
+        SELECT 1
+        FROM repo_index_scopes visible_scope
+        WHERE visible_scope."projectId" = s."projectId"
+          AND s.name = ${SCOPE_SOURCE_PREFIX} || visible_scope.id
+          AND visible_scope.state = ANY(${READABLE_SCOPE_STATES})
+      )
+    )`;
+}
+
 async function vectorSearch(
   projectId: string,
   queryEmbedding: number[],
@@ -968,9 +1007,7 @@ async function vectorSearch(
   const embeddingStr = `[${queryEmbedding.join(",")}]`;
   const metadataJson = metadataFilter ? JSON.stringify(metadataFilter) : null;
   const scopedSourceIds = uniqueStrings(sourceIds || []);
-  const sourceFilterSql = scopedSourceIds.length > 0
-    ? Prisma.sql`AND d."sourceId" = ANY(${scopedSourceIds})`
-    : Prisma.empty;
+  const sourceFilterSql = visibleSourceSql(scopedSourceIds);
   const scopedChunkIds = uniqueStrings(chunkIds || []);
   const chunkIdFilterSql = scopedChunkIds.length > 0
     ? Prisma.sql`AND id = ANY(${scopedChunkIds}::uuid[])`
@@ -1040,9 +1077,7 @@ async function fullTextSearch(
 
   const metadataJson = metadataFilter ? JSON.stringify(metadataFilter) : null;
   const scopedSourceIds = uniqueStrings(sourceIds || []);
-  const sourceFilterSql = scopedSourceIds.length > 0
-    ? Prisma.sql`AND d."sourceId" = ANY(${scopedSourceIds})`
-    : Prisma.empty;
+  const sourceFilterSql = visibleSourceSql(scopedSourceIds);
   const scopedChunkIds = uniqueStrings(chunkIds || []);
   const chunkIdFilterSql = scopedChunkIds.length > 0
     ? Prisma.sql`AND id = ANY(${scopedChunkIds}::uuid[])`

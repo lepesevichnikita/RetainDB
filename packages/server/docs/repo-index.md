@@ -8,8 +8,8 @@ client that produces the metadata is documented separately in
 Unreleased, and not verified end to end. The migration has been applied to a real PostgreSQL 16
 with pgvector 0.8.7 (75 tables, including all five `repo_index_*` tables), and the DB-gated tests
 now execute against a database instead of skipping: with `RETAINDB_TEST_DATABASE_URL` pointing at
-that database and `RETAINDB_TEST_LOCAL_EMBEDDINGS=true`, the full server suite reports 310 tests,
-310 pass, 0 fail, 0 skipped. Both variables are needed: without the second, the embedding-backed
+that database and `RETAINDB_TEST_LOCAL_EMBEDDINGS=true`, the full server suite reports 323 tests,
+323 pass, 0 fail, 0 skipped. Both variables are needed: without the second, the embedding-backed
 cases skip, and a skipped case is not a passing one. Read
 [Operational status](#operational-status) before relying on any of it.
 
@@ -399,17 +399,30 @@ that project should answer:
   inside it: a clear that ran before the commit could be refilled by a concurrent search from the
   tree being replaced, and that answer would then outlive the commit by its full TTL. Adding,
   replacing and dropping a path are one event here, so a dropped path is covered by the same clear.
-- **A withdrawal** (`POST /v1/repo-index/admin/scopes/:scopeId/withdraw`). The scope is terminal, so
-  what it made searchable is retired: `retireUnlistedPaths` with an empty path list deletes its
-  documents and their chunks, and then the project's answers are cleared. A withdrawn scope
-  therefore stops being visible to a search, cached or not. Pause and resume leave the tree alone
-  and retire nothing, because a paused scope can be resumed.
+- **A withdrawal** (`POST /v1/repo-index/admin/scopes/:scopeId/withdraw`). Withdrawal is terminal and
+  deletes nothing: the scope's source, its documents, their chunks and its path rows all stay where
+  they are, because a delete is the one answer the terminal state could never take back. What
+  changes is two things. The project's cached answers are cleared here, so an answer computed while
+  the scope was active cannot outlive the state that produced it. And the read path stops returning
+  the content: `visibleSourceSql` in `engine/retriever.ts` excludes a chunk whose document belongs to
+  a `repo_index` source whose scope `isScopeReadable` refuses (any state but `active`, so paused too),
+  inside the scoped set - the rows are filtered before `LIMIT k` takes its `k`, so a hidden row cannot
+  occupy a slot a visible one should have answered. So a withdrawn scope is invisible to a search,
+  cached or not, while every row it published remains in the database. Pause and resume change that
+  state and nothing else: a paused scope is not readable either, and resuming makes it readable again.
+  Neither clears the cache the way a withdrawal does, so an answer cached while the scope was active
+  can still be served until its 300-second TTL runs out.
 - **A grant revocation** (`POST /v1/repo-index/admin/scopes/:scopeId/grants/:grantId/revoke`). The
   tree is untouched - a credential is not content - so the recomputed answer still finds it, but
   the answers cached under the previous grant are gone.
 
 `test/repo-index.search-cache.integration.test.ts` pins each direction through the real publish
 transaction and the real admin routes, in one process, against the cache the earlier search filled.
+Its withdrawal case asserts the pair that matters: the uncached search answers nothing, and the
+`source`, `document`, `chunk` and `repo_index_paths` counts read straight from the tables are the
+same before and after the withdrawal. `test/scoped-vector-search.integration.test.ts` pins the reason
+the filter is in the SQL and not after the fetch: with the withdrawn scope holding the nearest vector,
+a `top_k` of 1 still answers the visible row.
 
 ## The connector path
 
@@ -573,7 +586,7 @@ storage layer; it has not been found through the deployed query API, and no mode
 | Materialisation into sources, documents, chunks | Yes | `packages/server/test/repo-index.materialise.integration.test.ts`, same gate, now executed rather than skipped. |
 | Ingest and repository index in one project | Yes | `packages/server/test/repo-index.slice.integration.test.ts`, same gate, now executed rather than skipped. |
 | The branch's migration | Yes | `packages/server/test/migrations.integration.test.ts` runs `prisma migrate deploy` against an isolated database when the variable is set; `20261120120500_repo_index_indexing` applied, creating the five `repo_index_*` tables. |
-| Reading an indexed path through `/v1/context/query` or search | No | No test exists. The rows materialisation writes are ordinary `chunks` rows, so retrieval is expected to work through the existing search path, but no test reads one back that way. |
+| Reading an indexed path through `/v1/context/query` or search | Yes | `packages/server/test/repo-index.search-cache.integration.test.ts` publishes through the real store and reads the path back with the production `retrieve()` call; `packages/server/test/scoped-vector-search.integration.test.ts` asks the `/v1/context/query` route and requires the visible row to be chosen over a nearer row of a withdrawn scope. Both are gated on `RETAINDB_TEST_DATABASE_URL` and execute with it attached. |
 | The connector run against the real store | No | `packages/server/test/repo-index.connector-run.test.ts` still injects a fake `PublicationStore`, so `connector-run.ts` has not run against the real store. The store functions it calls do now execute in the DB-backed suites, and the test's own comment records that `store.ts` cannot be imported by a database-free suite. |
 | The committed-ref reader against a real forge | No | `packages/server/test/repo-index.git.integration.test.ts` drives `readCommittedRef` with an in-memory provider and no git subprocess, despite the file name. `packages/server/test/repo-index.ref-provider.integration.test.ts` drives the same reader through `createGitRefProvider` (`packages/server/src/connectors/ref-provider-git.ts`) against real git repositories it builds in the OS temp directory and removes afterwards, so the git plumbing is exercised: a pinned commit, a branch that moved, a truncated listing, a missing blob, a symlink mode. No adapter speaks to GitHub or GitLab, so no run has read a real forge. |
 | The Rust client transmitting a batch | No | `packages/repo-sync/src/transport.rs` holds `transport::deliver` and `CurlTransport`: one bounded request per generation, the grant read from `RETAINDB_REPO_INDEX_GRANT`, 413 refused locally before sending, and the watermark advanced only by a parsed receipt. Twelve contract tests in `packages/repo-sync/tests/transport.rs` drive `deliver` through a fake `Transport`, so no test opens a socket or runs `curl`; the package's 122 tests pass with `cargo fmt --check`, `cargo clippy --all-targets -D warnings` and `cargo build --offline` clean and still zero dependencies. What is unproven is the seam: no CLI subcommand calls `deliver`, the batch body (`enrollment_id`, `generation`, `part_no`, `changes`) is the transport's own wire contract and no Server route reads it, and no batch has been sent to a live RetainDB. |

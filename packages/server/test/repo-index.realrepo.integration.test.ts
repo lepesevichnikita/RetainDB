@@ -25,11 +25,13 @@
  *   embed chunk text with a deterministic pseudo-vector instead of reaching for a model.
  *
  * What this file found at the pinned commit, and therefore asserts: the tree reads COMPLETE
- * (307 paths, no unsafe entry), and the run then REFUSES with MATERIALISE_REFUSED /
- * CHUNK_LIMIT, because the tree materialises to more searchable chunks than
- * `MATERIALISE_LIMITS.maxChunksPerGeneration` allows. Nothing is published. The ceiling is not
- * raised anywhere in this file: a tree above it is the code's own answer, and the honest
- * evidence is the refusal plus the measurements that explain it.
+ * (309 paths, 3.3 MB of blobs, no unsafe entry), and at the DOCUMENTED DEFAULT ceiling the run
+ * REFUSES with MATERIALISE_REFUSED / CHUNK_LIMIT, because the tree materialises to more searchable
+ * chunks than `MATERIALISE_LIMITS.maxChunksPerGeneration` allows. Nothing is published. The cases
+ * whose premise is "the default refuses" delete `MATERIALISE_MAX_CHUNKS_ENV` for their duration and
+ * restore it afterwards, so the premise holds whatever the ambient environment exports; the last
+ * case sets the variable above the tree's plan and asserts the same run no longer refuses at the
+ * ceiling at all.
  */
 
 import assert from "node:assert/strict";
@@ -41,7 +43,7 @@ import { createGitRefProvider } from "../src/connectors/ref-provider-git.js";
 import { REF_RUN_OUTCOME, readCommittedRef, type RefManifestEntry } from "../src/connectors/repo-ref.js";
 import { chunkText } from "../src/engine/chunker.js";
 import { RUN_CODE, runCommittedRef, type CommittedRefRunResult, type PublicationStore } from "../src/engine/repo-index/connector-run.js";
-import { MATERIALISE_CODE, MATERIALISE_LIMITS, type Embedder } from "../src/engine/repo-index/materialise.js";
+import { MATERIALISE_CODE, MATERIALISE_LIMITS, MATERIALISE_MAX_CHUNKS_ENV, type Embedder } from "../src/engine/repo-index/materialise.js";
 import { EMBEDDING_DIMENSIONS } from "../src/engine/repo-index/receipt.js";
 import type { AttemptManifest, FinalizeInput } from "../src/engine/repo-index/store.js";
 
@@ -171,20 +173,24 @@ function searchableChunksOf(path: string, content: string): number {
 }
 
 /**
- * The chunk burden of one tree: how many searchable chunks materialisation would plan for it, and
- * the path at which the running total first crosses `MATERIALISE_LIMITS.maxChunksPerGeneration`.
- * That crossing is the file the refusal names, so it is computed the same way materialisation
- * computes it - over the manifest's path order, one file at a time.
+ * The chunk burden of one tree: how many searchable chunks materialisation would plan for it, the
+ * path at which the running total first crosses `ceiling`, and the running total at that path - the
+ * count a refusal names. That crossing is the file the refusal names, so it is computed the same way
+ * materialisation computes it - over the manifest's path order, one file at a time.
  */
-async function chunkBurden(commit: string, paths: readonly string[]): Promise<{ total: number; crossing: string }> {
+async function chunkBurden(commit: string, paths: readonly string[], ceiling: number): Promise<{ total: number; crossing: string; plannedAtCrossing: number }> {
   const provider = createGitRefProvider({ repoDir: REPO_DIR });
   let total = 0;
   let crossing = "";
+  let plannedAtCrossing = 0;
   for (const path of [...paths].sort()) {
     total += searchableChunksOf(path, await provider.readBlob(commit, path));
-    if (crossing === "" && total > MATERIALISE_LIMITS.maxChunksPerGeneration) crossing = path;
+    if (crossing === "" && total > ceiling) {
+      crossing = path;
+      plannedAtCrossing = total;
+    }
   }
-  return { total, crossing };
+  return { total, crossing, plannedAtCrossing };
 }
 
 /**
@@ -289,6 +295,25 @@ async function runOverRepository(options: { scopeId: string; vectors: ReadonlyMa
   return { result, elapsedMs: Date.now() - started };
 }
 
+/**
+ * Deletes `MATERIALISE_MAX_CHUNKS_ENV` and answers the call that puts the process's own value back.
+ *
+ * The cases that follow assert that the DOCUMENTED DEFAULT refuses this tree. The code under test
+ * reads the variable when a generation is chunked, so an ambient value - an operator's own `50000`,
+ * exported while running this file - would be measured instead of the default: the refusal would
+ * become a publication, or a transaction that outran its budget, and the assertion would be about
+ * the environment rather than about the default. Pinning it makes the premise explicit; the caller
+ * hands the answer to `t.after`, so the restore happens even when an assertion fails first.
+ */
+function pinDefaultCeiling(): () => void {
+  const saved = process.env[MATERIALISE_MAX_CHUNKS_ENV];
+  delete process.env[MATERIALISE_MAX_CHUNKS_ENV];
+  return () => {
+    if (saved === undefined) delete process.env[MATERIALISE_MAX_CHUNKS_ENV];
+    else process.env[MATERIALISE_MAX_CHUNKS_ENV] = saved;
+  };
+}
+
 /** Every table this file writes to, counted for the rows it created. */
 async function countsOf(client: any) {
   return {
@@ -317,7 +342,7 @@ test("the connector reads this repository at its pinned commit, completely and d
   const elapsedMs = Date.now() - started;
 
   // A coarse bound, so the test cannot silently become an empty tree: this repository holds
-  // hundreds of files and megabytes of blobs. Measured: 307 paths, 3,262,417 bytes.
+  // hundreds of files and megabytes of blobs. Measured: 309 paths, 3,308,357 bytes.
   assert.ok(tree.paths.length > 100, `the pinned commit holds a real tree, got ${tree.paths.length} paths`);
   assert.ok(tree.bytes > 1_000_000, `the pinned commit holds real blobs, got ${tree.bytes} bytes`);
   assert.ok(elapsedMs < RUN_BUDGET_MS, `the read finished inside its budget, took ${elapsedMs}ms`);
@@ -353,10 +378,14 @@ test("the connector reads this repository at its pinned commit, completely and d
 // path, the attempt opens and its parts are accepted - and the publish transaction then rolls
 // back, because this tree needs more searchable chunks than MATERIALISE_LIMITS allows. The scope
 // stays at generation 0 with no path row, no document and no chunk.
-test("a committed-ref run over this repository refuses at materialisation and publishes nothing", async () => {
+test("a committed-ref run over this repository refuses at materialisation and publishes nothing", async (t) => {
+  // The premise of this case is the documented default, so the variable is pinned rather than
+  // inherited: the operator who raised the ceiling for their own deployment must not be able to
+  // turn this assertion into a publication (or into the transaction time that follows one).
+  t.after(pinDefaultCeiling());
   const commit = await pinnedCommit();
   const tree = await treeOf(commit);
-  const burden = await chunkBurden(commit, tree.paths);
+  const burden = await chunkBurden(commit, tree.paths, MATERIALISE_LIMITS.maxChunksPerGeneration);
   const { client, project, scope } = await fixtureScope();
   const manifests: AttemptManifest[] = [];
   const vectors = vectorsOf(tree.entries);
@@ -378,12 +407,17 @@ test("a committed-ref run over this repository refuses at materialisation and pu
   assert.equal(result.commit, commit, "the refusal names the commit it read");
 
   // Why: this tree plans for more searchable chunks than one generation may materialise, and the
-  // refusal names the file at which the running total crossed the ceiling.
+  // refusal names the file at which the running total crossed the ceiling, the plan by that file,
+  // the ceiling in force and the variable that decides it.
   assert.ok(
     burden.total > MATERIALISE_LIMITS.maxChunksPerGeneration,
     `the tree plans ${burden.total} searchable chunks against a ${MATERIALISE_LIMITS.maxChunksPerGeneration} ceiling`,
   );
-  assert.equal(result.failure, `${MATERIALISE_CODE.CHUNK_LIMIT}: ${burden.crossing}`, "the refusal names the crossing file");
+  assert.equal(
+    result.failure,
+    `${MATERIALISE_CODE.CHUNK_LIMIT}: ${burden.crossing}: planned ${burden.plannedAtCrossing} chunks so far - ${burden.plannedAtCrossing} new, 0 reused - exceeding the ${MATERIALISE_LIMITS.maxChunksPerGeneration}-chunk ceiling set by ${MATERIALISE_MAX_CHUNKS_ENV} (unset, documented default)`,
+    "the refusal names the crossing file, the plan so far, the ceiling in force and the variable that sets it",
+  );
 
   // The attempt did reach the store: one part was submitted before the transaction refused it.
   assert.ok(result.partCount >= 1, `the run submitted ${result.partCount} part(s) before the refusal`);
@@ -429,7 +463,11 @@ test("a committed-ref run over this repository refuses at materialisation and pu
 // two attempts - declare the same manifest digest and the same path set, and that digest is the
 // digest of the tree git reports. Without a forge this is the closest thing to two devices
 // retrieving one revision: the answer is a property of the commit, not of the run.
-test("two independent runs of the same pinned commit declare the same manifest digest and path set", async () => {
+test("two independent runs of the same pinned commit declare the same manifest digest and path set", async (t) => {
+  // Both runs are asserted to refuse at the documented default, so the variable is pinned here too:
+  // with it exported, the two runs would publish (or spend 30s each trying to) and this case would
+  // be measuring the environment instead of the answer a default deployment gets.
+  t.after(pinDefaultCeiling());
   const commit = await pinnedCommit();
   const tree = await treeOf(commit);
   const vectors = vectorsOf(tree.entries);
@@ -477,6 +515,65 @@ test("two independent runs of the same pinned commit declare the same manifest d
     assert.equal(scopeAfter.activeGeneration, 0);
     assert.equal(await client.repoIndexPath.count({ where: { scopeId: scope.id } }), 0);
   }
+});
+
+// Behaviour: the ceiling is configuration, not a property of this tree. The same commit, the same
+// manifest, the same reader, the same embedder and the same store, with the variable raised above
+// the plan, no longer refuse at CHUNK_LIMIT. What happens next is recorded rather than assumed: the
+// publication either finishes inside the publish transaction's 30s budget and publishes, or the
+// store answers LOCK_TIMEOUT because that budget expired. Both are asserted, so a failure to
+// publish can never be read as the ceiling still refusing - and a run that stopped for any other
+// reason fails this case instead of passing quietly.
+test("with the ceiling raised above the plan, the same run does not refuse at the ceiling", async (t) => {
+  const commit = await pinnedCommit();
+  const tree = await treeOf(commit);
+  const raised = 50_000;
+  const burden = await chunkBurden(commit, tree.paths, raised);
+  const { client, project, scope } = await fixtureScope();
+  const manifests: AttemptManifest[] = [];
+
+  // The premise: the ceiling now in force is above what this tree plans, so a CHUNK_LIMIT answer
+  // would mean the configuration is not the one the run obeyed.
+  assert.ok(burden.total <= raised, `the raised ceiling is above the tree's plan: ${burden.total} <= ${raised}`);
+  assert.equal(burden.crossing, "", "no file of this tree crosses the raised ceiling");
+
+  const saved = process.env[MATERIALISE_MAX_CHUNKS_ENV];
+  t.after(() => {
+    if (saved === undefined) delete process.env[MATERIALISE_MAX_CHUNKS_ENV];
+    else process.env[MATERIALISE_MAX_CHUNKS_ENV] = saved;
+  });
+  process.env[MATERIALISE_MAX_CHUNKS_ENV] = String(raised);
+
+  const { result, elapsedMs } = await runOverRepository({ scopeId: scope.id, vectors: vectorsOf(tree.entries), manifests });
+  assert.ok(elapsedMs < RUN_BUDGET_MS, `the run finished inside its budget, took ${elapsedMs}ms`);
+
+  // The ceiling is gone from the answer, whatever else happened: no CHUNK_LIMIT code, and no
+  // CHUNK_LIMIT in the text an operator would read.
+  assert.notEqual(result.materialiseCode, MATERIALISE_CODE.CHUNK_LIMIT, `the raised ceiling must not refuse the tree: ${JSON.stringify(result)}`);
+  assert.equal(String(result.failure ?? "").includes(MATERIALISE_CODE.CHUNK_LIMIT), false, `and nothing names the ceiling: ${result.failure}`);
+
+  if (result.code === RUN_CODE.PUBLISHED) {
+    // The tree became the generation the scope serves, holding every chunk the plan measured.
+    assert.equal(result.generation, 1, "the first publication is generation 1");
+    assert.equal(await client.repoIndexPath.count({ where: { scopeId: scope.id } }), tree.paths.length, "every path of the tree has a row");
+    assert.equal(await client.chunk.count({ where: { projectId: project.id } }), burden.total, "and the generation holds every chunk the plan measured");
+    t.diagnostic(`published ${tree.paths.length} paths and ${burden.total} chunks in ${elapsedMs}ms`);
+    return;
+  }
+
+  // Not the ceiling. The run got past the plan, embedded every chunk and then ran out of the publish
+  // transaction's 30s budget, which the store answers as LOCK_TIMEOUT. That is a separate blocker -
+  // the transaction's budget, not the configuration - and it is named here rather than passed over:
+  // a tree this size is exactly the tree the variable exists to allow.
+  assert.equal(result.code, RUN_CODE.STORE_REFUSED, `the run was stopped above the ceiling, by the store: ${JSON.stringify(result)}`);
+  assert.equal(result.storeCode, "LOCK_TIMEOUT", "the publish transaction outran its 30s budget");
+  assert.equal(result.layer, "store");
+  t.diagnostic(
+    `the ceiling no longer refuses this tree; the publication then hit the publish transaction's 30s budget after ${elapsedMs}ms ` +
+      `(${result.code}/${result.storeCode}). That is a separate blocker - the transaction's budget, not the ceiling - and nothing was published.`,
+  );
+  assert.equal((await client.repoIndexScope.findUniqueOrThrow({ where: { id: scope.id } })).activeGeneration, 0, "a transaction that expired published nothing");
+  assert.equal(await client.repoIndexPath.count({ where: { scopeId: scope.id } }), 0, "and left no path row with it");
 });
 
 after(async () => {

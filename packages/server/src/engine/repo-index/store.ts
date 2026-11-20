@@ -473,9 +473,10 @@ async function publish(tx: Transaction, input: FinalizeInput): Promise<FinalizeR
 
 /**
  * Turns the generation this transaction just sealed into searchable rows, in this same transaction.
- * A refusal (content that cannot be read, an unusable vector, a tree above MATERIALISE_LIMITS)
- * throws, so the seal, the generation bump and the path rows roll back together: no generation is
- * ever visible while half its chunks are missing, and the generation it replaced stays current.
+ * A refusal (content that cannot be read, an unusable vector, a generation above its chunk ceiling -
+ * `MATERIALISE_LIMITS`, or the variable that raises it) throws, so the seal, the generation bump and
+ * the path rows roll back together: no generation is ever visible while half its chunks are missing,
+ * and the generation it replaced stays current.
  *
  * A publication without a reader still owes the deletion half. The paths its manifest no longer
  * names stop being searchable, whether or not anything was read: that half needs no content, so a

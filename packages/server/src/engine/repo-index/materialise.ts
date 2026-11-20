@@ -21,8 +21,8 @@
  *   query can return it, so storing it would be a row nothing reads.
  *
  * Atomicity: the caller runs this on the transaction that publishes the generation, so a refusal
- * (unreadable content, an unusable vector, a tree above the chunk ceiling) rolls back the seal, the
- * generation bump and the path rows together. No generation can be visible while half its chunks
+ * (unreadable content, an unusable vector, a generation above the chunk ceiling) rolls back the seal,
+ * the generation bump and the path rows together. No generation can be visible while half its chunks
  * are missing, and the generation it replaced is untouched.
  *
  * Content comes from the caller: `readContent` is the only way a file is read here, so this module
@@ -130,10 +130,41 @@ export class MaterialiseError extends Error {
   constructor(
     readonly code: MaterialiseCode,
     readonly path?: string,
+    /** The chunk tally behind a CHUNK_LIMIT refusal: what the generation would hold, and against what. */
+    readonly tally?: ChunkTally,
   ) {
-    super(path ? `${code}: ${path}` : code);
+    super(refusalOf(code, path, tally));
     this.name = "MaterialiseError";
   }
+}
+
+/**
+ * What one generation would hold against the ceiling it is measured against: the chunks a previous
+ * publication already embedded and this one reuses, the chunks this one has planned so far, and the
+ * knob that set the ceiling - the variable and its value, or the caller's own number.
+ */
+export interface ChunkTally {
+  ceiling: number;
+  reused: number;
+  planned: number;
+  source: string;
+}
+
+/**
+ * The refusal as a caller reads it: the file it happened on, the chunks the generation had planned
+ * by then, which part of them is new and which is reused, the ceiling in force and the setting it
+ * came from.
+ *
+ * A first publication - the run every deployment makes - reuses nothing, and its refusal used to be
+ * exactly `CHUNK_LIMIT: <path>`: no number, no ceiling and no setting, which tells an operator
+ * neither whether the tree is too large, which number stopped it, nor where to raise it. So the
+ * tally is stated for every publication, the reuse-free one included, and the split is spelled out
+ * because it is what the generation would hold: the plan by this file, and none of it reused.
+ */
+function refusalOf(code: MaterialiseCode, path: string | undefined, tally: ChunkTally | undefined): string {
+  const refusal = path ? `${code}: ${path}` : code;
+  if (!tally) return refusal;
+  return `${refusal}: planned ${tally.planned} chunks so far - ${tally.planned} new, ${tally.reused} reused - exceeding the ${tally.ceiling}-chunk ceiling set by ${tally.source}`;
 }
 
 /**
@@ -144,9 +175,12 @@ export class MaterialiseError extends Error {
 export const MATERIALISE_MAX_CHUNKS_ENV = "RETAINDB_REPO_INDEX_MAX_CHUNKS_PER_GENERATION";
 
 /**
- * The ceiling on the chunks one generation may materialise. It bounds the embedding work the
- * publish transaction performs, so an over-sized tree is refused instead of holding the transaction
- * (and the generation's row lock) open until it times out.
+ * The ceiling on the chunks one generation may hold: the chunks a previous publication already
+ * embedded and this one reuses, plus the chunks this one plans to embed. It bounds what the publish
+ * transaction has to carry, so an over-sized generation is refused instead of holding the
+ * transaction (and the generation's row lock) open until it times out. The reuse is counted because
+ * a re-publication that keeps 5,000 chunks and plans 1,999 still holds 6,999: a ceiling that only
+ * watched the new work would not be the budget it claims to be.
  *
  * `maxChunksPerGeneration` is the default an unconfigured process runs with;
  * `largestConfiguredChunks` is the most the variable may name, because a ceiling above it is a typo
@@ -159,6 +193,30 @@ export const MATERIALISE_LIMITS = {
   largestConfiguredChunks: 200_000,
 } as const;
 
+/** How much of a refused value the message echoes: enough to recognise it, never a pasted payload. */
+const ECHOED_CHARS = 40;
+
+/**
+ * The received value as the refusal states it: quoted, so a newline or a tab cannot forge or split a
+ * log line, and clipped, so a 4 KB paste cannot become the message a caller reads or serves.
+ */
+function echoed(received: string): string {
+  return JSON.stringify(received.length > ECHOED_CHARS ? `${received.slice(0, ECHOED_CHARS)}...` : received);
+}
+
+/**
+ * A configured value that cannot be a ceiling. It is the process's configuration, not the tree it
+ * was asked to publish, so it is named apart from `MaterialiseError`: a caller that reports store
+ * failures must not read an operator's typo as a broken database, and the answer is "fix the
+ * variable", not "this generation is too large".
+ */
+export class MaterialiseConfigurationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MaterialiseConfigurationError";
+  }
+}
+
 /**
  * The ceiling in force for one materialisation: `MATERIALISE_MAX_CHUNKS_ENV` when it names a
  * whole number of chunks, the documented default when it is unset or empty.
@@ -170,17 +228,35 @@ export const MATERIALISE_LIMITS = {
 export function maxChunksPerGeneration(): number {
   const received = process.env[MATERIALISE_MAX_CHUNKS_ENV];
   if (received === undefined || received.trim() === "") return MATERIALISE_LIMITS.maxChunksPerGeneration;
-  const ceiling = Number(received);
+  // The separator is accepted because the largest ceiling is written `200_000` here and in the docs:
+  // a variable that refused the spelling its own constant uses would be the incoherence, not the fix.
+  const ceiling = Number(received.trim().replaceAll("_", ""));
   const accepted = Number.isInteger(ceiling) && ceiling >= 1 && ceiling <= MATERIALISE_LIMITS.largestConfiguredChunks;
   if (!accepted) {
-    throw new Error(
-      `${MATERIALISE_MAX_CHUNKS_ENV}=${received} is not a chunk ceiling: set a whole number of chunks ` +
+    throw new MaterialiseConfigurationError(
+      `${MATERIALISE_MAX_CHUNKS_ENV}=${echoed(received)} is not a chunk ceiling: set a whole number of chunks ` +
         `between 1 and ${MATERIALISE_LIMITS.largestConfiguredChunks}, or leave it unset for the default of ` +
         `${MATERIALISE_LIMITS.maxChunksPerGeneration}`,
     );
   }
   return ceiling;
 }
+
+/**
+ * Reads the ceiling once as this module loads, so a process configured with a value that cannot be a
+ * ceiling fails at start. The same validation used to run only when a generation was chunked: that is
+ * inside the publish transaction, after the scope's row lock and after the seal, so a committed-ref
+ * run answered `STORE_FAILED` with layer "store" and an operator's typo read as a broken database.
+ *
+ * The read inside `maxChunksPerGeneration` stays, because a process whose environment changes at
+ * runtime must still be refused at the point of use; this call is what moves the common case - a
+ * deployment started with a bad value - to load time, before any transaction exists to fail.
+ */
+function refuseInvalidChunkCeiling(): void {
+  maxChunksPerGeneration();
+}
+
+refuseInvalidChunkCeiling();
 
 /** The source `type` that marks a source as this scope's mirror, never an ingested document set. */
 export const REPO_INDEX_SOURCE_TYPE = "repo_index";
@@ -225,27 +301,76 @@ export function partitionByDigest(
  * Everything that must happen before the first row is written: decide what is already materialised,
  * read and chunk the rest, refuse beyond the ceiling, then embed. A refusal here means the caller's
  * transaction has not touched a row, so a failed materialisation cannot leave partial state.
+ *
+ * The ceiling is spent on the whole generation, not only on the new work: the chunks a publication
+ * reuses are chunks the generation it serves will hold, so they are counted before the first read.
  */
 export async function prepareMaterialisation(input: PrepareInput): Promise<PreparedMaterialisation> {
   const { reuse, pending } = partitionByDigest(input.paths, input.previous);
-  const prepared = await chunkPaths(pending, input.readContent, input.maxChunks ?? maxChunksPerGeneration());
+  const budget: ChunkBudget = {
+    ceiling: input.maxChunks ?? maxChunksPerGeneration(),
+    reused: reusedChunksOf(reuse),
+    source: ceilingSource(input.maxChunks),
+  };
+  const prepared = await chunkPaths(pending, input.readContent, budget);
   await embedChunks(prepared, input.embed ?? embedDocuments);
   return { reuse, pending: prepared };
 }
 
-async function chunkPaths(paths: readonly SourcePath[], readContent: ContentReader, maxChunks: number): Promise<PreparedPath[]> {
+/**
+ * The ceiling one materialisation is measured against, the chunks it reuses before it plans, and the
+ * knob the number came from - which is what a refusal has to name if an operator is to act on it.
+ */
+interface ChunkBudget {
+  ceiling: number;
+  reused: number;
+  source: string;
+}
+
+/**
+ * Where the ceiling in force came from, as a refusal names it: the caller's own number when one is
+ * injected, otherwise the variable and the value it holds - or that it is unset, which is the
+ * documented default. Naming the variable is the point: `CHUNK_LIMIT: <path>` told an operator
+ * neither which number refused the tree nor which setting would raise it.
+ */
+function ceilingSource(maxChunks: number | undefined): string {
+  if (maxChunks !== undefined) return "the caller's maxChunks";
+  const configured = process.env[MATERIALISE_MAX_CHUNKS_ENV];
+  return configured === undefined || configured.trim() === "" ? `${MATERIALISE_MAX_CHUNKS_ENV} (unset, documented default)` : `${MATERIALISE_MAX_CHUNKS_ENV}=${configured}`;
+}
+
+/** The chunks a re-publication keeps: rows that stay searchable, and so count against the ceiling. */
+function reusedChunksOf(reuse: readonly ReusedPath[]): number {
+  return reuse.reduce((total, entry) => total + entry.chunkIds.length, 0);
+}
+
+async function chunkPaths(paths: readonly SourcePath[], readContent: ContentReader, budget: ChunkBudget): Promise<PreparedPath[]> {
   const prepared: PreparedPath[] = [];
   let planned = 0;
+  // Judged before the first read: a publication that only renames paths still holds every chunk it
+  // reuses, and a generation whose reuse alone crosses the ceiling has no room to plan anything.
+  refuseAboveCeiling(budget, planned);
   for (const entry of paths) {
     const content = await readContentOf(readContent, entry.path);
     const chunks = chunkFile(entry.path, content);
     planned += chunks.length;
     // Checked per file, not after the last one: an over-sized tree stops reading here, before a
     // single embedding request, instead of spending the whole transaction budget first.
-    if (planned > maxChunks) throw new MaterialiseError(MATERIALISE_CODE.CHUNK_LIMIT, entry.path);
+    refuseAboveCeiling(budget, planned, entry.path);
     prepared.push({ path: entry.path, digest: entry.digest, content, chunks: chunks.map((chunk) => ({ chunk, vector: [] })) });
   }
   return prepared;
+}
+
+/** Refuses once the generation - the reused chunks plus the planned ones - is over its ceiling. */
+function refuseAboveCeiling(budget: ChunkBudget, planned: number, path?: string): void {
+  if (budget.reused + planned <= budget.ceiling) return;
+  throw new MaterialiseError(MATERIALISE_CODE.CHUNK_LIMIT, path, {
+    ceiling: budget.ceiling,
+    reused: budget.reused,
+    planned,
+    source: budget.source,
+  });
 }
 
 async function readContentOf(readContent: ContentReader, path: string): Promise<string> {

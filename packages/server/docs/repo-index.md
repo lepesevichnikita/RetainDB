@@ -7,9 +7,11 @@ client that produces the metadata is documented separately in
 
 Unreleased, and not verified end to end. The migration has been applied to a real PostgreSQL 16
 with pgvector 0.8.7 (75 tables, including all five `repo_index_*` tables), and the DB-gated tests
-now execute against a database instead of skipping: the full server suite reports 207 tests, 207
-pass, 0 fail, 0 skipped. Read [Operational status](#operational-status) before relying on any of
-it.
+now execute against a database instead of skipping: with `RETAINDB_TEST_DATABASE_URL` pointing at
+that database and `RETAINDB_TEST_LOCAL_EMBEDDINGS=true`, the full server suite reports 272 tests,
+272 pass, 0 fail, 0 skipped. Both variables are needed: without the second, the embedding-backed
+cases skip, and a skipped case is not a passing one. Read
+[Operational status](#operational-status) before relying on any of it.
 
 ## Where the code is
 
@@ -482,10 +484,16 @@ It created 75 tables, including all five `repo_index_*` tables: `repo_index_scop
 `repo_index_grants`, `repo_index_generations`, `repo_index_parts` and `repo_index_paths`. With
 that database attached, the DB-gated tests execute instead of skipping.
 
-**The suite is green.** The full server suite, run with the database attached, reported 207 tests:
-207 pass, 0 fail, 0 skipped. A green run is not the same as verified end to end: no publication
-has been materialised, read back and found by search through the real query path, so a passing
-count here says the tests pass, not that the feature works against a deployment.
+**The suite is green.** The full server suite, run with the database attached, reported 272 tests:
+272 pass, 0 fail, 0 skipped. A green run is still not the same as verified end to end, but one
+specific gap has now closed: `repo-index.publish.integration.test.ts` drives a real on-disk git
+repository through the on-disk provider and `runCommittedRef`, publishes a generation, and then
+finds a published path with an actual pgvector nearest-neighbour query that resolves the hit back
+to its `repo_index_paths` row, with every stored vector 1024 dimensions and non-zero. Two limits on
+that evidence, both deliberate: the vectors come from a deterministic injected embedder rather
+than an embedding model, and the query is SQL against the store rather than a request through the
+HTTP query route. So a publication has been materialised, read back and found by search at the
+storage layer; it has not been found through the deployed query API, and no model produced a vector.
 
 | Part | Runs against a real PostgreSQL | Test that covers it |
 | --- | --- | --- |
@@ -501,8 +509,10 @@ count here says the tests pass, not that the feature works against a deployment.
 
 So: the enrolment surface, the fence, the cursor signing, the chunk partitioning and the run's
 decision logic are covered by tests that do not need a database. Tests that need rows now execute
-against a real PostgreSQL, and the full suite is green: 207 of 207 pass. Treat the feature as
-unreleased and not verified end to end until a publication has been materialised, read back and
-found by search against a real PostgreSQL. The transport exists but no batch has reached a live
-RetainDB, the committed-ref adapter has run only against on-disk fixture repositories, no real
-client (Claude, Codex or Hermes) has been exercised against this feature, and nothing is deployed.
+against a real PostgreSQL, and the full suite is green: 272 of 272 pass. Treat the feature as
+unreleased and not verified end to end: a publication has now been materialised and found by a
+pgvector query over its stored vectors, but with an injected deterministic embedder and against the
+store rather than through the HTTP query route, so the deployed search path remains unproven. The
+transport exists but no batch has reached a live RetainDB, the committed-ref adapter has run only
+against on-disk fixture repositories, no real client (Claude, Codex or Hermes) has been exercised
+against this feature, and nothing is deployed.

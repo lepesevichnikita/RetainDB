@@ -14,6 +14,7 @@ if (databaseUrl) {
 const adminPath = "../src/api/repo-index-admin.js";
 const routerPath = "../src/api/repo-index.js";
 const tokenPath = "../src/engine/repo-index/grant-token.js";
+const receiptPath = "../src/engine/repo-index/receipt.js";
 const dbPath = "../src/db/index.js";
 /** One literal token and its digest, so a change to either side of mint/lookup fails here. */
 const KNOWN_TOKEN = "0123456789abcdef0123456789abcdef";
@@ -52,14 +53,30 @@ async function adminApp() {
 
 type AdminApp = Awaited<ReturnType<typeof adminApp>>;
 
-function postInit(body?: unknown): RequestInit {
-  const headers = { "content-type": "application/json" };
-  if (body === undefined) return { method: "POST", headers };
-  return { method: "POST", headers, body: JSON.stringify(body) };
+function jsonInit(method: string, body?: unknown, headers: Record<string, string> = {}): RequestInit {
+  return {
+    method,
+    headers: { "content-type": "application/json", ...headers },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  };
 }
 
-async function call(app: AdminApp, path: string, body?: unknown) {
-  const response = await app.request(path, postInit(body));
+function postInit(body?: unknown): RequestInit {
+  return jsonInit("POST", body);
+}
+
+/** A POST that also carries a scope grant token, the way a data-plane caller proves one. */
+function grantPostInit(token: string, body?: unknown): RequestInit {
+  return jsonInit("POST", body, { [GRANT_HEADER]: token });
+}
+
+/** A PUT that carries a scope grant token; opening an attempt and writing a part are PUTs. */
+function grantPutInit(token: string, body: unknown): RequestInit {
+  return jsonInit("PUT", body, { [GRANT_HEADER]: token });
+}
+
+async function call(app: AdminApp, path: string, body?: unknown, headers: Record<string, string> = {}) {
+  const response = await app.request(path, jsonInit("POST", body, headers));
   return { status: response.status, body: (await response.json()) as any };
 }
 
@@ -176,6 +193,19 @@ async function mintGrant(app: AdminApp, scopeId: string, kind: string, principal
   return minted.body.token as string;
 }
 
+/**
+ * The operator path for the first admin grant: one row provisioned out of band with its own
+ * database access. The surface will not mint `admin` for a caller that does not already present
+ * one, so the first one cannot come over HTTP, and a deployment seeds it the way this helper does.
+ */
+async function seedAdminGrant(scopeId: string, principal: string) {
+  const token = randomUUID().replace(/-/g, "");
+  await (await dbClient()).repoIndexGrant.create({
+    data: { scopeId, kind: "admin", principal, tokenHash: createHash("sha256").update(token, "utf8").digest("hex") },
+  });
+  return token;
+}
+
 // Behaviour: the only value that reaches the grants table is a digest of the token, so a database
 // read can never yield the plaintext a client was handed, and the digest is the one repo-index.ts
 // computes when it looks a grant up.
@@ -222,6 +252,17 @@ test("every documented grant kind is accepted", async () => {
   for (const kind of ["reader", "uploader", "connector", "admin"]) {
     assert.equal(grantRequestSchema.safeParse({ kind, principal: "ci" }).success, true, kind);
   }
+});
+
+// Behaviour: the kinds the mint route refuses to hand out on the deployment key's own authority are
+// exactly the kinds that can publish or abandon a generation. Pinned to CAPABILITY, the one table
+// that decides promotion: a kind added there without the same treatment in the mint rule fails here
+// instead of quietly reopening the escalation this surface has to prevent.
+test("the kinds the mint rule refuses are the kinds only publication accepts", async () => {
+  const { PROMOTION_KINDS } = await import(adminPath);
+  const { CAPABILITY } = await import(routerPath);
+  const promotive = new Set([...CAPABILITY.FINALIZE, ...CAPABILITY.ABANDON]);
+  assert.deepEqual([...PROMOTION_KINDS].sort(), [...promotive].sort());
 });
 
 // Behaviour: no credential is minted for a request that never passed the auth middleware, so a
@@ -527,6 +568,116 @@ run("minting the same kind for the same principal twice is refused", async () =>
   assert.equal(second.status, 409);
   assert.equal(second.body.error.code, "GRANT_DUPLICATE");
   assert.equal(second.body.error.grant.id, live.id);
+});
+
+// Behaviour: an uploader holds no promotion right, so its own token cannot mint the admin grant
+// that would let it publish its own upload. The mint is refused and writes no row at all.
+run("an uploader grant cannot mint an admin grant on its own scope", async () => {
+  const { app, scopeId } = await enrolledScope();
+  const uploaderToken = await mintGrant(app, scopeId, "uploader", "ci-uploader");
+  const refused = await call(app, grantsUrl(scopeId), { kind: "admin", principal: "ci-uploader-admin" }, {
+    [GRANT_HEADER]: uploaderToken,
+  });
+  assert.equal(refused.status, 403);
+  assert.equal(refused.body.success, false);
+  assert.equal(refused.body.error.code, "GRANT_KIND_REFUSED");
+  assert.equal(refused.body.error.kind, "admin");
+  const rows = await (await dbClient()).repoIndexGrant.findMany({ where: { scopeId, kind: "admin" } });
+  assert.deepEqual(rows, []);
+});
+
+// Behaviour: the deployment key authenticates the control plane but cannot publish, so it cannot
+// mint the one kind that can. The refusal is specific to that kind: the same key still mints a
+// reader below, which is what keeps enrolment usable.
+run("the deployment key alone cannot mint an admin grant", async () => {
+  const { app, scopeId } = await enrolledScope();
+  const refused = await call(app, grantsUrl(scopeId), { kind: "admin", principal: "operator" });
+  assert.equal(refused.status, 403);
+  assert.equal(refused.body.error.code, "GRANT_KIND_REFUSED");
+  assert.equal(refused.body.error.kind, "admin");
+  const rows = await (await dbClient()).repoIndexGrant.findMany({ where: { scopeId, kind: "admin" } });
+  assert.deepEqual(rows, []);
+  const reader = await call(app, grantsUrl(scopeId), { kind: "reader", principal: "ci-reader" });
+  assert.equal(reader.status, 201, JSON.stringify(reader.body));
+  assert.equal(reader.body.code, "GRANT_CREATED");
+});
+
+// Behaviour: the legitimate admin path keeps working. A caller that presents an admin grant on the
+// scope mints every kind, so the rule narrows who may mint admin without making any kind
+// unreachable.
+run("an admin grant mints every kind", async () => {
+  const { app, scopeId } = await enrolledScope();
+  const adminToken = await seedAdminGrant(scopeId, "operator");
+  for (const kind of ["reader", "uploader", "connector", "admin"]) {
+    const minted = await call(app, grantsUrl(scopeId), { kind, principal: `operator-${kind}` }, {
+      [GRANT_HEADER]: adminToken,
+    });
+    assert.equal(minted.status, 201, `${kind}: ${JSON.stringify(minted.body)}`);
+    assert.equal(minted.body.code, "GRANT_CREATED");
+    assert.equal(minted.body.grant.kind, kind);
+  }
+});
+
+// Behaviour: presenting a revoked admin grant mints nothing, so revoking the promotion credential
+// retires it on this surface too and does not leave a live path to a fresh admin grant.
+run("a revoked admin grant cannot mint an admin grant", async () => {
+  const { app, scopeId } = await enrolledScope();
+  const adminToken = await seedAdminGrant(scopeId, "operator");
+  const live = await (await dbClient()).repoIndexGrant.findFirst({ where: { scopeId, kind: "admin" } });
+  const revoked = await call(app, grantRevokeUrl(scopeId, live.id));
+  assert.equal(revoked.status, 200, JSON.stringify(revoked.body));
+  const refused = await call(app, grantsUrl(scopeId), { kind: "admin", principal: "successor" }, {
+    [GRANT_HEADER]: adminToken,
+  });
+  assert.equal(refused.status, 403);
+  assert.equal(refused.body.error.code, "GRANT_KIND_REFUSED");
+  const admins = await (await dbClient()).repoIndexGrant.findMany({ where: { scopeId, kind: "admin", revokedAt: null } });
+  assert.deepEqual(admins, []);
+});
+
+// Behaviour: the refused mint leaves no capability behind. The uploader's attempt stays open, its
+// parts are stored, and it still cannot publish: the generation it was refused never becomes the
+// scope's active generation.
+run("an uploader refused an admin mint still cannot publish its upload", async () => {
+  const { app, scopeId } = await enrolledScope();
+  const uploaderToken = await mintGrant(app, scopeId, "uploader", "ci-uploader");
+  const { repoIndexRoutes } = await import(routerPath);
+  const { EMBEDDING_DIMENSIONS } = await import(receiptPath);
+  const attemptId = randomUUID();
+  const attemptUrl = `/v1/repo-index/scopes/${scopeId}/generations/${attemptId}`;
+  const opened = await repoIndexRoutes.request(
+    attemptUrl,
+    grantPutInit(uploaderToken, { baseGeneration: 0, revision: 1, manifestDigest: "digest-1", partCount: 1 }),
+  );
+  assert.equal(opened.status, 201, JSON.stringify(await opened.clone().json()));
+  assert.equal(((await opened.json()) as any).code, "ATTEMPT_OPEN");
+  const wrote = await repoIndexRoutes.request(`${attemptUrl}/parts/1`, grantPutInit(uploaderToken, {
+    upserts: ["src/a.ts"],
+    tombstones: [],
+  }));
+  assert.equal(wrote.status, 202);
+  assert.equal(((await wrote.json()) as any).code, "PART_ACCEPTED");
+
+  const refused = await call(app, grantsUrl(scopeId), { kind: "admin", principal: "ci-uploader-admin" }, {
+    [GRANT_HEADER]: uploaderToken,
+  });
+  assert.equal(refused.status, 403);
+  assert.equal(refused.body.error.code, "GRANT_KIND_REFUSED");
+
+  const vector = Array<number>(EMBEDDING_DIMENSIONS).fill(0);
+  vector[0] = 1;
+  const finalized = await repoIndexRoutes.request(`${attemptUrl}/finalize`, grantPostInit(uploaderToken, {
+    requiredPaths: ["src/a.ts"],
+    manifest: { digest: "digest-1", dimensions: EMBEDDING_DIMENSIONS, entries: [{ path: "src/a.ts", digest: "content-src/a.ts", vector }] },
+  }));
+  assert.equal(finalized.status, 403);
+  assert.equal(((await finalized.json()) as any).error.code, "GRANT_MISSING");
+
+  const client = await dbClient();
+  const scope = await client.repoIndexScope.findUnique({ where: { id: scopeId } });
+  assert.equal(scope.activeGeneration, 0);
+  const attempt = await client.repoIndexGeneration.findFirst({ where: { scopeId, attemptId } });
+  assert.equal(attempt.status, "open");
 });
 
 // Behaviour: a paused scope accepts nothing, including new credentials.

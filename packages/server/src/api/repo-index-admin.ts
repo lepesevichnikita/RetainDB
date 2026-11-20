@@ -17,6 +17,19 @@
  * the call that minted it; only its sha256 digest reaches the database, and no log line or
  * refusal carries it, because `repo-index.ts` resolves a grant by `tokenHash` and nothing else.
  *
+ * Minting authority: no route may mint a grant kind it cannot itself present. A kind that carries
+ * the promotion decision (`PROMOTION_KINDS`, which `repo-index.ts` accepts for finalize and abandon)
+ * is minted only for a caller that already presents a live grant of that kind on the same scope in
+ * `X-RetainDB-Repo-Index-Grant`; anyone else answers `403 GRANT_KIND_REFUSED`. That is what keeps an
+ * uploader from minting the admin grant that publishes its own upload, and it is why the deployment
+ * key - a data-plane credential that cannot publish - cannot mint `admin` either. The kinds that
+ * cannot publish are minted on the deployment key's authority, so enrolment stays usable.
+ *
+ * The first admin grant of a scope is therefore not minted here: a deployment provisions it out of
+ * band with its own database access (one live row whose `tokenHash` is the sha256 of a token it
+ * keeps), and that holder mints the rest. There is deliberately no request that creates the first
+ * one, because such a request would be the escalation this rule exists to refuse.
+ *
  * State machine, chosen so that no transition can leave the terminal state:
  *   active   --pause-->    paused      (reversible; a paused scope serves and accepts nothing)
  *   paused   --resume-->   active      (the documented way back; its grants survive the pause)
@@ -34,7 +47,7 @@ import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import { z } from "zod";
 import { prisma } from "../db/index.js";
-import { mintGrantToken } from "../engine/repo-index/grant-token.js";
+import { hashGrantToken, mintGrantToken } from "../engine/repo-index/grant-token.js";
 import { resolveProjectReference } from "./helpers.js";
 import type { AuthContext } from "../middleware/auth.js";
 import type { Context, Next } from "hono";
@@ -61,6 +74,24 @@ const db = prisma as any;
 
 /** The capabilities a grant can carry. `connector` is reserved for the sync worker. */
 export const GRANT_KINDS = ["reader", "uploader", "connector", "admin"] as const;
+
+/**
+ * The kinds that carry the promotion decision, and therefore the only ones this surface refuses to
+ * hand out on the deployment key's own authority: `repo-index.ts` accepts `admin` alone for FINALIZE
+ * and ABANDON, so a grant of one of these is the right to publish an upload.
+ *
+ * The rule this table serves: no route may mint a grant kind it cannot itself present. A promotion
+ * kind is minted only by a caller that already presents one of that kind on the same scope, which is
+ * what stops an uploader from minting itself the admin grant that publishes its own upload. The
+ * kinds outside this list cannot publish, so minting one on the deployment key's authority adds no
+ * capability that key does not already exercise; the deployment key itself cannot publish, so it
+ * cannot mint the kind that can. Keeping this list equal to CAPABILITY.FINALIZE and CAPABILITY.ABANDON
+ * is pinned by the admin suite, so a new promotive kind fails there instead of reopening this.
+ */
+export const PROMOTION_KINDS: readonly string[] = ["admin"];
+
+/** Header that carries a scope grant token; the same one `repo-index.ts` resolves a grant from. */
+const GRANT_HEADER = "X-RetainDB-Repo-Index-Grant";
 
 const SCOPE_STATE = {
   ACTIVE: "active",
@@ -91,6 +122,8 @@ const CODE = {
   GRANT_NOT_FOUND: "GRANT_NOT_FOUND",
   GRANT_REVOKED: "GRANT_REVOKED",
   GRANT_ALREADY_REVOKED: "GRANT_ALREADY_REVOKED",
+  /** The requested kind is promotive and this caller presented no grant of that kind on the scope. */
+  GRANT_KIND_REFUSED: "GRANT_KIND_REFUSED",
   PROJECT_NOT_FOUND: "PROJECT_NOT_FOUND",
   ADMIN_REQUIRED: "ADMIN_REQUIRED",
 } as const;
@@ -118,6 +151,7 @@ const HTTP_STATUS: Record<Code, ContentfulStatusCode> = {
   [CODE.GRANT_NOT_FOUND]: 404,
   [CODE.GRANT_REVOKED]: 200,
   [CODE.GRANT_ALREADY_REVOKED]: 200,
+  [CODE.GRANT_KIND_REFUSED]: 403,
   [CODE.PROJECT_NOT_FOUND]: 404,
   [CODE.ADMIN_REQUIRED]: 403,
 };
@@ -223,6 +257,13 @@ repoIndexAdminRoutes.post(
     if (!scope) return answer(c, CODE.SCOPE_NOT_FOUND);
     if (scope.state !== SCOPE_STATE.ACTIVE) return answer(c, CODE.SCOPE_NOT_ACTIVE, { state: scope.state });
     const body = c.req.valid("json");
+    // No route may mint a grant kind it cannot itself present. A promotion kind is minted only by a
+    // caller that already presents one of that kind on this scope, so the deployment key alone and
+    // an uploader's own token both stop here instead of minting the grant that publishes an upload.
+    // Asked before the insert, so a refusal writes no row and cannot be retried into one.
+    if (PROMOTION_KINDS.includes(body.kind) && (await presentedKind(scope.id, grantToken(c))) !== body.kind) {
+      return answer(c, CODE.GRANT_KIND_REFUSED, { kind: body.kind });
+    }
     const minted = mintGrantToken();
     const mintedGrant = await createGrant(scope.id, body, minted.tokenHash);
     if (!mintedGrant.grant) {
@@ -301,6 +342,26 @@ function pathParam(c: Context<{ Variables: Variables }>, name: string): string {
 /** The scope inside this caller's org, or nothing; the org is never taken from the request. */
 async function findScope(orgId: string, scopeId: string) {
   return readScope(db as ScopeStore, orgId, scopeId);
+}
+
+/** The grant token this caller presented, or nothing: the deployment key alone presents no grant. */
+function grantToken(c: Context<{ Variables: Variables }>): string | undefined {
+  const raw = c.req.header(GRANT_HEADER)?.trim();
+  return raw ? raw : undefined;
+}
+
+/**
+ * The kind of this caller's live grant on this scope, or nothing when its token resolves to no live
+ * grant there. Resolved by digest, like `repo-index.ts` resolves it, so a revoked or unknown token
+ * and an absent one all present no kind: a refusal tells every one of them the same thing.
+ */
+async function presentedKind(scopeId: string, token: string | undefined): Promise<string | null> {
+  if (!token) return null;
+  const grant = (await db.repoIndexGrant.findFirst({
+    where: { scopeId, tokenHash: hashGrantToken(token), revokedAt: null },
+    select: { kind: true },
+  })) as { kind: string } | null;
+  return grant?.kind ?? null;
 }
 
 async function readScope(store: ScopeStore, orgId: string, scopeId: string) {

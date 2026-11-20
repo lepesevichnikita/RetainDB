@@ -2,18 +2,25 @@
 //! status, retried only where a retry can help, and never echoing the scoped
 //! credential.
 //!
-//! Every test drives the production entry point (`transport::deliver`) with the
-//! fake transport, so no socket is opened and no `curl` runs.
+//! Every test drives the production entry point (`transport::deliver`). Most of
+//! them use the fake transport, so no socket is opened and no `curl` runs; the
+//! loopback tests run the real `CurlTransport` against a local listener, so the
+//! invocation itself (argv, stdin, status classification) is exercised too.
 
 mod support;
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, VecDeque};
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use retaindb_repo::json;
 use retaindb_repo::sync_state::{ChangeKind, PendingChange, SyncState};
 use retaindb_repo::transport::{
-    deliver, Credential, Endpoint, Limits, Lost, Receipt, Reply, Request, SendError, Transport,
+    command_for, deliver, Credential, CurlTransport, Endpoint, Limits, Lost, Receipt, Reply,
+    Request, SendError, Transport, GRANT_HEADER,
 };
 
 /// The token a real deployment would read from the environment.
@@ -355,5 +362,271 @@ fn the_credential_never_appears_in_any_error_string() {
     assert!(
         !format!("{:?}", endpoint()).contains(TOKEN),
         "the endpoint's Debug redacts the credential"
+    );
+}
+
+/// One request as the loopback listener saw it.
+#[derive(Debug)]
+struct Seen {
+    /// The scoped grant exactly as the server received it.
+    grant: Option<String>,
+    /// The raw body bytes, before any parsing.
+    body: Vec<u8>,
+}
+
+/// A loopback listener that answers every request with the same status and body,
+/// so the real `curl` invocation is exercised without touching a network.
+struct Server {
+    url: String,
+    handler: thread::JoinHandle<Vec<Seen>>,
+}
+
+impl Server {
+    /// The requests that arrived, once the client has stopped talking.
+    fn seen(self) -> Vec<Seen> {
+        self.handler.join().expect("the loopback server thread")
+    }
+}
+
+/// Answer `status` with `answer` for every request until the client has been
+/// quiet long enough that a retry would already have arrived. Counting the
+/// requests that arrived is how a test sees the retry policy.
+fn loopback(status: u16, answer: &'static str) -> Server {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("the bound address").port();
+    listener.set_nonblocking(true).expect("a polling listener");
+    let handler = thread::spawn(move || {
+        let started = Instant::now();
+        let mut quiet_since = started;
+        let mut seen = Vec::new();
+        loop {
+            match listener.accept() {
+                Ok((mut socket, _)) => {
+                    socket.set_nonblocking(false).expect("a blocking socket");
+                    seen.push(read_request(&mut socket));
+                    write_answer(&mut socket, status, answer);
+                    quiet_since = Instant::now();
+                }
+                Err(_) => {
+                    // A retry follows within milliseconds (the test limits have no
+                    // backoff), so a longer silence is the end of the script.
+                    let quiet = if seen.is_empty() {
+                        Duration::from_secs(5)
+                    } else {
+                        Duration::from_millis(500)
+                    };
+                    if quiet_since.elapsed() > quiet || started.elapsed() > Duration::from_secs(20)
+                    {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+        seen
+    });
+    Server {
+        url: format!("http://127.0.0.1:{port}/v1/repo-index/batches"),
+        handler,
+    }
+}
+
+/// Read one HTTP request: the named headers and the body bytes, unchanged.
+fn read_request(socket: &mut TcpStream) -> Seen {
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while split_headers(&raw).is_none() {
+        let read = socket.read(&mut chunk).expect("the request headers");
+        assert!(read > 0, "the client closed before sending headers");
+        raw.extend_from_slice(&chunk[..read]);
+    }
+    let split = split_headers(&raw).expect("a blank line after the headers");
+    let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+    let length: usize = header_of(&head, "content-length")
+        .expect("a content-length")
+        .parse()
+        .expect("a numeric content-length");
+    let mut body = raw[split..].to_vec();
+    while body.len() < length {
+        let read = socket.read(&mut chunk).expect("the request body");
+        assert!(read > 0, "the client closed mid-body");
+        body.extend_from_slice(&chunk[..read]);
+    }
+    Seen {
+        grant: header_of(&head, GRANT_HEADER),
+        body,
+    }
+}
+
+/// Length of the request line and headers, including the blank line.
+fn split_headers(raw: &[u8]) -> Option<usize> {
+    raw.windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|at| at + 4)
+}
+
+/// One header value by case-insensitive name; the value is not case-folded.
+fn header_of(head: &str, name: &str) -> Option<String> {
+    head.split("\r\n").skip(1).find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim()
+            .eq_ignore_ascii_case(name)
+            .then(|| value.trim().to_string())
+    })
+}
+
+fn write_answer(socket: &mut TcpStream, status: u16, body: &str) {
+    let answer = format!(
+        "HTTP/1.1 {status} loopback\r\ncontent-type: application/json\r\n\
+         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    socket
+        .write_all(answer.as_bytes())
+        .expect("the answer is written");
+    socket.flush().expect("the answer is flushed");
+}
+
+/// The endpoint a loopback server answers on, with the production token.
+fn loopback_endpoint(server: &Server) -> Endpoint {
+    Endpoint {
+        url: server.url.clone(),
+        credential: Credential::parse(TOKEN).expect("a usable token"),
+    }
+}
+
+#[test]
+fn the_curl_command_line_carries_no_credential() {
+    // `ps` and /proc/<pid>/cmdline show a child's arguments to other processes
+    // for the whole request, so the grant must not be one of them.
+    let request = Request {
+        method: "POST",
+        url: endpoint().url,
+        body: r#"{"generation":3}"#.to_string(),
+        credential: Credential::parse(TOKEN).expect("a usable token"),
+    };
+    let command = command_for(30, &request);
+    let argv: Vec<String> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    assert!(argv.len() > 1, "the invocation carries arguments: {argv:?}");
+    for arg in &argv {
+        assert!(
+            !arg.contains(TOKEN),
+            "the credential is on the command line: {arg}"
+        );
+        assert!(
+            !arg.to_ascii_lowercase().contains(GRANT_HEADER),
+            "the grant header is on the command line: {arg}"
+        );
+    }
+}
+
+#[test]
+fn the_loopback_success_path_returns_a_receipt_and_advances_the_watermark() {
+    // The real curl invocation, not a fake: the grant still arrives, the receipt
+    // still parses, and it is still the only thing that moves the watermark.
+    let harness = support::Harness::enrolled();
+    planted(&harness, 4, &["src/main.rs", "src/lib.rs"]);
+    let server = loopback(200, r#"{"generation":4}"#);
+    let delivered = deliver(
+        &harness.store,
+        &CurlTransport::default(),
+        &loopback_endpoint(&server),
+        &limits(),
+    )
+    .expect("delivered over loopback");
+    assert_eq!(delivered, Some(Receipt { generation: 4 }));
+    assert_eq!(watermark(&harness), 4, "the receipt moved the watermark");
+    let seen = server.seen();
+    assert_eq!(seen.len(), 1, "one generation, one request");
+    assert_eq!(
+        seen[0].grant.as_deref(),
+        Some(TOKEN),
+        "the grant reached the server without being an argument"
+    );
+}
+
+#[test]
+fn the_loopback_request_body_matches_the_fake_one_byte_for_byte() {
+    // The invocation rewrite must not change a single byte of the request: the
+    // loopback server receives exactly the body the fake transport received,
+    // including a path that needs JSON escaping of a quote and a backslash.
+    let harness = support::Harness::enrolled();
+    planted(&harness, 4, &[r#"we"ird\name.rs"#, "src/main.rs"]);
+    let fake = FakeTransport::answering(vec![answered(429); 3]);
+    deliver(&harness.store, &fake, &endpoint(), &limits()).expect_err("429 is a failure");
+    let expected = fake.requests()[0].body.clone();
+    assert!(
+        expected.contains(r#""we\"ird\\name.rs""#),
+        "the planted path needs escaping: {expected}"
+    );
+    let server = loopback(200, r#"{"generation":4}"#);
+    deliver(
+        &harness.store,
+        &CurlTransport::default(),
+        &loopback_endpoint(&server),
+        &limits(),
+    )
+    .expect("delivered over loopback");
+    let seen = server.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        String::from_utf8(seen[0].body.clone()).expect("a UTF-8 body"),
+        expected,
+        "the request body is byte-identical to the fake one"
+    );
+}
+
+#[test]
+fn a_413_over_loopback_is_not_retried() {
+    // A real 413 must still be final: the same body cannot shrink.
+    let harness = support::Harness::enrolled();
+    planted(&harness, 4, &["src/main.rs"]);
+    let server = loopback(413, "");
+    let error = deliver(
+        &harness.store,
+        &CurlTransport::default(),
+        &loopback_endpoint(&server),
+        &limits(),
+    )
+    .expect_err("413 is a failure");
+    assert!(
+        matches!(error, SendError::TooLarge { status: 413 }),
+        "{error}"
+    );
+    assert_eq!(server.seen().len(), 1, "the same body is not resent");
+    assert_eq!(watermark(&harness), 0);
+}
+
+#[test]
+fn a_429_over_loopback_retries_only_the_attempt_budget() {
+    // The real transport, not the fake, must stop at `max_attempts`.
+    let harness = support::Harness::enrolled();
+    planted(&harness, 4, &["src/main.rs"]);
+    let server = loopback(429, "");
+    let error = deliver(
+        &harness.store,
+        &CurlTransport::default(),
+        &loopback_endpoint(&server),
+        &limits(),
+    )
+    .expect_err("429 exhausts the budget");
+    assert!(
+        matches!(
+            error,
+            SendError::Exhausted {
+                status: 429,
+                attempts: 3
+            }
+        ),
+        "{error}"
+    );
+    assert_eq!(server.seen().len(), 3, "exactly the bounded attempt count");
+    assert_eq!(
+        watermark(&harness),
+        0,
+        "a refusal never advances the watermark"
     );
 }

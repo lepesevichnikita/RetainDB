@@ -101,6 +101,13 @@ export interface MaterialiseInput {
   maxChunks?: number;
 }
 
+/** The deletion half of materialisation: the paths a generation serves, and where they live. */
+export interface RetireInput {
+  scopeId: string;
+  projectId: string;
+  paths: readonly SourcePath[];
+}
+
 export interface MaterialiseOutcome {
   /** Paths whose existing chunks were named on the path row again. */
   reused: number;
@@ -257,8 +264,7 @@ export async function materialiseGeneration(handle: Database, input: Materialise
   const created = await writePendingPaths(handle, input, source.id, previousByPath, prepared.pending);
   const reused = prepared.reuse.map((entry) => ({ path: entry.path, chunkId: entry.chunkIds[0] }));
   await writeChunkAnchors(handle, input, [...reused, ...created]);
-  await dropRemovedPaths(handle, source.id, input.paths, previous);
-  await refreshSourceCounts(handle, source.id);
+  await retirePaths(handle, source.id, input.paths, previous);
   return {
     reused: reused.length,
     created: prepared.pending.length,
@@ -267,22 +273,43 @@ export async function materialiseGeneration(handle: Database, input: Materialise
 }
 
 /**
+ * The deletion half of materialisation on its own: every path this generation no longer names stops
+ * being searchable, and the scope's source counts follow it. It reads no content, which is why a
+ * publication that never read any - the metadata-only finalize route - owes this same drop; skipping
+ * it leaves a chunk of a file the published generation does not contain, and recall returns it.
+ *
+ * Runs on the caller's transaction, so a refused publication rolls the drop back with the rest: the
+ * generation the scope served keeps every chunk it had. A scope that was never materialised has no
+ * source and nothing to drop, so this creates none.
+ */
+export async function retireUnlistedPaths(handle: Database, input: RetireInput): Promise<void> {
+  const source = await findScopeSource(handle, input.scopeId, input.projectId);
+  if (!source) return;
+  await retirePaths(handle, source.id, input.paths, await loadMaterialisedPaths(handle, source.id));
+}
+
+/**
  * The scope's own source, created once. `sources.projectId` is a real foreign key, so the scope's
  * project has to exist: a repository index is attributable to a project, not to a conversation.
  */
 async function ensureScopeSource(handle: Database, input: MaterialiseInput): Promise<{ id: string }> {
-  const where = { projectId: input.projectId, name: scopeSourceName(input.scopeId) };
-  const existing = await handle.source.findFirst({ where, select: { id: true } });
+  const existing = await findScopeSource(handle, input.scopeId, input.projectId);
   if (existing) return existing;
   return handle.source.create({
     data: {
-      ...where,
+      projectId: input.projectId,
+      name: scopeSourceName(input.scopeId),
       orgId: input.orgId,
       type: REPO_INDEX_SOURCE_TYPE,
       status: "READY",
       config: { repo_scope_id: input.scopeId },
     },
   });
+}
+
+/** The source this scope mirrors into, or nothing when it was never materialised. */
+async function findScopeSource(handle: Database, scopeId: string, projectId: string): Promise<{ id: string } | null> {
+  return handle.source.findFirst({ where: { projectId, name: scopeSourceName(scopeId) }, select: { id: true } });
 }
 
 /** One materialised path: the document that mirrors it and the chunks it already has, in order. */
@@ -440,6 +467,12 @@ async function dropRemovedPaths(handle: Database, sourceId: string, paths: reado
   const kept = new Set(paths.map((entry) => entry.path));
   const removed = previous.filter((row) => !kept.has(row.path)).map((row) => row.id);
   if (removed.length > 0) await handle.document.deleteMany({ where: { id: { in: removed } } });
+}
+
+/** Drops what this generation no longer names, then keeps the source's counts honest about it. */
+async function retirePaths(handle: Database, sourceId: string, paths: readonly SourcePath[], previous: readonly MaterialisedDocument[]): Promise<void> {
+  await dropRemovedPaths(handle, sourceId, paths, previous);
+  await refreshSourceCounts(handle, sourceId);
 }
 
 /** Keeps the scope's synthetic source honest about what it now holds. */

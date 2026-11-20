@@ -117,6 +117,20 @@ answers `404 PROJECT_NOT_FOUND`; the body never carries authority.
    `token` field. The scope must be `active` to mint; any other state answers
    `409 SCOPE_NOT_ACTIVE`.
 
+   **Minting is bounded by what the caller can itself present.** `reader`, `uploader` and
+   `connector` can be minted with the deployment key, because none of them can publish. `admin`
+   is a promoting kind (`PROMOTION_KINDS` in `repo-index-admin.ts`, the kinds `repo-index.ts`
+   accepts for finalize and abandon), so it is minted only for a caller that presents a live
+   `admin` grant for the same scope in `X-RetainDB-Repo-Index-Grant`. Anyone else — including a
+   request authenticated solely by the deployment key — gets `403 GRANT_KIND_REFUSED`, and the
+   refusal is decided before the insert so no row is written. An uploader therefore cannot mint
+   itself the capability to publish its own upload.
+
+   **The first `admin` grant of a scope is provisioned out of band**, as one live row whose
+   `tokenHash` is the sha256 of a token the operator generates and keeps. There is deliberately no
+   HTTP request that creates it: a route able to mint the first admin grant would be the same
+   escalation path this rule closes.
+
 3. **The token's plaintext appears exactly once, in that response.** A token is 128 random bits as
    hex (`mintGrantToken` in `grant-token.ts`); only the sha256 of its plaintext reaches the
    database, and `serializeGrant` in `repo-index-admin.ts` omits `tokenHash` from every response.
@@ -471,7 +485,8 @@ module-level `CURSOR_SECRET` in `store.ts`). The exact behaviour:
 
 ## Operational status
 
-The feature exists as uncommitted working-tree changes on branch `feat/repo-index`. Its test files
+The feature is committed and merged: it landed on `main` at `fa156de`, which contains all six
+branches of this line of work, and that commit is pushed to the fork. Its test files
 split into two kinds: the database-free ones exercise pure functions or injected fakes, and the
 DB-gated ones (`repo-index.admin`, `repo-index.batch`, `repo-index.materialise`, `repo-index.slice`
 and the shared `migrations.integration.test.ts`) are written as

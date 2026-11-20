@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { after, test } from "node:test";
+import { Hono } from "hono";
+import { mintGrantToken } from "../src/engine/repo-index/grant-token.js";
+import { scopeSourceName, type Embedder } from "../src/engine/repo-index/materialise.js";
 import { EMBEDDING_DIMENSIONS } from "../src/engine/repo-index/receipt.js";
-import type { Embedder } from "../src/engine/repo-index/materialise.js";
+import type { AuthContext } from "../src/middleware/auth.js";
 import type { FinalizeInput } from "../src/engine/repo-index/store.js";
 
 const databaseUrl = process.env.RETAINDB_TEST_DATABASE_URL;
@@ -462,6 +465,344 @@ run("a path the next tree drops stops being searchable", async () => {
   const rows = await anchoredChunks(db, scope.id);
   assert.deepEqual(rows.map((row: any) => row.path), ["src/alpha.ts"]);
   assert.equal(await db.chunk.count({ where: { projectId: project.id, document: { externalId: "src/beta.ts" } } }), 0);
+});
+
+const routerPath = "../src/api/repo-index.js";
+/** Header that carries the scope grant token; the scope itself is the path parameter. */
+const GRANT_HEADER = "X-RetainDB-Repo-Index-Grant";
+
+/**
+ * The repository index router mounted the way the server mounts it: behind the middleware that puts
+ * the deployment's credential on the context. A finalize posted here is the route's own call, so
+ * these tests publish through the HTTP API itself and not through a copy of what it does.
+ */
+async function scopeApp() {
+  const { repoIndexRoutes } = await import(routerPath);
+  const app = new Hono<{ Variables: { auth: AuthContext } }>();
+  app.use("/*", async (c, next) => {
+    c.set("auth", { orgId: "default", authType: "api_key" } satisfies AuthContext);
+    await next();
+  });
+  app.route("/", repoIndexRoutes);
+  return app;
+}
+
+type ScopeApp = Awaited<ReturnType<typeof scopeApp>>;
+
+/** A grant token of the one kind the finalize route accepts; the scope owns the row, so it cascades. */
+async function adminToken(client: any, scopeId: string): Promise<string> {
+  const minted = mintGrantToken();
+  await client.repoIndexGrant.create({
+    data: { scopeId, kind: "admin", principal: `materialise-test-${scopeId}`, tokenHash: minted.tokenHash },
+  });
+  return minted.token;
+}
+
+/** Posts one finalize to the real route under the given grant, answering its status and body. */
+async function finalizeRoute(app: ScopeApp, token: string, scopeId: string, attemptId: string, body: unknown) {
+  const response = await app.request(`/v1/repo-index/scopes/${scopeId}/generations/${attemptId}/finalize`, {
+    method: "POST",
+    headers: { "content-type": "application/json", [GRANT_HEADER]: token },
+    body: JSON.stringify(body),
+  });
+  return { status: response.status, body: (await response.json()) as any };
+}
+
+/**
+ * One metadata-only publication through the real finalize route. The attempt and its single part
+ * are declared through the store, then the route publishes them with the only body it accepts:
+ * paths, digests and vectors, with no content anywhere. `vectorFor` is the embedding stage's answer
+ * for a path, so a test can hand the fence a vector semantic search cannot consume.
+ */
+async function publishMetadata(
+  client: any,
+  scope: any,
+  app: ScopeApp,
+  token: string,
+  tree: Array<{ path: string; digest: string }>,
+  tombstones: string[] = [],
+  vectorFor: (path: string) => number[] = (path) => vectors([path])[0],
+) {
+  const store = await import(storePath);
+  const attemptId = randomUUID();
+  const current = await client.repoIndexScope.findUniqueOrThrow({ where: { id: scope.id } });
+  const opened = await store.openAttempt({
+    scopeId: scope.id,
+    attemptId,
+    baseGeneration: current.activeGeneration,
+    revision: current.activeGeneration + 1,
+    manifestDigest: `digest-${attemptId}`,
+    partCount: 1,
+  });
+  assert.equal(opened.code, "ATTEMPT_OPEN");
+  await store.putPart({ scopeId: scope.id, attemptId, partNo: 1, part: { upserts: tree.map((entry) => entry.path), tombstones } });
+  return finalizeRoute(app, token, scope.id, attemptId, {
+    requiredPaths: tree.map((entry) => entry.path),
+    manifest: {
+      digest: `digest-${attemptId}`,
+      dimensions: EMBEDDING_DIMENSIONS,
+      entries: tree.map((entry) => ({ ...entry, vector: vectorFor(entry.path) })),
+    },
+  });
+}
+
+/** The path rows the scope currently serves, in path order. */
+async function presentPaths(client: any, scopeId: string) {
+  return client.repoIndexPath.findMany({ where: { scopeId, state: "present" }, orderBy: { path: "asc" } });
+}
+
+/** The scope's own source row, the one whose counts describe what search can return. */
+async function scopeSource(client: any, projectId: string, scopeId: string) {
+  return client.source.findFirst({ where: { projectId, name: scopeSourceName(scopeId) } });
+}
+
+/**
+ * The chunks a semantic search over this scope's source can return, by path: the join is the search
+ * surface itself, so a path with no row here cannot be returned by any query.
+ */
+async function searchableChunks(client: any, scopeId: string) {
+  return client.$queryRaw`
+    SELECT d."externalId" AS "path", COUNT(c."id")::int AS "chunks"
+    FROM "documents" d
+    LEFT JOIN "chunks" c ON c."documentId" = d."id"
+    WHERE d."sourceId" = (SELECT s."id" FROM "sources" s WHERE s."name" = ${scopeSourceName(scopeId)})
+    GROUP BY d."externalId"
+    ORDER BY d."externalId"
+  `;
+}
+
+/** The search surface at its own boundary: every chunk of this scope's source, nearest to `query` first. */
+async function nearestPaths(client: any, scopeId: string, query: string) {
+  return client.$queryRaw`
+    SELECT d."externalId" AS "path"
+    FROM "chunks" c
+    JOIN "documents" d ON d."id" = c."documentId"
+    JOIN "sources" s ON s."id" = d."sourceId"
+    WHERE s."name" = ${scopeSourceName(scopeId)}
+    ORDER BY c."embedding" <=> ${query}::vector
+  `;
+}
+
+/** The stored vector of one path's chunk, read as the literal a semantic query would send. */
+async function storedVector(client: any, scopeId: string, path: string): Promise<string> {
+  const rows = await client.$queryRaw`
+    SELECT c."embedding"::text AS "embedding"
+    FROM "chunks" c
+    JOIN "documents" d ON d."id" = c."documentId"
+    JOIN "sources" s ON s."id" = d."sourceId"
+    WHERE s."name" = ${scopeSourceName(scopeId)} AND d."externalId" = ${path}
+    LIMIT 1
+  `;
+  assert.equal(rows.length, 1, `${path} has a stored vector before the drop`);
+  return rows[0].embedding;
+}
+
+/** Publishes the first generation of these tests: a reader, an embedder and one chunk per path. */
+async function publishSearchable(db: any, scope: any, tree: Array<{ path: string; digest: string }>) {
+  const published = await publishGeneration(db, scope, tree, {
+    readContent: async (path: string) => `export const value = "${path}";`,
+    embed: async (texts: string[]) => vectors(texts),
+  });
+  assert.equal(published.code, "PUBLISHED");
+  return published;
+}
+
+// Behaviour: a publication that carries no content still owes the deletion half of materialisation.
+// This route has no reader to embed with, so the tombstone used to be recorded on the path rows
+// while the dropped path's chunk stayed in the project: semantic search kept returning a file the
+// published generation no longer contains (docs/repo-index.md:358-359).
+run("a metadata-only publication that drops a path leaves none of its chunks searchable", async () => {
+  const { db, scope } = await fixture();
+  await publishSearchable(db, scope, [
+    { path: "src/a.ts", digest: "digest-a" },
+    { path: "src/b.ts", digest: "digest-b" },
+  ]);
+  const before = await searchableChunks(db, scope.id);
+  assert.deepEqual(
+    before.map((row: any) => [row.path, row.chunks]),
+    [["src/a.ts", 1], ["src/b.ts", 1]],
+    "the first generation is searchable for both paths",
+  );
+  const droppedVector = await storedVector(db, scope.id, "src/a.ts");
+
+  const token = await adminToken(db, scope.id);
+  const metadata = await publishMetadata(
+    db,
+    scope,
+    await scopeApp(),
+    token,
+    [{ path: "src/b.ts", digest: "digest-b" }],
+    ["src/a.ts"],
+  );
+
+  assert.equal(metadata.status, 201, `a metadata-only publication is still a publication: ${JSON.stringify(metadata.body)}`);
+  assert.equal(metadata.body.code, "PUBLISHED");
+  assert.equal(metadata.body.searchable, false, "the route still reports that it materialised no content");
+  assert.equal(metadata.body.materialisedChunks, 0, "the drop writes no chunk");
+
+  assert.deepEqual((await presentPaths(db, scope.id)).map((row: any) => row.path), ["src/b.ts"], "the served tree holds the surviving path only");
+  assert.deepEqual(
+    (await searchableChunks(db, scope.id)).map((row: any) => [row.path, row.chunks]),
+    [["src/b.ts", 1]],
+    "the dropped path has no chunk left for a search to return",
+  );
+
+  // The search surface itself, queried with the dropped chunk's own vector: it is gone, and the
+  // surviving path is still a hit.
+  const hits = await nearestPaths(db, scope.id, droppedVector);
+  assert.deepEqual(hits.map((row: any) => row.path), ["src/b.ts"], "a semantic search cannot return the dropped path");
+});
+
+// Behaviour: the drop is exactly the set the manifest stopped naming. Every other path of the
+// previous generation keeps its document, its chunks and their vectors, so a publication without
+// content cannot erase text it never touched.
+run("a metadata-only drop leaves the generation's other paths untouched", async () => {
+  const { db, scope } = await fixture();
+  await publishSearchable(db, scope, [
+    { path: "src/a.ts", digest: "digest-a" },
+    { path: "src/b.ts", digest: "digest-b" },
+    { path: "src/c.ts", digest: "digest-c" },
+  ]);
+  const keptChunks = await db.chunk.findMany({
+    where: { projectId: scope.projectId, document: { externalId: { in: ["src/b.ts", "src/c.ts"] } } },
+    orderBy: { chunkIndex: "asc" },
+  });
+  assert.equal(keptChunks.length, 2, "the fixture keeps one chunk per surviving path");
+  const keptDocuments = await db.document.findMany({
+    where: { projectId: scope.projectId, externalId: { in: ["src/b.ts", "src/c.ts"] } },
+    orderBy: { externalId: "asc" },
+  });
+
+  const token = await adminToken(db, scope.id);
+  const metadata = await publishMetadata(
+    db,
+    scope,
+    await scopeApp(),
+    token,
+    [{ path: "src/b.ts", digest: "digest-b" }, { path: "src/c.ts", digest: "digest-c" }],
+    ["src/a.ts"],
+  );
+  assert.equal(metadata.body.code, "PUBLISHED");
+
+  const keptAfter = await db.chunk.findMany({ where: { id: { in: keptChunks.map((row: any) => row.id) } } });
+  assert.deepEqual(
+    keptAfter.map((row: any) => [row.id, row.content, row.documentId]).sort(),
+    keptChunks.map((row: any) => [row.id, row.content, row.documentId]).sort(),
+    "the surviving paths keep the very same chunk rows",
+  );
+  const documentsAfter = await db.document.findMany({
+    where: { id: { in: keptDocuments.map((row: any) => row.id) } },
+    orderBy: { externalId: "asc" },
+  });
+  assert.deepEqual(
+    documentsAfter.map((row: any) => [row.id, row.externalId, row.contentHash]),
+    keptDocuments.map((row: any) => [row.id, row.externalId, row.contentHash]),
+    "the surviving documents are not recreated",
+  );
+  assert.deepEqual(
+    (await searchableChunks(db, scope.id)).map((row: any) => [row.path, row.chunks]),
+    [["src/b.ts", 1], ["src/c.ts", 1]],
+    "both surviving paths are still searchable",
+  );
+});
+
+// Behaviour: the drop belongs to the publication, not to the request. A publication the fence
+// refuses - here a vector semantic search cannot consume, and a drop the attempt never declared -
+// writes nothing at all, so the generation the scope serves keeps every chunk it had. An unsafe
+// tree and a stale ref are refused by the connector before the store is asked, and
+// repo-index.publish.integration.test.ts pins those against the same invariant.
+run("a refused metadata-only publication drops nothing and leaves the last generation searchable", async () => {
+  const { db, scope } = await fixture();
+  await publishSearchable(db, scope, [
+    { path: "src/a.ts", digest: "digest-a" },
+    { path: "src/b.ts", digest: "digest-b" },
+  ]);
+  const before = await searchableChunks(db, scope.id);
+  const chunksBefore = await db.chunk.count({ where: { projectId: scope.projectId } });
+  const pathsBefore = await presentPaths(db, scope.id);
+
+  const token = await adminToken(db, scope.id);
+  const app = await scopeApp();
+
+  // A vector of the wrong width: the fence refuses the manifest (receipt.ts:144 and :148), so the
+  // publication that also declares the tombstone never reaches a write.
+  const unusable = await publishMetadata(
+    db,
+    scope,
+    app,
+    token,
+    [{ path: "src/b.ts", digest: "digest-b" }],
+    ["src/a.ts"],
+    () => Array<number>(EMBEDDING_DIMENSIONS - 1).fill(0.5),
+  );
+  assert.equal(unusable.status, 422, `a vector of the wrong width is refused: ${JSON.stringify(unusable.body)}`);
+  assert.equal(unusable.body.error?.code, "INVALID_MANIFEST");
+
+  // A tree that drops src/a.ts without the attempt declaring it: the same publication is refused.
+  const undeclared = await publishMetadata(db, scope, app, token, [{ path: "src/b.ts", digest: "digest-b" }]);
+  assert.equal(undeclared.status, 409, `an undeclared drop is refused: ${JSON.stringify(undeclared.body)}`);
+  assert.equal(undeclared.body.error?.code, "UNDECLARED_DROP");
+  assert.deepEqual(undeclared.body.error?.undeclaredDrops, ["src/a.ts"]);
+
+  const scopeAfter = await db.repoIndexScope.findUniqueOrThrow({ where: { id: scope.id } });
+  assert.equal(scopeAfter.activeGeneration, 1, "no refused publication moved the scope");
+  assert.deepEqual(
+    (await presentPaths(db, scope.id)).map((row: any) => [row.path, row.generationId, row.state]),
+    pathsBefore.map((row: any) => [row.path, row.generationId, row.state]),
+    "the served tree is the one that was published",
+  );
+  assert.deepEqual(
+    (await searchableChunks(db, scope.id)).map((row: any) => [row.path, row.chunks]),
+    before.map((row: any) => [row.path, row.chunks]),
+    "both paths are still searchable",
+  );
+  assert.equal(await db.chunk.count({ where: { projectId: scope.projectId } }), chunksBefore, "a refused publication wrote no chunk and dropped none");
+});
+
+// Behaviour: the scope's source reports what it now holds. A count left behind by a drop describes
+// text search no longer has and hides text it does, which is what sources.chunkCount is read for.
+run("the scope's source reports the chunk count the drop left", async () => {
+  const { db, project, scope } = await fixture();
+  await publishSearchable(db, scope, [
+    { path: "src/a.ts", digest: "digest-a" },
+    { path: "src/b.ts", digest: "digest-b" },
+  ]);
+  const source = await scopeSource(db, project.id, scope.id);
+  assert.equal(source.documentCount, 2, "the first publication recorded the documents it wrote");
+  assert.equal(source.chunkCount, 2, "the first publication recorded the chunks it wrote");
+
+  const token = await adminToken(db, scope.id);
+  const metadata = await publishMetadata(
+    db,
+    scope,
+    await scopeApp(),
+    token,
+    [{ path: "src/b.ts", digest: "digest-b" }],
+    ["src/a.ts"],
+  );
+  assert.equal(metadata.body.code, "PUBLISHED");
+
+  const after = await scopeSource(db, project.id, scope.id);
+  assert.equal(after.documentCount, 1, "one document is left");
+  assert.equal(after.chunkCount, 1, "one chunk is left");
+  assert.equal(
+    await db.chunk.count({ where: { projectId: project.id, document: { sourceId: source.id } } }),
+    1,
+    "the recorded count is the row count a search would read",
+  );
+});
+
+// Behaviour: a scope that was never materialised has nothing to drop, and a metadata-only
+// publication does not invent a source row to look for it: the drop half leaves the project's
+// source list exactly as it found it.
+run("a metadata-only publication of a never-materialised scope creates no source", async () => {
+  const { db, project, scope } = await fixture();
+  const token = await adminToken(db, scope.id);
+  const metadata = await publishMetadata(db, scope, await scopeApp(), token, [{ path: "src/a.ts", digest: "digest-a" }]);
+  assert.equal(metadata.status, 201, `a scope with no chunks still publishes its metadata: ${JSON.stringify(metadata.body)}`);
+  assert.equal(metadata.body.code, "PUBLISHED");
+  assert.equal(await db.source.count({ where: { projectId: project.id } }), 0, "the drop half created no source row");
+  assert.equal(await db.document.count({ where: { projectId: project.id } }), 0);
 });
 
 after(async () => {

@@ -8,6 +8,11 @@
 //! `{"generation":N}`, and only the generation in a parsed receipt advances the
 //! watermark.
 //!
+//! Invocation: `curl` gets the grant header and the body as a config stream on
+//! stdin (`--config -`). The credential is never an argument, so no other process
+//! can read it from `ps` or `/proc/<pid>/cmdline` while the request is in flight,
+//! and it never touches a file.
+//!
 //! Bounds are checked before the request leaves: an entry count and a wire byte
 //! limit, both explicit in [`Limits`]. A batch over either is refused locally
 //! instead of being uploaded and bounced with a 413.
@@ -229,10 +234,11 @@ impl Transport for CurlTransport {
             Ok(child) => child,
             Err(_) => return Reply::Lost(Lost::Spawn),
         };
-        // `EPIPE` is not fatal here: curl may already have failed, and the exit
-        // status says what happened.
+        // The grant and the body travel as curl's stdin config, so the credential
+        // is never one of the child's arguments. `EPIPE` is not fatal here: curl
+        // may already have failed, and the exit status says what happened.
         if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(request.body.as_bytes());
+            let _ = stdin.write_all(config_for(request).as_bytes());
         }
         match child.wait_with_output() {
             Ok(output) if output.status.success() => status_of(&output.stdout),
@@ -242,10 +248,12 @@ impl Transport for CurlTransport {
     }
 }
 
-/// The curl invocation for one request. No shell, so the token cannot be split
-/// or expanded; no `--location`, so a redirect cannot carry the grant header to
-/// another host; `--proto` keeps an env-supplied URL from reading local files.
-fn command_for(timeout_seconds: u64, request: &Request) -> Command {
+/// The curl invocation for one request: arguments only, so the credential is not
+/// among them. No shell, so nothing can be split or expanded; no `--location`, so
+/// a redirect cannot carry the grant header to another host; `--proto` keeps an
+/// env-supplied URL from reading local files. The grant header and the body reach
+/// curl on stdin through `--config -`; see [`config_for`].
+pub fn command_for(timeout_seconds: u64, request: &Request) -> Command {
     let mut command = Command::new("curl");
     command
         .arg("--silent")
@@ -261,10 +269,8 @@ fn command_for(timeout_seconds: u64, request: &Request) -> Command {
         .arg(request.method)
         .arg("--header")
         .arg("content-type: application/json")
-        .arg("--header")
-        .arg(format!("{GRANT_HEADER}: {}", request.credential.expose()))
-        .arg("--data-binary")
-        .arg("@-")
+        .arg("--config")
+        .arg("-")
         .arg("--write-out")
         .arg(STATUS_TRAILER)
         .arg("--url")
@@ -273,6 +279,39 @@ fn command_for(timeout_seconds: u64, request: &Request) -> Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     command
+}
+
+/// The options `curl` reads from stdin: the grant header and the request body.
+///
+/// This is the only channel the credential travels on. A `--header` argument
+/// would be readable through `ps` and `/proc/<pid>/cmdline` for as long as the
+/// request lasts, and a `--header @file` indirection would leave it on disk. The
+/// body is one config line, far below curl's own line limit at the default
+/// [`Limits::max_wire_bytes`].
+fn config_for(request: &Request) -> String {
+    let grant = format!("{GRANT_HEADER}: {}", request.credential.expose());
+    format!(
+        "header = \"{}\"\ndata-binary = \"{}\"\n",
+        config_value(&grant),
+        config_value(&request.body)
+    )
+}
+
+/// Quote one config value: a backslash or a quote would otherwise end the value,
+/// and a raw line break would end the line before the closing quote. Every other
+/// byte, including UTF-8 and tabs, passes through unchanged.
+fn config_value(text: &str) -> String {
+    let mut value = String::with_capacity(text.len() + 2);
+    for ch in text.chars() {
+        match ch {
+            '\\' => value.push_str("\\\\"),
+            '"' => value.push_str("\\\""),
+            '\n' => value.push_str("\\n"),
+            '\r' => value.push_str("\\r"),
+            other => value.push(other),
+        }
+    }
+    value
 }
 
 /// Split `<body>\n<status>` into a [`Reply`].

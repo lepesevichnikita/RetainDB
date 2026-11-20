@@ -28,7 +28,7 @@ import {
   type ScopeState,
   type ScopeStatus,
 } from "./receipt.js";
-import { materialiseGeneration, type ContentReader, type Embedder, type MaterialiseOutcome } from "./materialise.js";
+import { materialiseGeneration, retireUnlistedPaths, type ContentReader, type Embedder, type MaterialiseOutcome } from "./materialise.js";
 
 // The Prisma client generated for this worktree can predate the repo-index models
 // (`prisma generate` is not run here), so the database handle is narrowed once, in
@@ -462,6 +462,11 @@ async function publish(tx: Transaction, input: FinalizeInput): Promise<FinalizeR
  * throws, so the seal, the generation bump and the path rows roll back together: no generation is
  * ever visible while half its chunks are missing, and the generation it replaced stays current.
  *
+ * A publication without a reader still owes the deletion half. The paths its manifest no longer
+ * names stop being searchable, whether or not anything was read: that half needs no content, so a
+ * metadata-only publication drops here - in this transaction - instead of being skipped with the
+ * rest, and a refused publication rolls the drop back with everything else.
+ *
  * The embedder is passed on rather than defaulted here: materialiseGeneration owns the production
  * default, so a caller that injects one is answered by it instead of by a second choice in the store.
  * The outcome it returns is what this publication really wrote; without a reader there is none.
@@ -472,13 +477,17 @@ async function materialise(
   attempt: GenerationRow,
   input: FinalizeInput,
 ): Promise<MaterialiseOutcome | undefined> {
-  if (!input.readContent) return undefined;
+  const paths = input.manifest.entries.map((entry) => ({ path: entry.path, digest: entry.digest }));
+  if (!input.readContent) {
+    await retireUnlistedPaths(tx, { scopeId: input.scopeId, projectId: scope.projectId, paths });
+    return undefined;
+  }
   return materialiseGeneration(tx, {
     scopeId: input.scopeId,
     generationId: attempt.id,
     projectId: scope.projectId,
     orgId: scope.orgId,
-    paths: input.manifest.entries.map((entry) => ({ path: entry.path, digest: entry.digest })),
+    paths,
     readContent: input.readContent,
     embed: input.embed,
   });

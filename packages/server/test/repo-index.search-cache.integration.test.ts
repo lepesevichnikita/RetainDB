@@ -366,6 +366,36 @@ test("a withdrawn scope is invisible to search while its rows are retained", { t
 });
 
 /**
+ * Behaviour: pausing a scope takes effect immediately, including for an answer cached while it was
+ * active. Pause changes no row - only the state the read path consults - so before this the cached
+ * answer outlived the pause for its full five minutes and a paused scope kept answering.
+ */
+test("a paused scope stops answering, including from an answer cached while it was active", { timeout: 180_000 }, async () => {
+  const { project, scope } = await fixtureScope();
+  const query = "who owns the incident postmortem template";
+
+  const published = await publish({
+    scopeId: scope.id,
+    baseGeneration: 0,
+    files: [{ path: "docs/postmortem.md", content: "# Postmortem\n\nThe incident postmortem template is owned by the on call lead.\n" }],
+  });
+  assert.equal(published.code, "PUBLISHED", `the generation is published: ${published.code}`);
+
+  const cached = await search(project.id, query);
+  assert.deepEqual(answeredPaths(cached), ["docs/postmortem.md"], "the active scope answers the query");
+
+  const app = await adminApp();
+  const response = await app.request(`/v1/repo-index/admin/scopes/${scope.id}/pause`, { method: "POST" });
+  assert.equal(response.status, 200, JSON.stringify(await response.clone().json()));
+  assert.equal((await response.json()).code, "PAUSE_APPLIED");
+
+  const after = await search(project.id, query);
+  assert.deepEqual(after.results, [], "a paused scope serves nothing, cached or not");
+  const withoutCache = await search(project.id, query, { useCache: false });
+  assert.deepEqual(withoutCache.results, [], "the read path refuses a paused scope, so not even an uncached search answers");
+});
+
+/**
  * Behaviour: revoking a grant invalidates the answers cached for that project. The published tree
  * itself is untouched - a credential is not content - so the recomputed answer still finds it.
  */

@@ -964,6 +964,62 @@ function normalizeMemoryType(memoryType?: string) {
 }
 
 
+// ─── Repository attribution ─────────────────────────────────
+
+/**
+ * The publication one repository result came from, as the query route answers it. Path and digest
+ * already travel in the chunk's own metadata (`repo_path`, `repo_digest`), written by
+ * materialisation; generation and revision belong to the publication and no chunk column holds
+ * them, so a client cannot tell which revision of a file it was handed. They are read here from the
+ * path row and the generation it points at, which is the same pairing the repository read routes
+ * serve, and attached to the result.
+ */
+interface RepositoryAttribution {
+  scope_id: string;
+  path: string;
+  digest: string;
+  generation: number;
+  revision: number;
+}
+
+/** The key one result's attribution is looked up under: a scope holds one path row per path. */
+function repositoryAttributionKey(result: { metadata?: Record<string, any> }): string {
+  const scopeId = String(result.metadata?.repo_scope_id ?? "");
+  const path = String(result.metadata?.repo_path ?? "");
+  return scopeId !== "" && path !== "" ? `${scopeId}\u0000${path}` : "";
+}
+
+/**
+ * Every repository result's publication, in one statement: the path row names the digest, and the
+ * generation row it points at names the number and revision a client reports. A result that is not
+ * repository content (no scope or no path in its metadata) is not looked up, and a query whose
+ * results carry none - the ordinary case - reaches no database at all.
+ */
+async function repositoryAttributionOf(
+  results: ReadonlyArray<{ metadata?: Record<string, any> }>,
+): Promise<Map<string, RepositoryAttribution>> {
+  const wanted = results.filter((result) => repositoryAttributionKey(result) !== "");
+  if (wanted.length === 0) return new Map();
+  const rows = await prisma.$queryRaw<Array<{ scopeId: string; path: string; digest: string; generation: number; revision: string }>>`
+    SELECT p."scopeId" AS "scopeId", p.path, p.digest, g.generation, g.revision
+    FROM repo_index_paths p
+    INNER JOIN repo_index_generations g ON g.id = p."generationId"
+    WHERE p.state = 'present'
+      AND p."scopeId" = ANY(${wanted.map((result) => String(result.metadata?.repo_scope_id))}::text[])
+      AND p.path = ANY(${wanted.map((result) => String(result.metadata?.repo_path))}::text[])
+  `;
+  return new Map(rows.map((row) => [
+    `${row.scopeId}\u0000${row.path}`,
+    {
+      scope_id: row.scopeId,
+      path: row.path,
+      digest: row.digest,
+      generation: Number(row.generation),
+      revision: Number(row.revision),
+    },
+  ]));
+}
+
 // ─── Query Context ───────────────────────────────────────────
 
 api.post(
@@ -1059,6 +1115,7 @@ api.post(
     // usage tracking not available in OSS
 
     const consistencyState = body.include_memories ? "eventual" : "fresh";
+    const repositoryAttribution = await repositoryAttributionOf(result.results);
 
     return c.json({
       results: result.results.map((r) => ({
@@ -1070,6 +1127,9 @@ api.post(
         document: r.documentTitle,
         type: r.chunkType,
         retrieval_source: r.source,
+        // Absent for ordinary content: JSON drops an undefined value, so a non-repository answer
+        // keeps exactly the shape it had. A repository hit names the publication it came from.
+        repository: repositoryAttribution.get(repositoryAttributionKey(r)),
       })),
       context: result.context,
       meta: {

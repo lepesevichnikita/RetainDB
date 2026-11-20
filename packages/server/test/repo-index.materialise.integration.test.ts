@@ -571,16 +571,27 @@ async function searchableChunks(client: any, scopeId: string) {
   `;
 }
 
-/** The search surface at its own boundary: every chunk of this scope's source, nearest to `query` first. */
+/**
+ * The search surface at its own boundary: every chunk of this scope's source, nearest to `query`
+ * first, asked exactly. Index scans are off for this read because the alternative plan - an HNSW
+ * index scan - is approximate by construction: it answers from its candidate window in distance
+ * order, and pgvector never sees the joins above it (0.8.7 keeps walking the graph only when the
+ * filter is on the indexed table and `hnsw.iterative_scan` is set), so a chunk that exists can
+ * legitimately fall outside the window. This assertion is about which rows the surface holds, not
+ * about how approximate a plan may be, so it reads every row and orders them itself.
+ */
 async function nearestPaths(client: any, scopeId: string, query: string) {
-  return client.$queryRaw`
-    SELECT d."externalId" AS "path"
-    FROM "chunks" c
-    JOIN "documents" d ON d."id" = c."documentId"
-    JOIN "sources" s ON s."id" = d."sourceId"
-    WHERE s."name" = ${scopeSourceName(scopeId)}
-    ORDER BY c."embedding" <=> ${query}::vector
-  `;
+  return client.$transaction(async (tx: any) => {
+    await tx.$executeRaw`SET LOCAL enable_indexscan = off`;
+    return tx.$queryRaw`
+      SELECT d."externalId" AS "path"
+      FROM "chunks" c
+      JOIN "documents" d ON d."id" = c."documentId"
+      JOIN "sources" s ON s."id" = d."sourceId"
+      WHERE s."name" = ${scopeSourceName(scopeId)}
+      ORDER BY c."embedding" <=> ${query}::vector
+    `;
+  });
 }
 
 /** The stored vector of one path's chunk, read as the literal a semantic query would send. */

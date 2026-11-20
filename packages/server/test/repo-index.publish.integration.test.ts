@@ -340,21 +340,29 @@ test("a published path is returned by a semantic search over its stored vector",
   }
 
   // A real semantic query: the query vector is the one derived from a chunk's own text, so that
-  // chunk is the nearest neighbour and the hit has to resolve to its published path row.
+  // chunk is the nearest neighbour and the hit has to resolve to its published path row. Index
+  // scans are off for this read because the alternative plan - an HNSW index scan - is approximate
+  // by construction: it answers from its candidate window in distance order and never sees the
+  // joins above it (pgvector 0.8.7 keeps walking the graph only when the filter is on the indexed
+  // table and `hnsw.iterative_scan` is set), so a chunk that exists can fall outside the window.
+  // The assertion is about which path the query resolves to, so the ordering has to be exact.
   const target = anchors[anchors.length - 1];
   const query = `[${pseudoVector(`chunk:${target.content}`).join(",")}]`;
-  const hits = await db.$queryRaw`
-    SELECT c."id" AS "chunkId", d."externalId" AS "path", d."projectId" AS "projectId",
-           s."type" AS "sourceType", s."name" AS "sourceName", p."path" AS "publishedPath",
-           p."generationId" AS "generationId", (1 - (c."embedding" <=> ${query}::vector)) AS "score"
-    FROM "chunks" c
-    JOIN "documents" d ON d."id" = c."documentId"
-    JOIN "sources" s ON s."id" = d."sourceId"
-    JOIN "repo_index_paths" p ON p."chunkId" = c."id"
-    WHERE s."projectId" = ${project.id} AND p."scopeId" = ${scope.id}
-    ORDER BY c."embedding" <=> ${query}::vector
-    LIMIT 1
-  `;
+  const hits = await db.$transaction(async (tx: any) => {
+    await tx.$executeRaw`SET LOCAL enable_indexscan = off`;
+    return tx.$queryRaw`
+      SELECT c."id" AS "chunkId", d."externalId" AS "path", d."projectId" AS "projectId",
+             s."type" AS "sourceType", s."name" AS "sourceName", p."path" AS "publishedPath",
+             p."generationId" AS "generationId", (1 - (c."embedding" <=> ${query}::vector)) AS "score"
+      FROM "chunks" c
+      JOIN "documents" d ON d."id" = c."documentId"
+      JOIN "sources" s ON s."id" = d."sourceId"
+      JOIN "repo_index_paths" p ON p."chunkId" = c."id"
+      WHERE s."projectId" = ${project.id} AND p."scopeId" = ${scope.id}
+      ORDER BY c."embedding" <=> ${query}::vector
+      LIMIT 1
+    `;
+  });
   assert.equal(hits.length, 1);
   assert.equal(hits[0].chunkId, target.chunkId, "the nearest hit is the chunk whose vector was the query");
   assert.equal(hits[0].publishedPath, hits[0].path, "the hit resolves to the path row that published it");

@@ -10,6 +10,7 @@ import {
   type RefTreePage,
   type RefViolationReason,
 } from "../src/connectors/repo-ref.js";
+import { PUBLISHED_PAGES_MAX } from "../src/engine/repo-index/connector-run.js";
 
 // Lowercase sha a provider would really answer with, so address validation is
 // exercised by realistic values instead of a placeholder like "commit-1".
@@ -704,9 +705,10 @@ test("a tree larger than one page is enumerated whole", async () => {
 // would report every file the remaining pages hold as deleted.
 test("a provider that keeps announcing another page is refused at the ceiling", async () => {
   // The number is part of the contract, not of this module alone: engine/repo-index/connector-run.ts
-  // bounds its own paging loop at PUBLISHED_PAGES_MAX = 100, and the review's requirement is that
-  // the two agree. Pinning it here fails if either loop drifts to a different ceiling.
-  assert.equal(TREE_PAGES_MAX, 100, "the tree ceiling matches the run's published-tree ceiling");
+  // bounds its own paging loop at PUBLISHED_PAGES_MAX, and the review's requirement is that the two
+  // agree. Comparing the two constants (not a copied 100) fails if either loop drifts to its own
+  // ceiling, which is the state repo-ref.ts's comment rules out.
+  assert.equal(TREE_PAGES_MAX, PUBLISHED_PAGES_MAX, "the tree ceiling matches the run's published-tree ceiling");
 
   const asked: number[] = [];
   const read: string[] = [];

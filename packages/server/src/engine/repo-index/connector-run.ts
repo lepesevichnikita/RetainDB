@@ -135,8 +135,12 @@ const DEFAULT_PART_SIZE = 500;
 /** Paths per page when the run reads the published tree; store.ts's own default is 100. */
 const PUBLISHED_PAGE = 1_000;
 
-/** A store that never finishes paging its manifest is broken, not slow; the run does not wait. */
-const PUBLISHED_PAGES_MAX = 100;
+/**
+ * A store that never finishes paging its manifest is broken, not slow; the run does not wait.
+ * Exported because `connectors/repo-ref.ts` bounds tree enumeration at the same ceiling
+ * (`TREE_PAGES_MAX`), and a test pins the two constants to each other.
+ */
+export const PUBLISHED_PAGES_MAX = 100;
 
 /**
  * Blob content the scan may keep so materialisation reads each blob once. Bounded because the scan

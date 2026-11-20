@@ -399,8 +399,15 @@ an injected provider, an injected-or-real store, and produces one publication or
    fetches; a moved ref is `STALE_REF`. Tree enumeration refuses a repeated path and a page
    pointer that does not advance as `INCOMPLETE_TREE`, and any entry that is not a regular file
    inside its root (absolute path, parent segment, symlink, submodule, unknown mode, control
-   character) as `UNSAFE_TREE` with the violations. Blobs are read 8 at a time, bounded by
-   `maxBlobBytes`; anything short of a complete read is `INCOMPLETE_TREE`.
+   character) as `UNSAFE_TREE` with the violations. Enumeration is also bounded at
+   `TREE_PAGES_MAX` pages (100): a provider that still announces another page at that ceiling
+   answers `INCOMPLETE_TREE`, because the pages read so far are a prefix and publishing them
+   would report every file in the pages left unread as deleted. The git provider gives each git
+   call 10 seconds by default (`GIT_TIMEOUT_MS` in `ref-provider-git.ts`); a tree or blob read that
+   misses the deadline fails with its own `GIT_TIMEOUT` and refuses the run as `INCOMPLETE_TREE`.
+   A timeout is never answered as a file being absent: absence is what the manifest records as a
+   deletion, and a deadline is not an answer about the repository. Blobs are read 8 at a time,
+   bounded by `maxBlobBytes`; anything short of a complete read is `INCOMPLETE_TREE`.
 3. **Deletions are declared, not inferred at publish time.** A path in the prior tree that the new
    manifest does not name is a deletion; the run records it as a tombstone in the first part,
    because a removal is not a manifest entry. Without that, the store would refuse the publication

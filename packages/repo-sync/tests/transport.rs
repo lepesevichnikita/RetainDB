@@ -20,7 +20,7 @@ use retaindb_repo::json;
 use retaindb_repo::sync_state::{ChangeKind, PendingChange, SyncState};
 use retaindb_repo::transport::{
     command_for, deliver, Credential, CurlTransport, Endpoint, Limits, Lost, Receipt, Reply,
-    Request, SendError, Transport, GRANT_HEADER,
+    Request, SendError, Transport, GRANT_HEADER, MAX_CONFIG_LINE_BYTES,
 };
 
 /// The token a real deployment would read from the environment.
@@ -263,6 +263,21 @@ fn a_lost_response_alone_never_moves_the_watermark() {
 }
 
 #[test]
+fn a_config_read_failure_is_final_and_not_retried() {
+    // If curl cannot read the config it was fed, no request left this host.
+    // Retrying the same bytes and calling it a lost response would blame the
+    // network for a local limit.
+    let harness = support::Harness::enrolled();
+    planted(&harness, 3, &["src/main.rs"]);
+    let transport = FakeTransport::answering(vec![Reply::Lost(Lost::Config); 3]);
+    let error = deliver(&harness.store, &transport, &endpoint(), &limits())
+        .expect_err("a config read failure is a failure");
+    assert!(matches!(error, SendError::ConfigUnreadable), "{error}");
+    assert_eq!(transport.calls(), 1, "a local read failure is not retried");
+    assert_eq!(watermark(&harness), 0);
+}
+
+#[test]
 fn a_401_is_not_retried() {
     // A refused grant does not heal by trying again.
     let harness = support::Harness::enrolled();
@@ -342,6 +357,11 @@ fn the_credential_never_appears_in_any_error_string() {
         vec![answered(400)],
         vec![answered(429); 3],
         vec![Reply::Lost(Lost::Connection); 3],
+        vec![Reply::Lost(Lost::Config)],
+        vec![Reply::Refused {
+            line_bytes: 2 * MAX_CONFIG_LINE_BYTES,
+            limit: MAX_CONFIG_LINE_BYTES,
+        }],
         vec![Reply::Status {
             status: 200,
             body: "not a receipt".to_string(),
@@ -390,7 +410,8 @@ impl Server {
 
 /// Answer `status` with `answer` for every request until the client has been
 /// quiet long enough that a retry would already have arrived. Counting the
-/// requests that arrived is how a test sees the retry policy.
+/// requests that arrived is how a test sees the retry policy; a client that
+/// refuses locally simply leaves the count at zero.
 fn loopback(status: u16, answer: &'static str) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
     let port = listener.local_addr().expect("the bound address").port();
@@ -409,9 +430,11 @@ fn loopback(status: u16, answer: &'static str) -> Server {
                 }
                 Err(_) => {
                     // A retry follows within milliseconds (the test limits have no
-                    // backoff), so a longer silence is the end of the script.
+                    // backoff), so a longer silence is the end of the script. With
+                    // nothing yet, the wait only has to outlast a curl that a
+                    // broken transport would already have started.
                     let quiet = if seen.is_empty() {
-                        Duration::from_secs(5)
+                        Duration::from_secs(2)
                     } else {
                         Duration::from_millis(500)
                     };
@@ -577,6 +600,141 @@ fn the_loopback_request_body_matches_the_fake_one_byte_for_byte() {
         expected,
         "the request body is byte-identical to the fake one"
     );
+}
+
+#[test]
+fn a_body_at_the_wire_limit_is_delivered_when_it_fits_one_config_line() {
+    // The transport's own maximum is a body it can hand to curl: the encoded
+    // body is exactly `max_wire_bytes`, the boundary `within` accepts.
+    let harness = support::Harness::enrolled();
+    planted(&harness, 4, &["src/main.rs", "src/lib.rs"]);
+    let fake = FakeTransport::answering(vec![answered(413)]);
+    deliver(&harness.store, &fake, &endpoint(), &limits()).expect_err("413 is a failure");
+    let expected = fake.requests()[0].body.clone();
+    let at_maximum = Limits {
+        max_wire_bytes: expected.len(),
+        backoff_ms: 0,
+        ..limits()
+    };
+    let server = loopback(200, r#"{"generation":4}"#);
+    let delivered = deliver(
+        &harness.store,
+        &CurlTransport::default(),
+        &loopback_endpoint(&server),
+        &at_maximum,
+    )
+    .expect("a body at the limit is delivered");
+    assert_eq!(delivered, Some(Receipt { generation: 4 }));
+    assert_eq!(watermark(&harness), 4);
+    let seen = server.seen();
+    assert_eq!(seen.len(), 1, "one attempt, no retry");
+    assert_eq!(
+        String::from_utf8(seen[0].body.clone()).expect("a UTF-8 body"),
+        expected,
+        "the delivered body is the encoded one, byte for byte"
+    );
+}
+
+#[test]
+fn a_batch_too_wide_for_one_curl_config_line_is_refused_locally_and_never_sent() {
+    // A batch can be legal under both `Limits` fields and still not fit the one
+    // config line curl reads. It must be refused here, before curl starts: an
+    // old curl rejects the line locally (exit 26), and the retry loop would
+    // report that local limit as a lost response.
+    let harness = support::Harness::enrolled();
+    let long = "p".repeat(4000);
+    let paths: Vec<String> = (0..32)
+        .map(|number| format!("dir/{long}/{number}.rs"))
+        .collect();
+    let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    planted(&harness, 5, &refs);
+    // The same batch is legal under the advertised entry and wire bounds, so
+    // the refusal below is only about the config line.
+    let default_limits = Limits {
+        backoff_ms: 0,
+        ..Limits::default()
+    };
+    let fake = FakeTransport::answering(vec![answered(413)]);
+    let error =
+        deliver(&harness.store, &fake, &endpoint(), &default_limits).expect_err("413 is a failure");
+    assert!(
+        matches!(error, SendError::TooLarge { status: 413 }),
+        "{error}"
+    );
+    let body = fake.requests()[0].body.len();
+    assert!(
+        body > MAX_CONFIG_LINE_BYTES,
+        "the batch really is wider than one config line: {body} bytes"
+    );
+    assert!(
+        body <= default_limits.max_wire_bytes,
+        "and still inside the wire bound: {body} bytes"
+    );
+    assert!(
+        paths.len() <= default_limits.max_entries,
+        "and inside the entry bound"
+    );
+    // At the transport's own maximum the body is still undeliverable: refuse it
+    // here, once, and never let curl see a line it cannot read.
+    let at_maximum = Limits {
+        max_wire_bytes: body,
+        backoff_ms: 0,
+        ..default_limits
+    };
+    let server = loopback(200, r#"{"generation":5}"#);
+    let error = deliver(
+        &harness.store,
+        &CurlTransport::default(),
+        &loopback_endpoint(&server),
+        &at_maximum,
+    )
+    .expect_err("a body that cannot fit one curl config line is refused");
+    assert!(
+        matches!(
+            error,
+            SendError::ConfigLineTooLong { line_bytes, limit }
+                if line_bytes >= body && limit == MAX_CONFIG_LINE_BYTES
+        ),
+        "{error}"
+    );
+    assert_eq!(
+        server.seen().len(),
+        0,
+        "the batch was not handed to curl, so nothing was sent or retried"
+    );
+    assert_eq!(
+        watermark(&harness),
+        0,
+        "a local refusal never advances the watermark"
+    );
+}
+
+#[test]
+fn a_body_that_starts_with_at_is_sent_byte_for_byte() {
+    // A request body is arbitrary bytes. `data-binary` would read a leading `@`
+    // as a file name, so the bytes handed to the transport would not be the
+    // bytes the server receives. The loopback listener asserts them.
+    let body = "@scope/not-a-file \"quoted\" \\ back\nsecond line\tend";
+    let server = loopback(200, r#"{"generation":1}"#);
+    let request = Request {
+        method: "POST",
+        url: server.url.clone(),
+        body: body.to_string(),
+        credential: Credential::parse(TOKEN).expect("a usable token"),
+    };
+    let reply = CurlTransport::default().send(&request);
+    assert!(
+        matches!(reply, Reply::Status { status: 200, .. }),
+        "the request was not delivered: {reply:?}"
+    );
+    let seen = server.seen();
+    assert_eq!(seen.len(), 1, "one request reached the server");
+    assert_eq!(
+        String::from_utf8(seen[0].body.clone()).expect("a UTF-8 body"),
+        body,
+        "the body arrived unchanged, leading `@` included"
+    );
+    assert_eq!(seen[0].grant.as_deref(), Some(TOKEN));
 }
 
 #[test]

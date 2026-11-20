@@ -11,11 +11,20 @@
 //! Invocation: `curl` gets the grant header and the body as a config stream on
 //! stdin (`--config -`). The credential is never an argument, so no other process
 //! can read it from `ps` or `/proc/<pid>/cmdline` while the request is in flight,
-//! and it never touches a file.
+//! and it never touches a file. The body is one `data-raw` value, so a leading
+//! `@` stays a byte instead of naming a file: the bytes passed are the bytes sent
+//! for any [`Request::body`].
 //!
 //! Bounds are checked before the request leaves: an entry count and a wire byte
 //! limit, both explicit in [`Limits`]. A batch over either is refused locally
-//! instead of being uploaded and bounced with a 413.
+//! instead of being uploaded and bounced with a 413. curl has a third bound that
+//! this transport cannot lift: it reads a config line into
+//! [`MAX_CONFIG_LINE_BYTES`], which was 100 KiB up to and including 8.1.0 and is
+//! 10 MiB from 8.2.0. The body is one line, so a body that does not fit is
+//! refused locally with [`SendError::ConfigLineTooLong`] before curl starts:
+//! never retried, never reported as a lost response. Holding every line to the
+//! older cap is also what makes one batch behave the same on every supported
+//! curl, 7.43.0 and newer (where `data-raw` exists).
 //!
 //! Idempotency: every change of one generation travels as part 1 of that
 //! generation, and a retry resends the identical body and part number, so the
@@ -56,10 +65,26 @@ const STATUS_TRAILER: &str = "\n%{http_code}";
 /// unbounded would let the peer decide how much memory this process uses.
 const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
 
+/// The longest line this transport puts into curl's config stream, measured
+/// after the body is quoted and escaped.
+///
+/// curl reads a config line into a buffer capped at its own
+/// `MAX_CONFIG_LINE_LENGTH`: 100 KiB up to and including 8.1.0, 10 MiB from
+/// 8.2.0. A line that does not fit is a local read error and curl exits 26
+/// without a request. This transport holds every line to the older cap, so one
+/// batch behaves the same on every supported curl, and it refuses a body that
+/// cannot fit instead of letting an old curl reject it. The two spare bytes are
+/// the line's newline and curl's terminating NUL.
+pub const MAX_CONFIG_LINE_BYTES: usize = 100 * 1024;
+
 /// Request bounds and retry budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// Hard cap on the encoded request body.
+    ///
+    /// A body inside this cap still has to fit one curl config line; see
+    /// [`MAX_CONFIG_LINE_BYTES`]. The cap is the caller's policy, the line is
+    /// curl's.
     pub max_wire_bytes: usize,
     /// Hard cap on the number of changes in one batch.
     pub max_entries: usize,
@@ -179,6 +204,9 @@ pub enum Lost {
     TooBig,
     /// `curl` exited 0 but printed no status code.
     NoStatus,
+    /// `curl` could not read the config it was fed (exit 26): a local read
+    /// failure, not an answer that went missing.
+    Config,
     /// Any other non-zero exit.
     Exit(i32),
 }
@@ -191,6 +219,7 @@ impl fmt::Display for Lost {
             Self::Connection => f.write_str("the endpoint could not be reached"),
             Self::TooBig => f.write_str("the answer was larger than the receipt limit"),
             Self::NoStatus => f.write_str("curl printed no status code"),
+            Self::Config => f.write_str("curl could not read its configuration"),
             Self::Exit(code) => write!(f, "curl exited {code}"),
         }
     }
@@ -201,6 +230,9 @@ impl fmt::Display for Lost {
 pub enum Reply {
     /// The endpoint answered.
     Status { status: u16, body: String },
+    /// The request does not fit the config curl reads, so nothing was sent.
+    /// The widest line and the limit say by how much.
+    Refused { line_bytes: usize, limit: usize },
     /// Nothing came back; a retry may still succeed.
     Lost(Lost),
 }
@@ -208,6 +240,10 @@ pub enum Reply {
 /// The wire seam. [`CurlTransport`] is the shipped implementation; tests drive
 /// a fake through the same interface, so classification and retry are testable
 /// without a socket.
+///
+/// An implementation that cannot put the request on the wire reports
+/// [`Reply::Refused`], never [`Reply::Lost`]: a local limit is not a response
+/// that went missing.
 pub trait Transport {
     /// Send one request and report what came back. Idempotent by contract: the
     /// caller may send the identical request again.
@@ -215,7 +251,9 @@ pub trait Transport {
 }
 
 /// Shells out to the system `curl`, which keeps this crate dependency-free and
-/// buildable offline.
+/// buildable offline. Needs curl 7.43.0 or newer for `--data-raw`, and holds
+/// every config line to [`MAX_CONFIG_LINE_BYTES`] so older and newer curls read
+/// the same request.
 pub struct CurlTransport {
     timeout_seconds: u64,
 }
@@ -230,6 +268,18 @@ impl Default for CurlTransport {
 
 impl Transport for CurlTransport {
     fn send(&self, request: &Request) -> Reply {
+        // The config is one line per option, and curl reads each line into a
+        // buffer of `MAX_CONFIG_LINE_BYTES`. A longer line is a local read error
+        // (exit 26), which no retry can fix, so it is refused before curl starts
+        // and never becomes a "lost response".
+        let config = config_for(request);
+        let line_bytes = widest_line(&config);
+        if line_bytes + 2 > MAX_CONFIG_LINE_BYTES {
+            return Reply::Refused {
+                line_bytes,
+                limit: MAX_CONFIG_LINE_BYTES,
+            };
+        }
         let mut child = match command_for(self.timeout_seconds, request).spawn() {
             Ok(child) => child,
             Err(_) => return Reply::Lost(Lost::Spawn),
@@ -238,7 +288,7 @@ impl Transport for CurlTransport {
         // is never one of the child's arguments. `EPIPE` is not fatal here: curl
         // may already have failed, and the exit status says what happened.
         if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(config_for(request).as_bytes());
+            let _ = stdin.write_all(config.as_bytes());
         }
         match child.wait_with_output() {
             Ok(output) if output.status.success() => status_of(&output.stdout),
@@ -285,16 +335,24 @@ pub fn command_for(timeout_seconds: u64, request: &Request) -> Command {
 ///
 /// This is the only channel the credential travels on. A `--header` argument
 /// would be readable through `ps` and `/proc/<pid>/cmdline` for as long as the
-/// request lasts, and a `--header @file` indirection would leave it on disk. The
-/// body is one config line, far below curl's own line limit at the default
-/// [`Limits::max_wire_bytes`].
+/// request lasts, and a `--header @file` indirection would leave it on disk.
+/// `data-raw` takes the body literally: `data-binary` would read a body that
+/// starts with `@` as a file name, so the bytes passed would not be the bytes
+/// sent. The body is one line, which is why [`MAX_CONFIG_LINE_BYTES`] bounds it.
 fn config_for(request: &Request) -> String {
     let grant = format!("{GRANT_HEADER}: {}", request.credential.expose());
     format!(
-        "header = \"{}\"\ndata-binary = \"{}\"\n",
+        "header = \"{}\"\ndata-raw = \"{}\"\n",
         config_value(&grant),
         config_value(&request.body)
     )
+}
+
+/// The widest line of a config stream, in bytes, without its line break. curl's
+/// own cap counts the break and the terminating NUL too, so the caller adds
+/// those two bytes before comparing.
+fn widest_line(config: &str) -> usize {
+    config.split('\n').map(str::len).max().unwrap_or(0)
 }
 
 /// Quote one config value: a backslash or a quote would otherwise end the value,
@@ -331,6 +389,7 @@ fn status_of(stdout: &[u8]) -> Reply {
 
 fn lost_of(code: Option<i32>) -> Lost {
     match code {
+        Some(26) => Lost::Config,
         Some(28) => Lost::Timeout,
         Some(63) => Lost::TooBig,
         Some(6 | 7 | 35 | 52 | 55 | 56) => Lost::Connection,
@@ -485,9 +544,15 @@ impl Retry {
 fn classify(reply: Reply) -> Step {
     match reply {
         Reply::Status { status, body } => classify_status(status, body),
+        // The request never fitted curl's config, so no attempt left this host.
+        Reply::Refused { line_bytes, limit } => {
+            Step::Final(SendError::ConfigLineTooLong { line_bytes, limit })
+        }
         Reply::Lost(Lost::Spawn) => Step::Final(SendError::Unavailable),
         // An answer past the receipt bound is not retryable into a receipt.
         Reply::Lost(Lost::TooBig) => Step::Final(SendError::UnreadableReceipt),
+        // A local read failure: the same bytes fail the same way again.
+        Reply::Lost(Lost::Config) => Step::Final(SendError::ConfigUnreadable),
         // Listed one by one: a new `Lost` variant must decide its own class
         // instead of inheriting "retryable" from a catch-all.
         Reply::Lost(Lost::Timeout)
@@ -523,6 +588,12 @@ pub enum SendError {
     TooManyEntries { count: usize, limit: usize },
     /// A larger encoded body than the wire limit allows.
     BodyTooLarge { bytes: usize, limit: usize },
+    /// The body cannot be put into one curl config line. Not retried: the same
+    /// body needs the same line again.
+    ConfigLineTooLong { line_bytes: usize, limit: usize },
+    /// `curl` could not read the config it was fed (exit 26). Not retried: no
+    /// request left this host.
+    ConfigUnreadable,
     /// The server refused the body as too large (413). Not retried.
     TooLarge { status: u16 },
     /// 401/403: the grant was refused. Not retried.
@@ -554,6 +625,13 @@ impl fmt::Display for SendError {
             }
             Self::BodyTooLarge { bytes, limit } => {
                 write!(f, "batch body is {bytes} bytes, limit is {limit}")
+            }
+            Self::ConfigLineTooLong { line_bytes, limit } => write!(
+                f,
+                "the request needs a {line_bytes}-byte curl config line, above the {limit}-byte cap of curl 8.1 and older"
+            ),
+            Self::ConfigUnreadable => {
+                f.write_str("curl could not read the request configuration")
             }
             Self::TooLarge { status } => {
                 write!(f, "the server refused the body as too large: {status}")

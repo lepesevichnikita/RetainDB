@@ -1000,24 +1000,61 @@ async function repositoryAttributionOf(
 ): Promise<Map<string, RepositoryAttribution>> {
   const wanted = results.filter((result) => repositoryAttributionKey(result) !== "");
   if (wanted.length === 0) return new Map();
-  const rows = await prisma.$queryRaw<Array<{ scopeId: string; path: string; digest: string; generation: number; revision: string }>>`
+
+  // Prefer the generation the chunk itself recorded when it was staged: that value was written by the
+  // publication that produced this text, so it cannot disagree with the answer. Reading the path row
+  // instead is a race - a publication committing between the search and this lookup moves the path row
+  // to the newer generation, and the answer would then be labelled with a revision it did not come from.
+  const generationIds = [...new Set(
+    wanted
+      .map((result) => String(result.metadata?.repo_index_generation_id ?? ""))
+      .filter((id) => id !== ""),
+  )];
+  const byGeneration = generationIds.length === 0 ? [] : await prisma.$queryRaw<Array<{ id: string; scopeId: string; generation: number; revision: string }>>`
+    SELECT g.id, g."scopeId" AS "scopeId", g.generation, g.revision
+    FROM repo_index_generations g
+    WHERE g.id = ANY(${generationIds}::uuid[])
+  `;
+  const generationById = new Map(byGeneration.map((row) => [row.id, row]));
+
+  // Fallback for a result whose metadata carries no generation id: read the path row as before.
+  const needPath = wanted.filter((result) => !generationById.has(String(result.metadata?.repo_index_generation_id ?? "")));
+  const rows = needPath.length === 0 ? [] : await prisma.$queryRaw<Array<{ scopeId: string; path: string; digest: string; generation: number; revision: string }>>`
     SELECT p."scopeId" AS "scopeId", p.path, p.digest, g.generation, g.revision
     FROM repo_index_paths p
     INNER JOIN repo_index_generations g ON g.id = p."generationId"
     WHERE p.state = 'present'
-      AND p."scopeId" = ANY(${wanted.map((result) => String(result.metadata?.repo_scope_id))}::text[])
-      AND p.path = ANY(${wanted.map((result) => String(result.metadata?.repo_path))}::text[])
+      AND p."scopeId" = ANY(${needPath.map((result) => String(result.metadata?.repo_scope_id))}::text[])
+      AND p.path = ANY(${needPath.map((result) => String(result.metadata?.repo_path))}::text[])
   `;
-  return new Map(rows.map((row) => [
-    `${row.scopeId}\u0000${row.path}`,
-    {
+
+  const attribution = new Map<string, RepositoryAttribution>();
+  for (const result of wanted) {
+    const key = repositoryAttributionKey(result);
+    const path = String(result.metadata?.repo_path);
+    const digest = String(result.metadata?.repo_digest ?? "");
+    const generationId = String(result.metadata?.repo_index_generation_id ?? "");
+    const recorded = generationById.get(generationId);
+    if (recorded) {
+      attribution.set(key, {
+        scope_id: recorded.scopeId,
+        path,
+        digest,
+        generation: Number(recorded.generation),
+        revision: Number(recorded.revision),
+      });
+    }
+  }
+  for (const row of rows) {
+    attribution.set(`${row.scopeId}\u0000${row.path}`, {
       scope_id: row.scopeId,
       path: row.path,
       digest: row.digest,
       generation: Number(row.generation),
       revision: Number(row.revision),
-    },
-  ]));
+    });
+  }
+  return attribution;
 }
 
 // ─── Query Context ───────────────────────────────────────────

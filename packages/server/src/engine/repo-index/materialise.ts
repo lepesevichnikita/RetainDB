@@ -506,18 +506,56 @@ export async function planMaterialisation(handle: Database, input: MaterialiseIn
  * is why the caller keeps batches small; every row of a batch appears at once, and none of them is
  * visible until `promoteStaged`.
  *
+ * Two statements write the batch, one for its documents and one for its chunks. A statement per row
+ * is what made this phase round-trip bound: every chunk paid a round trip, so a real tree spent its
+ * whole budget in a phase that never fails, it only gets slower as the tree grows. Both statements
+ * name the same columns and the same values a row-at-a-time write named, which is what the staging
+ * suite compares row by row.
+ *
  * The scope's source is created here, on the first batch that needs one, and never on a publication
  * that only reuses what it already has.
  */
 export async function stageBatch(handle: Database, input: StageBatchInput): Promise<StagedBatch> {
   const source = await ensureScopeSource(handle, input);
-  const anchors: Array<{ path: string; chunkId: string }> = [];
-  for (const entry of input.paths) {
-    const documentId = await createStagedDocument(handle, input, source.id, entry);
-    const chunkIds = await insertChunks(handle, input, documentId, entry);
-    if (chunkIds.length > 0) anchors.push({ path: entry.path, chunkId: chunkIds[0] });
-  }
-  return { sourceId: source.id, anchors };
+  const documents = input.paths.map((entry) => ({ id: randomUUID(), entry }));
+  const chunks = stagedChunksOf(documents);
+  await insertDocuments(handle, input, source.id, documents);
+  await insertChunks(handle, input, chunks);
+  return { sourceId: source.id, anchors: chunkAnchorsOf(chunks) };
+}
+
+/** One document a batch writes, under the id it will carry. */
+interface StagedDocument {
+  id: string;
+  entry: PreparedPath;
+}
+
+/** One chunk row a batch writes, with the document it belongs to and the id it will carry. */
+interface StagedChunk {
+  id: string;
+  documentId: string;
+  path: string;
+  digest: string;
+  prepared: PreparedChunk;
+}
+
+/** Every chunk row of the batch, in plan order, the way the batch's paths hold them. */
+function stagedChunksOf(documents: readonly StagedDocument[]): StagedChunk[] {
+  return documents.flatMap(({ id, entry }) =>
+    entry.chunks.map((prepared) => ({ id: randomUUID(), documentId: id, path: entry.path, digest: entry.digest, prepared })),
+  );
+}
+
+/** The chunk each staged path anchors: its first chunk, which is where the path row points. */
+function chunkAnchorsOf(chunks: readonly StagedChunk[]): Array<{ path: string; chunkId: string }> {
+  const anchors = new Map<string, string>();
+  for (const { path, id } of chunks) if (!anchors.has(path)) anchors.set(path, id);
+  return [...anchors].map(([path, chunkId]) => ({ path, chunkId }));
+}
+
+/** The token estimate every document and chunk row carries: a quarter of its text. */
+function tokenEstimate(content: string): number {
+  return Math.ceil(content.length / 4);
 }
 
 /**
@@ -639,81 +677,83 @@ async function loadMaterialisedPaths(handle: Database, sourceId: string): Promis
   }));
 }
 
-/** One document of one staged path, carrying the two markers that decide whether it may be published. */
-function documentData(input: StageBatchInput, entry: PreparedPath) {
-  return {
-    projectId: input.projectId,
-    externalId: entry.path,
-    title: entry.path,
-    path: entry.path,
-    contentHash: entry.digest,
-    content: entry.content,
-    tokens: Math.ceil(entry.content.length / 4),
-    metadata: {
-      repo_scope_id: input.scopeId,
-      repo_path: entry.path,
-      repo_digest: entry.digest,
-      [STAGED_GENERATION_KEY]: input.generationId,
-      [STAGED_STAGE_KEY]: input.stageId,
-    },
-    // Not indexed yet: this row is a stage, and the promotion is what makes it part of the index.
-    status: "PENDING",
-  };
+/**
+ * The document of every path of a batch, in one statement. Each row carries the two markers the
+ * promotion reads - the generation and the stage - and `deletedAt`, which is what keeps it out of
+ * every query until `promoteStaged` clears it. `createdAt` keeps the column's own default.
+ */
+async function insertDocuments(handle: Database, input: StageBatchInput, sourceId: string, documents: readonly StagedDocument[]): Promise<void> {
+  if (documents.length === 0) return;
+  const entries = documents.map(({ entry }) => entry);
+  await handle.$executeRaw`
+    INSERT INTO "documents" (
+      id, "sourceId", "projectId", "externalId", title, path, "contentHash", content, tokens,
+      metadata, status, "deletedAt", "updatedAt"
+    )
+    SELECT t.id, ${sourceId}, ${input.projectId}, t.path, t.path, t.path, t."contentHash", t.content, t.tokens,
+           t.metadata::jsonb, 'PENDING', ${input.stagedAt}::timestamp(3), NOW()
+    FROM unnest(
+      ${documents.map(({ id }) => id)}::uuid[],
+      ${entries.map(({ path }) => path)}::text[],
+      ${entries.map(({ digest }) => digest)}::text[],
+      ${entries.map(({ content }) => content)}::text[],
+      ${entries.map(({ content }) => tokenEstimate(content))}::int[],
+      ${entries.map((entry) => stagedDocumentMetadata(input, entry))}::text[]
+    ) AS t(id, path, "contentHash", content, tokens, metadata)
+  `;
 }
 
-async function createStagedDocument(handle: Database, input: StageBatchInput, sourceId: string, entry: PreparedPath): Promise<string> {
-  const document = await handle.document.create({
-    data: { sourceId, ...documentData(input, entry), deletedAt: input.stagedAt },
+/** The metadata a staged document carries: its path, digest, scope and the two markers. */
+function stagedDocumentMetadata(input: StageBatchInput, entry: PreparedPath): string {
+  return JSON.stringify({
+    repo_scope_id: input.scopeId,
+    repo_path: entry.path,
+    repo_digest: entry.digest,
+    [STAGED_GENERATION_KEY]: input.generationId,
+    [STAGED_STAGE_KEY]: input.stageId,
   });
-  return document.id;
-}
-
-async function insertChunks(handle: Database, input: StageBatchInput, documentId: string, entry: PreparedPath): Promise<string[]> {
-  const owner = { documentId, path: entry.path, digest: entry.digest, projectId: input.projectId, scopeId: input.scopeId };
-  const ids: string[] = [];
-  for (const prepared of entry.chunks) {
-    const id = randomUUID();
-    ids.push(id);
-    await insertChunk(handle, { ...owner, id }, prepared);
-  }
-  return ids;
-}
-
-interface ChunkOwner {
-  id: string;
-  documentId: string;
-  projectId: string;
-  scopeId: string;
-  path: string;
-  digest: string;
 }
 
 /**
- * One chunk row, with its vector, written the way engine/ingest.ts writes a document chunk: the
- * pgvector column takes a literal, because Prisma has no client type for `Unsupported("vector")`.
+ * Every chunk row of a batch, in one statement, written the way engine/ingest.ts writes a document
+ * chunk: the pgvector column takes a literal, because Prisma has no client type for
+ * `Unsupported("vector")`. The arrays are the columns, one element per chunk, so the statement is
+ * one column list whatever the batch holds and no parameter is spent per row.
  */
-async function insertChunk(handle: Database, owner: ChunkOwner, prepared: PreparedChunk): Promise<void> {
-  const metadata = JSON.stringify({
-    ...prepared.chunk.metadata,
-    repo_scope_id: owner.scopeId,
-    repo_path: owner.path,
-    repo_digest: owner.digest,
-  });
-  const tokens = Math.ceil(prepared.chunk.content.length / 4);
-  const contentHash = createHash("sha256").update(prepared.chunk.content).digest("hex");
-  const searchContent = searchContentFor(owner.path, prepared.chunk);
+async function insertChunks(handle: Database, input: StageBatchInput, chunks: readonly StagedChunk[]): Promise<void> {
+  if (chunks.length === 0) return;
   await handle.$executeRaw`
     INSERT INTO "chunks" (
       id, "documentId", "projectId", content, "chunkType", "chunkIndex", metadata, tokens,
       "searchContent", "contentHash", "sectionPath", "headingPath", embedding, "createdAt", "updatedAt"
     )
-    VALUES (
-      ${owner.id}::uuid, ${owner.documentId}, ${owner.projectId}, ${prepared.chunk.content},
-      ${prepared.chunk.chunkType}, ${prepared.chunk.chunkIndex}, ${metadata}::jsonb, ${tokens},
-      ${searchContent}, ${contentHash}, ${prepared.chunk.sectionPath ?? null}, ${prepared.chunk.headingPath ?? null},
-      ${`[${prepared.vector.join(",")}]`}::vector, NOW(), NOW()
-    )
+    SELECT t.id, t."documentId", ${input.projectId}, t.content, t."chunkType", t."chunkIndex", t.metadata::jsonb, t.tokens,
+           t."searchContent", t."contentHash", t."sectionPath", t."headingPath", t.embedding::vector, NOW(), NOW()
+    FROM unnest(
+      ${chunks.map(({ id }) => id)}::uuid[],
+      ${chunks.map(({ documentId }) => documentId)}::text[],
+      ${chunks.map(({ prepared }) => prepared.chunk.content)}::text[],
+      ${chunks.map(({ prepared }) => prepared.chunk.chunkType)}::text[],
+      ${chunks.map(({ prepared }) => prepared.chunk.chunkIndex)}::int[],
+      ${chunks.map((chunk) => stagedChunkMetadata(input, chunk))}::text[],
+      ${chunks.map(({ prepared }) => tokenEstimate(prepared.chunk.content))}::int[],
+      ${chunks.map(({ path, prepared }) => searchContentFor(path, prepared.chunk))}::text[],
+      ${chunks.map(({ prepared }) => createHash("sha256").update(prepared.chunk.content).digest("hex"))}::text[],
+      ${chunks.map(({ prepared }) => prepared.chunk.sectionPath ?? null)}::text[],
+      ${chunks.map(({ prepared }) => prepared.chunk.headingPath ?? null)}::text[],
+      ${chunks.map(({ prepared }) => `[${prepared.vector.join(",")}]`)}::text[]
+    ) AS t(id, "documentId", content, "chunkType", "chunkIndex", metadata, tokens, "searchContent", "contentHash", "sectionPath", "headingPath", embedding)
   `;
+}
+
+/** The metadata a chunk row carries: what the chunker wrote, plus the scope, path and digest. */
+function stagedChunkMetadata(input: StageBatchInput, chunk: StagedChunk): string {
+  return JSON.stringify({
+    ...chunk.prepared.chunk.metadata,
+    repo_scope_id: input.scopeId,
+    repo_path: chunk.path,
+    repo_digest: chunk.digest,
+  });
 }
 
 /** The path leads the text so a keyword search can match the file a hit came from. */

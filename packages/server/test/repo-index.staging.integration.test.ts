@@ -32,6 +32,7 @@ const savedEnvironment = { ...process.env };
 
 const storePath = "../src/engine/repo-index/store.js";
 const receiptPath = "../src/engine/repo-index/receipt.js";
+const materialisePath = "../src/engine/repo-index/materialise.js";
 const retrieverPath = "../src/engine/retriever.js";
 
 /** Every scope and project this file created, removed and counted in `after`. */
@@ -335,6 +336,227 @@ test("an attempt abandoned after staging drops its stage and leaves the served g
   });
   assert.equal(late.code, "ATTEMPT_FENCED", "a fenced attempt answers as fenced");
   assert.deepEqual(await documentCounts(client, project.id), { live: 2, staged: 0 });
+});
+
+/**
+ * A transaction handle that passes every call through to the real one and records the statement
+ * each write issued. Purpose-built for the two cases below: they measure round trips, so what they
+ * need from the handle is a name for every statement, not a different answer. A model delegate
+ * (`document`, `source`) is wrapped the same way, so a write made through Prisma's typed API is
+ * counted beside a raw one.
+ */
+function recording(handle: any): { handle: any; statements: string[] } {
+  const statements: string[] = [];
+  const record = (name: string, call: (...args: any[]) => any, target: any) =>
+    (...args: any[]) => {
+      statements.push(name);
+      return call.apply(target, args);
+    };
+  const delegate = (property: string, value: any) =>
+    new Proxy(value, {
+      get(model, method) {
+        const call = Reflect.get(model, method);
+        return typeof call === "function" ? record(`${property}.${String(method)}`, call, model) : call;
+      },
+    });
+  const proxy = new Proxy(handle, {
+    get(target, property) {
+      const value = Reflect.get(target, property);
+      if (property === "document" || property === "source") return delegate(String(property), value);
+      if (typeof value !== "function") return value;
+      if (property === "$executeRaw" || property === "$executeRawUnsafe") {
+        return (first: any, ...rest: any[]) => {
+          statements.push(Array.isArray(first) ? first.join("$?") : String(first));
+          return value.apply(target, [first, ...rest]);
+        };
+      }
+      return value.bind(target);
+    },
+  });
+  return { handle: proxy, statements };
+}
+
+/** One fixture file whose content chunks into `sections` headings, so a batch holds many chunks. */
+function sectionedFile(index: number, sections: number): TreeFile {
+  const content = Array.from(
+    { length: sections },
+    (_, section) => `## part ${section}\n\nexport const value${section} = "${index}-${section}";\n// ${"filler ".repeat(20)}\n`,
+  ).join("\n");
+  return { path: `docs/batch-${index}.md`, content };
+}
+
+/**
+ * What one batch of a plan is: the paths it writes and the chunk rows it must produce. The two
+ * cases below read this instead of restating the plan, so they compare the database against what
+ * the production planner asked for.
+ */
+async function plannedBatch(tree: readonly TreeFile[], scopeId: string, projectId: string) {
+  const { db } = await import("../src/db/index.js");
+  const materialise = await import(materialisePath);
+  const { EMBEDDING_DIMENSIONS } = await import(receiptPath);
+  const byPath = new Map(tree.map((file) => [file.path, file.content] as const));
+  const plan = await materialise.planMaterialisation(db, {
+    scopeId,
+    projectId,
+    paths: tree.map((file) => ({ path: file.path, digest: createHash("sha256").update(file.content, "utf8").digest("hex") })),
+    readContent: async (path: string) => byPath.get(path) as string,
+    embed: embedder(EMBEDDING_DIMENSIONS),
+  });
+  return { plan, byPath };
+}
+
+// Behaviour: one staging batch is a bounded number of statements. Staging was round-trip bound -
+// every chunk cost a statement of its own, so a tree of 5,000 chunks paid 5,000 of them and a
+// larger tree spent minutes inside a phase that never fails, it only gets slower. This counts the
+// statements one batch of eight files issues against the real database, and the case below checks
+// that the rows that bounded set of statements wrote are the rows the plan asked for.
+test("one staging batch writes every chunk of a file in one statement, not one per chunk", async () => {
+  const { client, project, scope } = await fixture();
+  const tree = Array.from({ length: 8 }, (_, index) => sectionedFile(index, 5));
+  const { plan } = await plannedBatch(tree, scope.id, project.id);
+  const materialise = await import(materialisePath);
+  const { prisma } = await import("../src/db/index.js");
+  const owner = { scopeId: scope.id, projectId: project.id, orgId: "default" };
+
+  // The scope's source is created by the first batch that needs one, which is a one-off per scope;
+  // staged empty, it leaves the measured batch below the shape a publication's later batches have.
+  await prisma.$transaction((tx: any) =>
+    materialise.stageBatch(tx, { ...owner, generationId: randomUUID(), stageId: randomUUID(), stagedAt: new Date(), paths: [] }),
+  );
+
+  const measured = await prisma.$transaction(async (tx: any) => {
+    const recorder = recording(tx);
+    const staged = await materialise.stageBatch(recorder.handle, {
+      ...owner,
+      generationId: randomUUID(),
+      stageId: randomUUID(),
+      stagedAt: new Date(),
+      paths: plan.pending,
+    });
+    return { staged, statements: recorder.statements };
+  });
+
+  const chunks = plan.pending.reduce((total, entry) => total + entry.chunks.length, 0);
+  const inserting = (table: string) => measured.statements.filter((statement) => statement.includes(`INSERT INTO "${table}"`)).length;
+  assert.ok(chunks > tree.length * 2, `the fixture batch holds enough chunks to have paid a statement each: ${chunks}`);
+  assert.equal(inserting("chunks"), 1, `one statement writes every chunk of the batch, not ${chunks}: ${measured.statements.length} statements in all`);
+  assert.equal(inserting("documents"), 1, `and one writes its documents, not ${tree.length}`);
+  // Three statements: the source this batch writes into, its documents and its chunks - whatever
+  // the batch holds. It was one per row before: a chunk of 40 rows cost 40 statements of its own.
+  assert.ok(
+    measured.statements.length <= 3,
+    `a batch of ${tree.length} files and ${chunks} chunks is three statements, not one per row: ${measured.statements.length}`,
+  );
+  assert.equal(await client.chunk.count({ where: { projectId: project.id } }), chunks, "every chunk of the batch is written");
+  assert.equal(await client.document.count({ where: { projectId: project.id, deletedAt: { not: null } } }), tree.length, "and one staged document per file");
+  // The anchors are unchanged: one first chunk per file that has chunks, in plan order.
+  assert.deepEqual(
+    (measured.staged.anchors as Array<{ path: string; chunkId: string }>).map((anchor) => anchor.path),
+    plan.pending.filter((entry) => entry.chunks.length > 0).map((entry) => entry.path),
+    "each staged file still answers its first chunk as the anchor",
+  );
+});
+
+// Behaviour: a batch writes the same rows it always wrote. A multi-row statement is one column
+// list, so a value in the wrong place is the failure this rewrite invites: every column of every
+// staged row is compared against the plan that asked for it, including the vector the embedder
+// returned (through the float4 the `vector` column stores) and the metadata the chunker wrote.
+test("a staged batch writes the rows its plan asked for, column for column", async () => {
+  const { client, project, scope } = await fixture();
+  const tree = [sectionedFile(0, 3), sectionedFile(1, 1), { path: "docs/empty.md", content: "" }];
+  const { plan } = await plannedBatch(tree, scope.id, project.id);
+  const materialise = await import(materialisePath);
+  const { prisma } = await import("../src/db/index.js");
+  const { EMBEDDING_DIMENSIONS } = await import(receiptPath);
+  const stagedAt = new Date();
+
+  const staged = await prisma.$transaction(async (tx: any) =>
+    materialise.stageBatch(tx, {
+      scopeId: scope.id,
+      projectId: project.id,
+      orgId: "default",
+      generationId: randomUUID(),
+      stageId: randomUUID(),
+      stagedAt,
+      paths: plan.pending,
+    }),
+  );
+
+  // The documents: one per path, keyed by the digest the fence compares, invisible until promotion.
+  const documents = (await client.$queryRawUnsafe(
+    `SELECT id, "externalId", title, path, "contentHash", content, tokens, status, metadata, "deletedAt", "sourceId", "projectId"
+       FROM "documents" WHERE "projectId" = $1 ORDER BY "externalId"`,
+    project.id,
+  )) as any[];
+  assert.deepEqual(documents.map((row) => row.externalId).sort(), tree.map((file) => file.path).sort(), "one document per path");
+  for (const entry of plan.pending) {
+    const document = documents.find((row) => row.externalId === entry.path);
+    const digest = createHash("sha256").update(entry.content, "utf8").digest("hex");
+    assert.ok(document, `the document of ${entry.path} was written`);
+    assert.equal(document.id.length, 36, "the document id is a generated uuid");
+    assert.equal(document.title, entry.path, `the title of ${entry.path} is its path`);
+    assert.equal(document.path, entry.path, `the stored path of ${entry.path}`);
+    assert.equal(document.contentHash, digest, `the digest of ${entry.path}`);
+    assert.equal(document.content, entry.content, `the content of ${entry.path}`);
+    assert.equal(document.tokens, Math.ceil(entry.content.length / 4), `the token estimate of ${entry.path}`);
+    assert.equal(document.status, "PENDING", `a staged document of ${entry.path} is not indexed yet`);
+    assert.equal(document.deletedAt?.getTime(), stagedAt.getTime(), `a staged document of ${entry.path} carries the stage time in deletedAt`);
+    assert.equal(document.sourceId, staged.sourceId, `the document of ${entry.path} belongs to the scope's source`);
+    assert.equal(document.projectId, project.id, `the document of ${entry.path} belongs to the project`);
+    assert.deepEqual(
+      { repo_path: document.metadata.repo_path, repo_digest: document.metadata.repo_digest, repo_scope_id: document.metadata.repo_scope_id },
+      { repo_path: entry.path, repo_digest: digest, repo_scope_id: scope.id },
+      `the document metadata of ${entry.path} names its path, digest and scope`,
+    );
+    assert.ok(document.metadata.repo_index_generation_id, `the staged generation of ${entry.path} is recorded`);
+    assert.ok(document.metadata.repo_index_stage_id, `the stage of ${entry.path} is recorded`);
+  }
+
+  // The chunks: every column the single statement writes, against the prepared chunk it came from.
+  const chunks = (await client.$queryRawUnsafe(
+    `SELECT d."externalId" AS path, c."documentId", c."projectId", c.content, c."chunkType", c."chunkIndex",
+            c.metadata, c.tokens, c."searchContent", c."contentHash", c."sectionPath", c."headingPath",
+            c.embedding::text AS embedding, c."createdAt", c."updatedAt"
+       FROM "chunks" c JOIN "documents" d ON d.id = c."documentId"
+      WHERE c."projectId" = $1 ORDER BY d."externalId", c."chunkIndex"`,
+    project.id,
+  )) as any[];
+  const prepared = plan.pending.flatMap((entry) => entry.chunks.map((chunk) => ({ path: entry.path, digest: entry.digest, ...chunk })));
+  prepared.sort((left, right) => (left.path === right.path ? left.chunk.chunkIndex - right.chunk.chunkIndex : left.path < right.path ? -1 : 1));
+  assert.equal(chunks.length, prepared.length, `every prepared chunk is a row: ${prepared.length}`);
+  assert.equal(chunks.length, 4, `the fixture plan holds four chunks: ${chunks.length}`);
+
+  for (const [index, row] of chunks.entries()) {
+    const expected = prepared[index];
+    const content = expected.chunk.content;
+    assert.equal(row.path, expected.path, `row ${index} belongs to ${expected.path}`);
+    assert.equal(row.content, content, `row ${index} holds its chunk text`);
+    assert.equal(row.chunkType, expected.chunk.chunkType, `row ${index} holds its chunk type`);
+    assert.equal(row.chunkIndex, expected.chunk.chunkIndex, `row ${index} holds its chunk index`);
+    assert.equal(row.projectId, project.id, `row ${index} belongs to the project`);
+    assert.equal(row.documentId.length, 36, `row ${index} is linked to a generated document id`);
+    assert.equal(row.tokens, Math.ceil(content.length / 4), `row ${index} holds its token estimate`);
+    assert.equal(row.contentHash, createHash("sha256").update(content, "utf8").digest("hex"), `row ${index} holds its content hash`);
+    assert.equal(
+      row.searchContent,
+      [expected.path, expected.chunk.headingPath, expected.chunk.sectionPath, content].filter(Boolean).join("\n").slice(0, 20_000),
+      `row ${index} holds the text a keyword search matches, path first`,
+    );
+    assert.equal(row.sectionPath ?? null, expected.chunk.sectionPath ?? null, `row ${index} holds its section path`);
+    assert.equal(row.headingPath ?? null, expected.chunk.headingPath ?? null, `row ${index} holds its heading path`);
+    assert.equal(row.metadata.repo_path, expected.path, `row ${index} metadata names its path`);
+    assert.equal(row.metadata.repo_digest, expected.digest, `row ${index} metadata names its digest`);
+    assert.equal(row.metadata.repo_scope_id, scope.id, `row ${index} metadata names its scope`);
+    assert.equal(row.metadata.parser, expected.chunk.metadata.parser, `row ${index} keeps the chunker's metadata`);
+    assert.equal(row.metadata.block_type, expected.chunk.metadata.block_type, `row ${index} keeps the chunker's block type`);
+    assert.ok(row.createdAt instanceof Date && row.updatedAt instanceof Date, `row ${index} is stamped`);
+
+    // The vector: the one the embedder returned, once the column's float4 has rounded it.
+    const stored = String(row.embedding).replace(/^\[|\]$/g, "").split(",").map(Number);
+    assert.equal(stored.length, EMBEDDING_DIMENSIONS, `row ${index} is stored at the fence's width`);
+    const drift = stored.reduce((worst, value, position) => Math.max(worst, Math.abs(value - expected.vector[position])), 0);
+    assert.ok(drift < 1e-6, `row ${index} stores the embedder's vector: worst element drift ${drift}`);
+  }
 });
 
 after(async () => {

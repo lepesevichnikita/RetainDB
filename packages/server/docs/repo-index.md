@@ -8,8 +8,8 @@ client that produces the metadata is documented separately in
 Unreleased, and not verified end to end. The migration has been applied to a real PostgreSQL 16
 with pgvector 0.8.7 (75 tables, including all five `repo_index_*` tables), and the DB-gated tests
 now execute against a database instead of skipping: with `RETAINDB_TEST_DATABASE_URL` pointing at
-that database and `RETAINDB_TEST_LOCAL_EMBEDDINGS=true`, the full server suite reports 272 tests,
-272 pass, 0 fail, 0 skipped. Both variables are needed: without the second, the embedding-backed
+that database and `RETAINDB_TEST_LOCAL_EMBEDDINGS=true`, the full server suite reports 310 tests,
+310 pass, 0 fail, 0 skipped. Both variables are needed: without the second, the embedding-backed
 cases skip, and a skipped case is not a passing one. Read
 [Operational status](#operational-status) before relying on any of it.
 
@@ -363,9 +363,11 @@ same transaction that seals the generation.
   with at least one non-zero element (`isUsableVector`); an empty, all-zero or sparse vector is
   `EMBEDDING_UNAVAILABLE`. `searchContent` is the path, heading path, section path and chunk text,
   capped at 20,000 characters, so a keyword search can match the file a hit came from.
-- **The chunk cap is 2000 per generation** (`MATERIALISE_LIMITS.maxChunksPerGeneration`). It is
-  checked per file while chunking, so an over-sized tree stops before the first embedding request
-  and refuses with `CHUNK_LIMIT` carrying the path.
+- **The chunk cap is 2000 per generation by default**
+  (`MATERIALISE_LIMITS.maxChunksPerGeneration`), and
+  `RETAINDB_REPO_INDEX_MAX_CHUNKS_PER_GENERATION` raises it for a larger repository (see
+  [Configuration](#configuration)). It is checked per file while chunking, so an over-sized tree
+  stops before the first embedding request and refuses with `CHUNK_LIMIT` carrying the path.
 - **An unchanged digest causes zero re-embeddings.** A path whose previous `documents` row has the
   same digest and at least one chunk is reused: its existing first chunk is named on the new path
   row and nothing is read, chunked or embedded. A path with a changed digest has its chunks
@@ -461,7 +463,26 @@ adapter into a route or a run, so the connector has not read a real forge.
 | --- | --- | --- |
 | `RETAINDB_API_KEY` | to enrol | `authMiddleware` verifies it as `Authorization: Bearer <key>`. Unset means `authType: "open"`, and every admin route then answers `403 ADMIN_REQUIRED`. Read paths keep working without it; enrolment and grant minting do not. |
 | `REPO_INDEX_CURSOR_SECRET` | in production | signs and verifies manifest cursors (HMAC-SHA256). |
+| `RETAINDB_REPO_INDEX_MAX_CHUNKS_PER_GENERATION` | no | searchable chunks one generation may materialise, checked per publication. Default `2000`; a whole number from 1 to 200000. Any other value refuses the publication when the ceiling is read. |
 | `RETAINDB_REPO_STATE_DIR` | no | client-side state directory, default `$HOME/.local/state/retaindb-repo` (`packages/repo-sync/README.md`). |
+
+`RETAINDB_REPO_INDEX_MAX_CHUNKS_PER_GENERATION` is how a repository larger than the default
+ceiling gets indexed. Unset or empty it answers `MATERIALISE_LIMITS.maxChunksPerGeneration`, which
+is `2000`, so a deployment that never sets it runs the ceiling it always ran. It is read once per
+materialisation, when a generation is chunked (`maxChunksPerGeneration()` in `materialise.ts`), and
+that call is the only source of the number: `prepareMaterialisation` takes it as its default, so no
+second copy decides it. A value that cannot be a ceiling is refused instead of clamped - `0`, `-1`,
+`1.5`, `abc`, or anything above `MATERIALISE_LIMITS.largestConfiguredChunks` (`200000`) - and the
+refusal names the variable and what it received:
+
+```
+RETAINDB_REPO_INDEX_MAX_CHUNKS_PER_GENERATION=1.5 is not a chunk ceiling: set a whole number of chunks between 1 and 200000, or leave it unset for the default of 2000
+```
+
+The throw happens inside the publish transaction, so the publication rolls back: the scope keeps the
+generation it served, the attempt stays open, and finalizing again with a valid value publishes.
+Because the refusal is the process's configuration and not the tree, a committed-ref run reports it
+as `STORE_FAILED` carrying that message rather than as `MATERIALISE_REFUSED`.
 
 `EMBEDDING_MODE=gemini` is refused when the process loads. `ingest.ts` keeps gemini in
 `MODES_BELOW_STORAGE_WIDTH` (line 21) and calls `refuseUnstorableEmbeddingMode` at module scope

@@ -137,13 +137,50 @@ export class MaterialiseError extends Error {
 }
 
 /**
- * Documented ceiling on the chunks one generation may materialise. It bounds the embedding work the
+ * The variable that configures the ceiling a generation is measured against. Unset (or empty)
+ * means `MATERIALISE_LIMITS.maxChunksPerGeneration`, so an existing deployment keeps the ceiling
+ * it ran with; a repository larger than the default raises it instead of being refused.
+ */
+export const MATERIALISE_MAX_CHUNKS_ENV = "RETAINDB_REPO_INDEX_MAX_CHUNKS_PER_GENERATION";
+
+/**
+ * The ceiling on the chunks one generation may materialise. It bounds the embedding work the
  * publish transaction performs, so an over-sized tree is refused instead of holding the transaction
  * (and the generation's row lock) open until it times out.
+ *
+ * `maxChunksPerGeneration` is the default an unconfigured process runs with;
+ * `largestConfiguredChunks` is the most the variable may name, because a ceiling above it is a typo
+ * rather than a repository - it is the same bound the index-bundle API puts on a chunk count. Both
+ * are read by `maxChunksPerGeneration()`, so the default and its bound cannot drift from the
+ * decision they describe.
  */
 export const MATERIALISE_LIMITS = {
   maxChunksPerGeneration: 2000,
+  largestConfiguredChunks: 200_000,
 } as const;
+
+/**
+ * The ceiling in force for one materialisation: `MATERIALISE_MAX_CHUNKS_ENV` when it names a
+ * whole number of chunks, the documented default when it is unset or empty.
+ *
+ * A value that cannot be a ceiling is refused here rather than clamped, and the refusal names the
+ * variable and what it received: a clamped value would silently publish a tree an operator
+ * believed they had allowed, or refuse one they had raised the ceiling for.
+ */
+export function maxChunksPerGeneration(): number {
+  const received = process.env[MATERIALISE_MAX_CHUNKS_ENV];
+  if (received === undefined || received.trim() === "") return MATERIALISE_LIMITS.maxChunksPerGeneration;
+  const ceiling = Number(received);
+  const accepted = Number.isInteger(ceiling) && ceiling >= 1 && ceiling <= MATERIALISE_LIMITS.largestConfiguredChunks;
+  if (!accepted) {
+    throw new Error(
+      `${MATERIALISE_MAX_CHUNKS_ENV}=${received} is not a chunk ceiling: set a whole number of chunks ` +
+        `between 1 and ${MATERIALISE_LIMITS.largestConfiguredChunks}, or leave it unset for the default of ` +
+        `${MATERIALISE_LIMITS.maxChunksPerGeneration}`,
+    );
+  }
+  return ceiling;
+}
 
 /** The source `type` that marks a source as this scope's mirror, never an ingested document set. */
 export const REPO_INDEX_SOURCE_TYPE = "repo_index";
@@ -191,7 +228,7 @@ export function partitionByDigest(
  */
 export async function prepareMaterialisation(input: PrepareInput): Promise<PreparedMaterialisation> {
   const { reuse, pending } = partitionByDigest(input.paths, input.previous);
-  const prepared = await chunkPaths(pending, input.readContent, input.maxChunks ?? MATERIALISE_LIMITS.maxChunksPerGeneration);
+  const prepared = await chunkPaths(pending, input.readContent, input.maxChunks ?? maxChunksPerGeneration());
   await embedChunks(prepared, input.embed ?? embedDocuments);
   return { reuse, pending: prepared };
 }

@@ -418,13 +418,33 @@ export async function searchMemories(
   return results;
 }
 
-function toMemorySearchResult(memory: any): MemorySearchResult {
+type SearchMemory = Omit<MemorySearchResult["memory"], "temporal" | "metadata"> &
+  MemorySearchResult["memory"]["temporal"] & {
+    metadata?: unknown;
+    similarity: number;
+    sourceChunkId?: string | null;
+    isRelated?: boolean;
+  };
+
+function copyMetadata(metadata: unknown): Record<string, unknown> {
+  return metadata && typeof metadata === "object" && !Array.isArray(metadata)
+    ? { ...metadata }
+    : {};
+}
+
+function isMemoryScopeTarget(scope: string | undefined): scope is MemoryScopeTarget {
+  return scope === "USER" || scope === "SESSION" || scope === "PROJECT" || scope === "AGENT"
+    || scope === "TASK" || scope === "DOCUMENT" || scope === "DROPPED";
+}
+
+export function toMemorySearchResult(memory: SearchMemory): MemorySearchResult {
   return {
     memory: {
       id: memory.id, content: memory.content, memoryType: memory.memoryType,
       entityMentions: memory.entityMentions || [], confidence: memory.confidence, version: memory.version,
-      scope: memory.scope, scopeTarget: memory.scope, userId: memory.userId ?? null,
-      sessionId: memory.sessionId ?? null, agentId: memory.agentId ?? null, taskId: memory.taskId ?? null,
+      scope: memory.scope, scopeTarget: memory.scopeTarget ?? (isMemoryScopeTarget(memory.scope) ? memory.scope : undefined),
+      userId: memory.userId ?? null, sessionId: memory.sessionId ?? null, agentId: memory.agentId ?? null, taskId: memory.taskId ?? null,
+      metadata: copyMetadata(memory.metadata),
       temporal: { documentDate: memory.documentDate, eventDate: memory.eventDate, validFrom: memory.validFrom, validUntil: memory.validUntil },
     },
     similarity: memory.similarity,
@@ -502,7 +522,9 @@ async function vectorSearchMemories(params: {
   const embeddingLiteral = Prisma.raw(`'[${embedding.join(",")}]'::vector`);
   const limitLiteral = Prisma.raw(String(Math.min(Math.max(1, Math.floor(limit)), 1000)));
 
-  const results = await db.$queryRaw(Prisma.sql`
+  const [, results] = await db.$transaction([
+    db.$executeRaw`SET LOCAL hnsw.iterative_scan = strict_order`,
+    db.$queryRaw(Prisma.sql`
     SELECT
       id,
       content,
@@ -511,6 +533,7 @@ async function vectorSearchMemories(params: {
       confidence,
       version,
       scope,
+      scope as "scopeTarget",
       "userId" as "userId",
       "sessionId" as "sessionId",
       "agentId" as "agentId",
@@ -528,7 +551,8 @@ async function vectorSearchMemories(params: {
     WHERE ${whereClause}
     ORDER BY embedding <=> ${embeddingLiteral}
     LIMIT ${limitLiteral}
-  `);
+    `),
+  ]);
 
   return (results as any[]).map((r) => ({
     ...r,
@@ -670,37 +694,15 @@ async function enrichWithRelations(
  * Provides full context for LLM
  */
 async function injectSourceChunks(
-  memories: any[]
+  memories: SearchMemory[]
 ): Promise<MemorySearchResult[]> {
   const chunkIds = memories
     .map((m) => m.sourceChunkId)
-    .filter((id): id is string => id !== null);
+    .filter((id): id is string => typeof id === "string");
 
   if (chunkIds.length === 0) {
     // Return memories without chunks
-    return memories.map((m) => ({
-      memory: {
-        id: m.id,
-        content: m.content,
-        memoryType: m.memoryType,
-        entityMentions: m.entityMentions || [],
-        confidence: m.confidence,
-        version: m.version,
-        scope: m.scope,
-        scopeTarget: m.scope,
-        userId: m.userId ?? null,
-        sessionId: m.sessionId ?? null,
-        agentId: m.agentId ?? null,
-        taskId: m.taskId ?? null,
-        temporal: {
-          documentDate: m.documentDate,
-          eventDate: m.eventDate,
-          validFrom: m.validFrom,
-          validUntil: m.validUntil,
-        },
-      },
-      similarity: m.similarity,
-    }));
+    return memories.map(toMemorySearchResult);
   }
 
   // Fetch chunks
@@ -719,35 +721,15 @@ async function injectSourceChunks(
 
   // Map memories to results with chunks
   return memories.map((m) => ({
-    memory: {
-      id: m.id,
-      content: m.content,
-      memoryType: m.memoryType,
-      entityMentions: m.entityMentions || [],
-      confidence: m.confidence,
-      version: m.version,
-      scope: m.scope,
-      scopeTarget: m.scope,
-      userId: m.userId ?? null,
-      sessionId: m.sessionId ?? null,
-      agentId: m.agentId ?? null,
-      taskId: m.taskId ?? null,
-      temporal: {
-        documentDate: m.documentDate,
-        eventDate: m.eventDate,
-        validFrom: m.validFrom,
-        validUntil: m.validUntil,
-      },
-    },
+    ...toMemorySearchResult(m),
     chunk: m.sourceChunkId && chunkMap.has(m.sourceChunkId)
       ? {
           id: chunkMap.get(m.sourceChunkId)!.id,
           content: chunkMap.get(m.sourceChunkId)!.content,
-          metadata: (chunkMap.get(m.sourceChunkId)!.metadata ?? {}) as Record<string, any>,
+          metadata: copyMetadata(chunkMap.get(m.sourceChunkId)!.metadata),
         }
       : undefined,
-    similarity: m.similarity,
-    relations: m.isRelated ? ([] as MemorySearchResult["relations"]) : undefined,
+    relations: m.isRelated ? [] : undefined,
   }));
 }
 

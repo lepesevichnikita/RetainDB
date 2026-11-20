@@ -204,6 +204,8 @@ model Chunk {
   embeddings    Embedding[]
   chunkMemories ChunkMemory[]
   memories      Memory[]      @relation("MemorySourceChunk")
+  entityMentions EntityMention[]
+  entityRelationMentions EntityRelationMention[]
 
   @@index([documentId])
   @@index([contentHash])
@@ -330,6 +332,7 @@ model Entity {
   description String?
   aliases    String[]               @default([])
   embedding  Unsupported("vector")?
+  isManual   Boolean                @default(true)
   metadata   Json                   @default("{}")
   createdAt  DateTime               @default(now())
   updatedAt  DateTime               @updatedAt
@@ -338,6 +341,7 @@ model Entity {
   project          Project?         @relation(fields: [projectId], references: [id], onDelete: Cascade)
   outgoingRelations EntityRelation[] @relation("EntityFrom")
   incomingRelations EntityRelation[] @relation("EntityTo")
+  mentions EntityMention[]
 
   @@unique([projectId, name, entityType])
   @@index([projectId])
@@ -353,15 +357,41 @@ model EntityRelation {
   relationType String
   weight       Float    @default(1.0)
   metadata     Json     @default("{}")
+  isManual     Boolean  @default(true)
   createdAt    DateTime @default(now())
 
   project    Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
   fromEntity Entity   @relation("EntityFrom", fields: [fromEntityId], references: [id], onDelete: Cascade)
   toEntity   Entity   @relation("EntityTo", fields: [toEntityId], references: [id], onDelete: Cascade)
+  mentions   EntityRelationMention[]
 
   @@unique([fromEntityId, toEntityId, relationType])
   @@index([projectId])
   @@map("entity_relations")
+}
+
+model EntityMention {
+  entityId    String
+  chunkId     String
+  description String?
+  embedding   Unsupported("vector")?
+  entity      Entity @relation(fields: [entityId], references: [id], onDelete: Cascade)
+  chunk       Chunk  @relation(fields: [chunkId], references: [id], onDelete: Cascade)
+
+  @@id([entityId, chunkId])
+  @@index([chunkId])
+  @@map("entity_mentions")
+}
+
+model EntityRelationMention {
+  relationId String
+  chunkId    String
+  relation   EntityRelation @relation(fields: [relationId], references: [id], onDelete: Cascade)
+  chunk      Chunk          @relation(fields: [chunkId], references: [id], onDelete: Cascade)
+
+  @@id([relationId, chunkId])
+  @@index([chunkId])
+  @@map("entity_relation_mentions")
 }
 
 // ── Sessions & Messages ───────────────────────────────────────────────────────
@@ -721,4 +751,154 @@ model WebhookDelivery {
 
   @@index([webhookId])
   @@map("webhook_deliveries")
+}
+
+model Package {
+  id            String    @id @default(uuid())
+  orgId         String    @default("default")
+  projectId     String?
+  ecosystem     String
+  name          String
+  version       String    @default("")
+  registryUrl   String?
+  autoSync      Boolean   @default(false)
+  lastIndexedAt DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@unique([orgId, ecosystem, name])
+  @@index([orgId])
+  @@map("packages")
+}
+
+// ── Repository Indexing ───────────────────────────────────────────────────────
+// Additive only. These tables keep repo-indexed source separate from the legacy
+// memory, search, export, source and job surfaces, so repository content cannot
+// leak through them. projectId is a plain column, not a relation, so this
+// migration does not widen the existing Project model or its client surface.
+
+model RepoIndexScope {
+  id              String    @id @default(uuid())
+  orgId           String    @default("default")
+  projectId       String
+  // Forge identity: provider host plus the provider's own repository id, never a
+  // display name, so a renamed repository keeps one identity.
+  repoHost        String
+  repoExternalId  String
+  worktreePath    String
+  deviceId        String
+  ref             String
+  headCommit      String
+  state           String    @default("active") // active | paused | withdrawn
+  policyVersion   String
+  pipelineVersion String
+  activeGeneration Int      @default(0)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  grants      RepoIndexGrant[]
+  generations RepoIndexGeneration[]
+  paths       RepoIndexPath[]
+
+  // Scope identity is normalised by the admin request schema before it reaches this key:
+  // repoHost is lowercased and worktreePath has its trailing separators stripped.
+  @@unique([orgId, repoHost, repoExternalId, worktreePath])
+  @@index([projectId])
+  @@index([state])
+  @@map("repo_index_scopes")
+}
+
+model RepoIndexGrant {
+  id        String    @id @default(uuid())
+  scopeId   String
+  // reader | uploader | connector | admin. Separate capabilities so an uploader
+  // can submit its own work but cannot publish or read another cohort.
+  kind      String
+  principal String
+  tokenHash String
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  scope RepoIndexScope @relation(fields: [scopeId], references: [id], onDelete: Cascade)
+
+  // A grant row is a credential, and revocation is its history. The partial unique index
+  // `repo_index_grants_live_principal_key` in the migration allows one live grant per
+  // (scopeId, kind, principal) and any number of revoked ones. Prisma cannot express a partial
+  // index; adding revokedAt to a plain @@unique would let two live rows coexist, because
+  // Postgres treats NULLs as distinct.
+  @@index([scopeId, revokedAt])
+  @@map("repo_index_grants")
+}
+
+model RepoIndexGeneration {
+  id             String    @id @default(uuid())
+  scopeId        String
+  attemptId      String
+  // Compare-and-swap fence: promotion is allowed only while baseGeneration still
+  // equals the scope's activeGeneration, so an older writer cannot overwrite a
+  // newer revision.
+  baseGeneration Int
+  generation     Int
+  revision       String
+  manifestDigest String
+  partCount      Int
+  // open | sealed | published | abandoned | failed
+  status         String    @default("open")
+  sealedAt       DateTime?
+  publishedAt    DateTime?
+  receiptDigest  String?
+  failureCode    String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  scope RepoIndexScope  @relation(fields: [scopeId], references: [id], onDelete: Cascade)
+  parts RepoIndexPart[]
+
+  @@unique([scopeId, attemptId])
+  @@unique([scopeId, generation])
+  @@index([scopeId, status])
+  @@map("repo_index_generations")
+}
+
+model RepoIndexPart {
+  id             String    @id @default(uuid())
+  generationId   String
+  partNo         Int
+  // Stored next to the outcome so the same scoped operation and canonical hash
+  // replay the same result, while a changed payload is a conflict rather than a
+  // silent overwrite.
+  requestHash    String
+  upsertCount    Int       @default(0)
+  tombstoneCount Int       @default(0)
+  // The deletions this part declares, by path. Persisted rather than counted, so the
+  // publication guard can require every path a manifest drops to have been declared.
+  tombstonePaths String[]  @default([])
+  status         String    @default("accepted")
+  receivedAt     DateTime  @default(now())
+
+  generation RepoIndexGeneration @relation(fields: [generationId], references: [id], onDelete: Cascade)
+
+  @@unique([generationId, partNo])
+  @@map("repo_index_parts")
+}
+
+model RepoIndexPath {
+  id           String   @id @default(uuid())
+  scopeId      String
+  generationId String
+  path         String
+  digest       String
+  lineStart    Int?
+  lineEnd      Int?
+  // present | tombstone
+  state        String   @default("present")
+  chunkId      String?
+  updatedAt    DateTime @updatedAt
+
+  scope RepoIndexScope @relation(fields: [scopeId], references: [id], onDelete: Cascade)
+
+  @@unique([scopeId, path])
+  @@index([scopeId, state])
+  @@index([generationId])
+  @@map("repo_index_paths")
 }

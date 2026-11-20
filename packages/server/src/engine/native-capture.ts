@@ -73,11 +73,21 @@ export function redactCapture(value: unknown): unknown {
   const sanitized = sanitize(value);
   const ordered = [...secrets].sort((a, b) => b.length - a.length);
   function scrub(entry: unknown): unknown {
-    if (typeof entry === "string") return ordered.reduce((text, secret) => {
-      if (secret.length >= 8) return text.split(secret).join("[REDACTED]");
-      const escaped = secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      return text.replace(new RegExp(`(^|[^\\p{L}\\p{N}_-])${escaped}(?=$|[^\\p{L}\\p{N}_-])`, "gu"), "$1[REDACTED]");
-    }, entry);
+    if (typeof entry === "string") {
+      // A whole-value match is the only safe replacement for a one-character
+      // secret ("1", "f"): it has no information value and appears in ordinary
+      // prose, so replacing it inside a sentence corrupts the captured text.
+      if (ordered.includes(entry)) return "[REDACTED]";
+      return ordered.reduce((text, secret) => {
+        if (secret.length >= 8) return text.split(secret).join("[REDACTED]");
+        if (secret.length < 2) return text;
+        // Two to seven characters are replaced as complete tokens, never inside a
+        // word, so a short echo is removed without touching "fixture-project".
+        const escaped = secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        return text.replace(new RegExp(`(^|[^\\p{L}\\p{N}_-])${escaped}(?=$|[^\\p{L}\\p{N}_-])`, "gu"), "$1[REDACTED]");
+      }, entry);
+    }
+    if ((typeof entry === "number" || typeof entry === "boolean") && secrets.has(String(entry))) return "[REDACTED]";
     if (Array.isArray(entry)) return entry.map(scrub);
     if (entry && typeof entry === "object") return Object.fromEntries(Object.entries(entry).map(([key, item]) => [key, scrub(item)]));
     return entry;
@@ -88,6 +98,13 @@ export function redactCapture(value: unknown): unknown {
 function stableId(value: string): string {
   const hex = createHash("sha256").update(value).digest("hex");
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+
+const MAX_CAPTURE_ATTEMPTS = Number(process.env.NATIVE_CAPTURE_MAX_ATTEMPTS ?? 8);
+
+export function captureRetryPlan(attempts: number): { state: "pending" | "failed"; retryAfterSeconds: number | null } {
+  if (attempts >= MAX_CAPTURE_ATTEMPTS) return { state: "failed", retryAfterSeconds: null };
+  return { state: "pending", retryAfterSeconds: Math.min(300, 2 ** Math.min(8, attempts)) };
 }
 
 export interface NativeCaptureInput {
@@ -199,14 +216,19 @@ async function processNextCapture(): Promise<boolean> {
       `;
     } catch (error) {
       const errorText = String(redactCapture(error instanceof Error ? error.message : String(error))).slice(0, 1000);
-      const delaySeconds = Math.min(300, 2 ** Math.min(8, attempts));
+      const retry = captureRetryPlan(attempts);
       await tx.$executeRaw`
         UPDATE messages SET metadata = metadata || jsonb_build_object(
-          'native_capture_state', 'pending', 'last_error', ${errorText}::text,
-          'capture_attempts', ${attempts}::int, 'retry_at', NOW() + ${delaySeconds} * INTERVAL '1 second'
+          'native_capture_state', ${retry.state}::text, 'last_error', ${errorText}::text,
+          'capture_attempts', ${attempts}::int,
+          'retry_at', ${retry.retryAfterSeconds}::int * INTERVAL '1 second' + clock_timestamp()
         ) WHERE id = ${message.id}
       `;
-      console.error(`[NativeCapture] Event ${message.id} will retry: ${errorText}`);
+      if (retry.state === "failed") {
+        console.error(`[NativeCapture] Event ${message.id} failed permanently after ${attempts} attempts: ${errorText}`);
+      } else {
+        console.error(`[NativeCapture] Event ${message.id} will retry: ${errorText}`);
+      }
     }
     return true;
   }, { timeout: 180_000, maxWait: 5000 });

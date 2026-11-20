@@ -105,6 +105,10 @@ Keep `ENCRYPTION_KEY` stable across restarts so stored agent credentials remain 
 
 Local inference prefers the native CPU backend. If model construction falls back to WebAssembly, the Server uses a single WASM thread because Node cannot start the browser Blob workers used by the pinned ONNX runtime. This does not limit native CPU inference threads or switch embedding providers.
 
+Use pgvector 0.8 or later for filtered HNSW retrieval. Document and memory vector searches enable strict iterative scans inside their own transaction so project, source, type and metadata filters can continue past unrelated neighbors without changing pooled connection settings. Approximate search still has pgvector's scan limits. Compose supplies pgvector; an existing PostgreSQL installation must upgrade its extension separately.
+
+Database upgrades preserve existing organization IDs, ownership and slugs. If another organization already uses the `default` slug, the ownerless default organization receives an available `default-oss-N` slug instead. Previously deployed migration files remain unchanged.
+
 To verify the packaged Prisma client and migration CLI without network access or a running database:
 
 ```bash
@@ -133,6 +137,15 @@ Source-version allocation is serialized in PostgreSQL for each source, so
 first writes and staged syncs do not race to allocate the same version number.
 Retained version-number gaps are preserved rather than reused.
 
+Batch ingestion binds source versions before submitting queued work. A failed
+batch waits for its submitted tasks to settle before returning an error, so
+connector failure handling cannot race later writes from that batch. Documents
+remain `PROCESSING` during a rebuild and become `READY` after chunk persistence.
+A required embedding or persistence failure records `ERROR` with the failure
+message as `parseError`; a successful retry clears the previous `parseError`.
+An empty, wrong-width or missing embedding fails that document instead of
+publishing a searchable chunk the store cannot answer.
+
 ### Coding-agent hooks with PostgreSQL
 
 The Server accepts the native Local hooks at `POST /retaindb/observe` and
@@ -152,8 +165,10 @@ for keeping unrelated secrets out of captured tool output.
 
 Native capture embeddings run in a reusable child process with a bounded
 attempt deadline (120 seconds by default; `NATIVE_CAPTURE_EMBEDDING_TIMEOUT_MS`
-can lower it). A stalled process is terminated before its event is retried,
-so it cannot retain the queue or perform late database writes. Receipt and
+can lower it). A stalled process, failure reply or invalid vector reply causes
+termination, and the Server waits for the child to close before another attempt.
+Retry delays start when the failure is recorded, not when inference began.
+The child cannot retain the queue or perform late database writes. Receipt and
 document writes remain in the Server process under exclusive database row
 ownership, which is released immediately if that process exits.
 
@@ -164,7 +179,8 @@ work immediately after the first import without rebuilding an index.
 The Server also supports `POST /v1/context/pack`, `POST /v1/context/delta`
 and `POST /v1/context/compress-output` without a cloud model. Context packs
 combine indexed documents and memories within the requested project and
-token budget. An unchanged context hash returns an empty delta. Client `cwd`
+token budget. An unchanged context hash returns an empty delta, which CLI and
+plugin hooks preserve rather than replacing it with the previous full context. Client `cwd`
 and `files` paths are diagnosed, not read from the Server filesystem; ingest
 those files through the source APIs first.
 
@@ -432,6 +448,22 @@ If `RETAINDB_API_KEY` is set, protected deployments require `Authorization: Bear
 | `POST` | `/v1/sources/:id/sync` | Trigger source sync |
 | `GET` | `/v1/sources/:id` | Inspect source status |
 
+Server graph endpoints:
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/v1/entities` | Create or update a project entity and store its embedding in pgvector |
+| `POST` | `/v1/relations` | Create or update an edge between project entities |
+| `POST` | `/v1/graph/search` | Find up to `top_k` embedded seeds and follow up to 50 edges per hop in both directions, for 1–3 hops; traversal-only entities have score `0` |
+| `GET` | `/v1/memory/graph` | Return memory nodes, stored relationships, and chronological session edges |
+| `GET` | `/v1/memory/graph/conversation/:sessionId` | Read the same memory graph for one conversation |
+
+In `/v1/context/query`, `include_graph: true` adds chunks linked by the entity graph and preserves the matched entities and relationships in each result's `metadata.graph`, even if vector or lexical search found the same chunk. `graph_depth` accepts 1–3. Graph queries bypass the response cache and respect project, source, chunk-type, metadata, and active-version filters.
+
+Entity and edge IDs are stable within the project. Extraction records claims per source chunk, so staged, failed, superseded, and deleted content does not replace the active graph. Graph search, export, and entity counts use the same visibility rule. Manually written entities and edges remain independent of source versions; extraction does not replace their annotations.
+
+Entity extraction runs only on eligible documents ingested with automatic extraction enabled and a configured inference provider. Native hook capture skips it. The migration preserves existing graph rows and backfills explicit legacy entity-to-chunk links. Old automatic edges without recorded provenance stay hidden until extraction confirms them. The migration does not extract from existing documents, and importing vector embeddings alone does not create graph edges.
+
 Local-only runtime endpoints:
 
 | Method | Path | Description |
@@ -498,6 +530,14 @@ The self-hosted server can index external knowledge sources into agent context:
 | HuggingFace | Model cards |
 | Plain text | Inline content |
 
+## Repository index
+
+A self-hosted server can index a Git worktree into searchable chunks: a scope per worktree, a generation of path metadata published through a fence, and ordinary document chunks materialised from one pinned commit. It has its own credential surface (scope grants, one token per holder) separate from the deployment API key.
+
+Operator and developer documentation: [`packages/server/docs/repo-index.md`](packages/server/docs/repo-index.md).
+
+The feature is unreleased. Its migration has been applied to PostgreSQL 16 with pgvector 0.8.7 and the server suite runs against a real database rather than skipping it, but it is not verified end to end and nothing is deployed; the document's operational status section lists exactly what has and has not been executed.
+
 ## Configuration
 
 | Env var | Default | Description |
@@ -512,6 +552,7 @@ The self-hosted server can index external knowledge sources into agent context:
 | `OPENAI_API_KEY` | unset | Enables OpenAI-backed server embeddings |
 | `EMBEDDING_MODE` | `auto` | Server embedding mode |
 | `EXTRACTION_MODEL` | `gpt-4o-mini` | Server extraction model |
+| `DISABLE_AUTO_EXTRACTION` | `false` | Skip automatic entity extraction during document ingestion |
 | `PORT` | `3000` | Server HTTP port |
 | `DISABLE_SCHEDULER` | `false` | Disable server background sync |
 
@@ -549,6 +590,7 @@ Self-hosted notes:
 | `packages/sdk` | `@retaindb/sdk` | TypeScript SDK |
 | `packages/mcp` | `@retaindb/mcp` | MCP server |
 | `packages/server` | not published | Self-hostable API server |
+| `packages/repo-sync` | not published | Rust `retaindb-repo` client: hook hints and Git reconcile |
 
 ## Development
 
@@ -586,7 +628,15 @@ RETAINDB_TEST_DATABASE_URL="$DATABASE_URL" \
   DISABLE_AUTO_EXTRACTION=true pnpm --filter @retaindb/server test
 ```
 
-The integration tests create and remove their own project data and a temporary chunk constraint for failure injection. Use a dedicated test database, never a production memory store. Without `RETAINDB_TEST_DATABASE_URL`, these tests are reported as skipped. Vector ingestion/retrieval, bulk local embeddings and queued-document checks additionally require `RETAINDB_TEST_LOCAL_EMBEDDINGS=true` and download the BGE model on first use. Test processes isolate their database, embedding mode and credential environment before imports, then restore it during teardown. The Node 20/22 CI jobs apply all migrations, repeat deployment, and run this real-database suite. These checks cover the ownerless `default` organization without a fabricated user, retained tenant/project foreign keys, source versions, document vectors, queued document processing, persistence-failure reporting, connector job health, and API loading; they do not establish parity for every legacy table or optional agent/storage feature.
+The integration tests create and remove their own project data and a temporary chunk constraint for failure injection; some also create and drop their own temporary databases, so the test role needs permission to do that. Use a dedicated test database, never a production memory store. Without `RETAINDB_TEST_DATABASE_URL`, these tests are reported as skipped. Vector ingestion/retrieval, bulk local embeddings and queued-document checks additionally require `RETAINDB_TEST_LOCAL_EMBEDDINGS=true` and download the BGE model on first use. Test processes isolate their database, embedding mode and credential environment before imports, then restore it during teardown. The Node 20/22 CI jobs apply all migrations, repeat deployment, and run this real-database suite. These checks cover the ownerless `default` organization without a fabricated user, retained tenant/project foreign keys, source versions, document vectors, queued document processing, persistence-failure reporting, connector job health, and API loading; they do not establish parity for every legacy table or optional agent/storage feature.
+
+Client (`packages/repo-sync`, std-only Rust, no crates.io dependencies):
+
+```bash
+cargo fmt --manifest-path packages/repo-sync/Cargo.toml --check
+cargo clippy --manifest-path packages/repo-sync/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path packages/repo-sync/Cargo.toml
+```
 
 ## Contributing
 

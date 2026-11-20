@@ -45,13 +45,15 @@ function startWorker(): ChildProcess {
     const request = pending;
     if (!request || !message || typeof message !== "object" || !("id" in message) || message.id !== request.id || request.failure) return;
     if ("error" in message && typeof message.error === "string") {
-      rejectPending(new Error(message.error));
+      request.failure = new Error(message.error);
+      child.kill("SIGKILL");
       return;
     }
     const vectors = "vectors" in message ? message.vectors : null;
     if (!Array.isArray(vectors) || vectors.length !== request.expected || !vectors.every(row =>
       Array.isArray(row) && row.length > 0 && row.every(value => typeof value === "number" && Number.isFinite(value)))) {
-      rejectPending(new Error("Native embedding process returned invalid vectors"));
+      request.failure = new Error("Native embedding process returned invalid vectors");
+      child.kill("SIGKILL");
       return;
     }
     clearTimeout(request.timer);

@@ -27,7 +27,8 @@ import { extractMemories, extractMemoriesForSession, shouldExtractMemory } from 
 import { ingestionQueue, type IngestionMemory } from "../engine/ingestion-queue.js";
 import { classifyRetryableWriteFailure } from "../engine/memory/write-reliability.js";
 import { addPendingOverlayEntry, getPendingOverlayEntries } from "../engine/pending-overlay.js";
-import type { ExtractedMemory } from "../engine/memory/types.js";
+import type { ExtractedMemory, MemorySearchResult } from "../engine/memory/types.js";
+import { toMemorySearchResult } from "../engine/memory/search.js";
 import {
   calibrateConfidence,
   countConfirmEventsForTenant,
@@ -332,7 +333,7 @@ async function keywordSearchMemories(params: {
   namespace?: string;
   tags?: string[];
   topK?: number;
-}) {
+}): Promise<MemorySearchResult[]> {
   const {
     projectId,
     orgId,
@@ -421,9 +422,8 @@ async function keywordSearchMemories(params: {
   }
 
   return filteredMemories.map((m) => ({
-    memory: m,
+    ...toMemorySearchResult({ ...m, memoryType: normalizeMemoryType(m.memoryType), similarity: 0.55 }),
     chunk: undefined,
-    similarity: 0.55,
     relations: [],
   }));
 }
@@ -654,7 +654,7 @@ memoryRoutes.post(
       const includePending = body.include_pending !== false;
 
       let usedLexicalFallback = false;
-      let results: any[] = [];
+      let results: MemorySearchResult[] = [];
       let lexicalLatencyMs = 0;
       let pendingMergeMs = 0;
       let pendingOverlayCount = 0;
@@ -715,7 +715,7 @@ memoryRoutes.post(
           if (results.length === 0) {
             results = lexicalResults;
           } else if (lexicalResults.length > 0) {
-            const merged: any[] = [];
+            const merged: MemorySearchResult[] = [];
             const seen = new Set<string>();
             for (const item of [...results, ...lexicalResults]) {
               const id = String(item?.memory?.id || "").trim();
@@ -772,7 +772,7 @@ memoryRoutes.post(
 
         if (pendingEntries.length > 0) {
           const mergeStart = Date.now();
-          const pendingResults = pendingEntries.map((entry, idx) => ({
+          const pendingResults = pendingEntries.map<MemorySearchResult>((entry, idx) => ({
             memory: {
               id: `pending:${entry.job_id}:${idx}`,
               content: entry.content,
@@ -786,10 +786,13 @@ memoryRoutes.post(
               sessionId: body.session_id ?? null,
               agentId: body.agent_id ?? null,
               taskId: body.task_id ?? null,
-              documentDate: entry.created_at,
-              eventDate: entry.created_at,
-              validFrom: entry.created_at,
-              validUntil: entry.expires_at,
+              metadata: { semantic_status: "pending" },
+              temporal: {
+                documentDate: new Date(entry.created_at),
+                eventDate: new Date(entry.created_at),
+                validFrom: new Date(entry.created_at),
+                validUntil: new Date(entry.expires_at),
+              },
             },
             chunk: undefined,
             similarity: 1,
@@ -798,7 +801,7 @@ memoryRoutes.post(
             job_id: entry.job_id,
           }));
 
-          const merged: any[] = [];
+          const merged: MemorySearchResult[] = [];
           const seen = new Set<string>();
           for (const item of [...pendingResults, ...results]) {
             const memoryId = item?.memory?.id || "";
@@ -828,7 +831,7 @@ memoryRoutes.post(
       };
 
       // Format response
-      const formatDate = (d: any): string | null => {
+      const formatDate = (d: Date | string | null | undefined): string | null => {
         if (!d || d === null || d === undefined) return null;
         try {
           if (typeof d === 'string') {
@@ -859,10 +862,10 @@ memoryRoutes.post(
           semantic_status: semanticStatusFromMetadata(r.memory.metadata),
           version: r.memory.version,
           temporal: {
-            document_date: formatDate(r.memory.documentDate),
-            event_date: formatDate(r.memory.eventDate),
-            valid_from: formatDate(r.memory.validFrom),
-            valid_until: formatDate(r.memory.validUntil),
+            document_date: formatDate(r.memory.temporal?.documentDate),
+            event_date: formatDate(r.memory.temporal?.eventDate),
+            valid_from: formatDate(r.memory.temporal?.validFrom),
+            valid_until: formatDate(r.memory.temporal?.validUntil),
           },
         },
         chunk: body.include_chunks && r.chunk ? {
@@ -880,7 +883,7 @@ memoryRoutes.post(
         scope_counts: normalizeScopeCounts(
           formattedResults.reduce((acc, item) => {
             const scope = item.memory.scope_target;
-            if (scope && SCOPE_TARGET_VALUES.includes(scope)) {
+            if (scope && SCOPE_TARGET_VALUES.some((value) => value === scope)) {
               acc[scope] = (acc[scope] || 0) + 1;
             }
             return acc;
@@ -1799,6 +1802,8 @@ memoryRoutes.get(
   }
 );
 
+const memoryGraphLimit = z.string().regex(/^-?\d+$/).transform((value) => Math.min(Math.max(Number(value), 1), 1000));
+
 // Memory Graph - Node/edge graph for visualization and debugging
 memoryRoutes.get(
   "/v1/memory/graph",
@@ -1810,7 +1815,7 @@ memoryRoutes.get(
       user_id: z.string().optional(),
       session_id: z.string().optional(),
       include_inactive: z.string().optional(),
-      limit: z.string().optional(),
+      limit: memoryGraphLimit.default("300"),
     })
   ),
   async (c) => {
@@ -1821,7 +1826,6 @@ memoryRoutes.get(
       const project = await ensureProject(auth.orgId, query.project, auth.isAdmin);
 
       const includeInactive = query.include_inactive === "true";
-      const limit = Math.min(Math.max(parseInt(query.limit || "300", 10), 1), 1000);
 
       const memories = await prisma.memory.findMany({
         where: {
@@ -1831,7 +1835,7 @@ memoryRoutes.get(
           ...(includeInactive ? {} : { isActive: true }),
         },
         orderBy: { createdAt: "desc" },
-        take: limit,
+        take: query.limit,
         select: {
           id: true,
           content: true,
@@ -1861,15 +1865,8 @@ memoryRoutes.get(
       }
 
       const memoryIds = memories.map((m) => m.id);
-      const idSet = new Set(memoryIds);
-
-      const relationEdgesRaw = await prisma.memoryRelation.findMany({
-        where: {
-          OR: [
-            { fromMemoryId: { in: memoryIds } },
-            { toMemoryId: { in: memoryIds } },
-          ],
-        },
+      const relations = await prisma.memoryRelation.findMany({
+        where: { fromMemoryId: { in: memoryIds }, toMemoryId: { in: memoryIds } },
         select: {
           id: true,
           fromMemoryId: true,
@@ -1880,17 +1877,15 @@ memoryRoutes.get(
         },
       });
 
-      const relationEdges = relationEdgesRaw
-        .filter((r) => idSet.has(r.fromMemoryId) && idSet.has(r.toMemoryId))
-        .map((r) => ({
-          id: r.id,
-          source: r.fromMemoryId,
-          target: r.toMemoryId,
-          type: r.relationType,
-          confidence: r.confidence,
-          reasoning: r.reasoning,
-          layer: "relation",
-        }));
+      const relationEdges = relations.map((r) => ({
+        id: r.id,
+        source: r.fromMemoryId,
+        target: r.toMemoryId,
+        type: r.relationType,
+        confidence: r.confidence,
+        reasoning: r.reasoning,
+        layer: "relation",
+      }));
 
       // Build lightweight chronological "conversation flow" edges.
       const bySession = new Map<string, typeof memories>();
@@ -1973,7 +1968,7 @@ memoryRoutes.get(
     z.object({
       project: z.string().optional(),
       include_inactive: z.string().optional(),
-      limit: z.string().optional(),
+      limit: memoryGraphLimit.optional(),
     })
   ),
   async (c) => {
@@ -1985,7 +1980,7 @@ memoryRoutes.get(
     if (query.project) target.searchParams.set("project", query.project);
     target.searchParams.set("session_id", sessionId);
     if (query.include_inactive) target.searchParams.set("include_inactive", query.include_inactive);
-    if (query.limit) target.searchParams.set("limit", query.limit);
+    if (query.limit !== undefined) target.searchParams.set("limit", String(query.limit));
 
     return c.redirect(target.toString(), 307);
   }
@@ -2640,7 +2635,7 @@ memoryRoutes.post(
         userId: user_id,
         projectId: project,
         query: question,
-        reasoningLevel: reasoning_level as DialecticReasoningLevel,
+        reasoningLevel: reasoning_level,
       });
       return c.json({ success: true, ...result });
     } catch (err: any) {

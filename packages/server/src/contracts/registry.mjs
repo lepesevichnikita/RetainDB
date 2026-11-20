@@ -290,6 +290,7 @@ export const CONTRACT_REGISTRY = Object.freeze([
         chunk_types: "array?",
         include_memories: "boolean?",
         include_graph: "boolean?",
+        graph_depth: "number?",
         user_id: "string?",
         session_id: "string?",
         max_tokens: "number?",

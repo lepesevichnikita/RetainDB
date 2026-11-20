@@ -1,5 +1,6 @@
 import { createHash } from "crypto";
 import { prisma } from "../db/index.js";
+import { exportProjectGraph } from "./entity-graph.js";
 
 export type IndexBundleInclude = {
   sources: boolean;
@@ -233,7 +234,7 @@ export async function exportIndexBundle(params: {
       ...c,
       content:
         typeof c.content === "string"
-          ? (redactSecrets ? redactSecretsDeep(c.content) : c.content).slice(0, limits.maxChunkChars)
+          ? String(redactSecrets ? redactSecretsDeep(c.content) : c.content).slice(0, limits.maxChunkChars)
           : c.content,
     }));
   }
@@ -274,64 +275,40 @@ export async function exportIndexBundle(params: {
     }));
   }
 
+  const { entities, relations: entityRelations } = await exportProjectGraph(project.id, {
+    entities: include.entities ? limits.maxEntities + 1 : 0,
+    relations: include.relations ? limits.maxRelations + 1 : 0,
+  });
   if (include.entities) {
-    const entities = await prisma.entity.findMany({
-      where: { projectId: project.id },
-      orderBy: { createdAt: "asc" },
-      take: limits.maxEntities + 1,
-      select: {
-        id: true,
-        name: true,
-        entityType: true,
-        description: true,
-        metadata: true,
-        createdAt: true,
-      },
-    });
     truncated.entities = entities.length > limits.maxEntities;
     contents.entities = entities.slice(0, limits.maxEntities).map((e) => ({
       ...e,
+      description: redactSecrets ? redactSecretsDeep(e.description) : e.description,
       metadata: redactSecrets ? redactSecretsDeep(e.metadata) : e.metadata,
     }));
   }
 
   if (include.relations) {
-    const [entityRelations, memoryRelations] = await Promise.all([
-      prisma.entityRelation.findMany({
-        where: { projectId: project.id },
-        orderBy: { createdAt: "asc" },
-        take: limits.maxRelations + 1,
-        select: {
-          id: true,
-          fromEntityId: true,
-          toEntityId: true,
-          relationType: true,
-          weight: true,
-          metadata: true,
-          createdAt: true,
-        },
-      }),
-      prisma.memoryRelation.findMany({
-        where: {
-          OR: [
-            { fromMemory: { projectId: project.id } },
-            { toMemory: { projectId: project.id } },
-          ],
-        },
-        orderBy: { createdAt: "asc" },
-        take: limits.maxRelations + 1,
-        select: {
-          id: true,
-          fromMemoryId: true,
-          toMemoryId: true,
-          relationType: true,
-          confidence: true,
-          reasoning: true,
-          metadata: true,
-          createdAt: true,
-        },
-      }),
-    ]);
+    const memoryRelations = await prisma.memoryRelation.findMany({
+      where: {
+        OR: [
+          { fromMemory: { projectId: project.id } },
+          { toMemory: { projectId: project.id } },
+        ],
+      },
+      orderBy: { createdAt: "asc" },
+      take: limits.maxRelations + 1,
+      select: {
+        id: true,
+        fromMemoryId: true,
+        toMemoryId: true,
+        relationType: true,
+        confidence: true,
+        reasoning: true,
+        metadata: true,
+        createdAt: true,
+      },
+    });
 
     truncated.relations = entityRelations.length > limits.maxRelations || memoryRelations.length > limits.maxRelations;
     contents.relations = {

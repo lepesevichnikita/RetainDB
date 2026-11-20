@@ -39,6 +39,15 @@ function pathToRegex(path: string): RegExp {
   return new RegExp(`^${escaped}$`);
 }
 
+/**
+ * The repository-index admin surface mints durable credentials, so it is admin work even though
+ * its path is namespaced under /v1/repo-index/. authMode is deliberately not derived from this:
+ * this build never sets isAdmin, so classifying it admin_only would refuse every caller.
+ */
+function isRepoIndexAdmin(path: string): boolean {
+  return path.startsWith("/v1/repo-index/admin/");
+}
+
 function deriveAuthMode(path: string): RouteAuthMode {
   if (path === "/" || path === "/health" || path.startsWith("/v1/contracts/meta")) return "public";
   if (path.startsWith("/v1/wizard/auth/device/") || path === "/v1/wizard/events") return "public";
@@ -65,7 +74,7 @@ function deriveOrgRule(path: string): RouteOrgRule {
 }
 
 function deriveTelemetry(path: string): RouteTelemetryKind[] {
-  if (path.startsWith("/v1/admin/")) return ["request", "admin"];
+  if (path.startsWith("/v1/admin/") || isRepoIndexAdmin(path)) return ["request", "admin"];
   if (path.includes("/sync") || path.includes("/sources")) return ["request", "sync"];
   if (path === "/v1/learn") return ["request", "ingest"];
   if (path === "/v1/index") return ["request", "ingest"];
@@ -78,7 +87,7 @@ function deriveTelemetry(path: string): RouteTelemetryKind[] {
 }
 
 function deriveRateBucket(path: string): string {
-  if (path.startsWith("/v1/admin/")) return "admin";
+  if (path.startsWith("/v1/admin/") || isRepoIndexAdmin(path)) return "admin";
   if (path.includes("/sync")) return "sync";
   if (path === "/v1/learn") return "ingest";
   if (path === "/v1/index") return "ingest";
@@ -128,11 +137,13 @@ function buildControl(
     rateBucket: deriveRateBucket(path),
     auditRequired:
       authMode === "admin_only" ||
+      isRepoIndexAdmin(path) ||
       ["POST", "PUT", "PATCH", "DELETE"].includes(normalizeMethod(method)),
     idempotencyRequired: deriveIdempotency(method, path),
     telemetry: deriveTelemetry(path),
     securitySensitive:
       authMode === "admin_only" ||
+      isRepoIndexAdmin(path) ||
       path.includes("/keys") ||
       path.includes("/webhooks") ||
       path.includes("/restore") ||

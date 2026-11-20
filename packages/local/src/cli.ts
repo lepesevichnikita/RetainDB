@@ -2558,7 +2558,7 @@ async function runHook() {
       });
       if (res.ok) {
         const body = await res.json();
-        const text = body.delta_context || body.context;
+        const text = body.delta_context ?? body.context;
         if (text) process.stdout.write(`\nRetainDB compact context:\n${text}\n`);
       }
     } catch {}

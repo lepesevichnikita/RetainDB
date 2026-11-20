@@ -245,7 +245,10 @@ export async function searchMemories(
   const cacheScope = JSON.stringify({ orgId, projectId, userId, sessionId, agentId, taskId,
     scopes: applicableScopes, includeInactive, memoryTypes: effectiveMemoryTypes, namespace, tags,
     temporalFilter: params.temporalFilter, questionDate: questionDate.toISOString().slice(0, 10), topK, fastMode });
-  const cacheKey = `search:${projectId}:${userId || ""}:${cacheScope}:${query}`;
+  // The cache layer's key prefix is part of the key (cache.ts DEFAULT_CONFIG.keyPrefix, the same
+  // spelling engine/retriever.ts writes into its context key), so a publication or a memory write
+  // can drop every answer of one project by pattern: `search:<projectId>:` clears this family.
+  const cacheKey = `whisper:context:search:${projectId}:${userId || ""}:${cacheScope}:${query}`;
   const simpleCached = await getFromCache<MemorySearchResult[]>(cacheKey);
   timings.push({ step: "simple_cache", duration: Date.now() - step0Start });
   

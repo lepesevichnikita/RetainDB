@@ -16,6 +16,7 @@ import { prisma } from "../../db/index.js";
 // The canonical payload hash is shared with request idempotency: one canonicalisation,
 // one digest algorithm, so a part's stored hash and an HTTP replay hash never disagree.
 import { hashIdempotencyPayload } from "../../api/idempotency.js";
+import { clearCacheByPattern } from "../cache.js";
 import {
   PROMOTION_OUTCOME,
   isScopeReadable,
@@ -403,6 +404,36 @@ function partOutcome(row: PartRow): Omit<PutPartResult, "code" | "partNo"> {
 }
 
 /**
+ * The cached search answers of one project, cleared because what they describe changed.
+ *
+ * A search answer is cached per project with nothing in its key that names the generation or the
+ * content revision it was computed from (engine/retriever.ts keys context answers
+ * `query:<projectId>:<hash>`, engine/memory/search.ts keys memory answers
+ * `search:<projectId>:<user>:<scope>:<query>`). Both live under the cache layer's single
+ * `whisper:context:` key prefix, so one pattern per family drops every answer the project had.
+ *
+ * Clearing by project rather than by query is deliberate: the answers a publication invalidates
+ * are exactly the ones that ranked the tree it replaced, and their keys carry the query, not the
+ * rows. A generation in the key would leave every entry written before it live for its full TTL.
+ */
+export async function invalidateProjectAnswers(projectId: string): Promise<void> {
+  await Promise.all([clearCacheByPattern(`query:${projectId}:`), clearCacheByPattern(`search:${projectId}:`)]);
+}
+
+/**
+ * Fences the publication's caches after it commits. Read outside the transaction, because a clear
+ * that ran before the commit could be refilled by a concurrent search from the tree being replaced,
+ * and an answer cached then would outlive the commit by its full TTL.
+ */
+async function invalidatePublishedProject(scopeId: string, result: FinalizeResult): Promise<void> {
+  if (result.code !== STORE_CODE.PUBLISHED) return;
+  const scope = (await db.repoIndexScope.findUnique({ where: { id: scopeId }, select: { projectId: true } })) as
+    | { projectId: string }
+    | null;
+  if (scope) await invalidateProjectAnswers(scope.projectId);
+}
+
+/**
  * Publishes an attempt: every declared part must be present, then the fence decides in
  * one transaction that either writes the active generation, the path rows and the
  * receipt, or writes nothing but the attempt's failure code.
@@ -412,7 +443,9 @@ function partOutcome(row: PartRow): Omit<PutPartResult, "code" | "partNo"> {
  */
 export async function finalizeAttempt(input: FinalizeInput): Promise<FinalizeResult> {
   try {
-    return await prisma.$transaction((tx: Transaction) => publish(tx, input), TRANSACTION);
+    const result = await prisma.$transaction((tx: Transaction) => publish(tx, input), TRANSACTION);
+    await invalidatePublishedProject(input.scopeId, result);
+    return result;
   } catch (error) {
     // The seal found the attempt no longer open. Its transaction rolls back with the throw, so a
     // fenced attempt never leaves a bumped generation, new paths or a half-written receipt behind.

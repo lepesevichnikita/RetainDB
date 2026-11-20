@@ -48,6 +48,8 @@ import { zValidator } from "@hono/zod-validator";
 import { z } from "zod";
 import { prisma } from "../db/index.js";
 import { hashGrantToken, mintGrantToken } from "../engine/repo-index/grant-token.js";
+import { retireUnlistedPaths } from "../engine/repo-index/materialise.js";
+import { invalidateProjectAnswers } from "../engine/repo-index/store.js";
 import { resolveProjectReference } from "./helpers.js";
 // The grant kinds are declared once, by the router that accepts them; this surface only mints them.
 import { GRANT_KINDS } from "./repo-index.js";
@@ -294,6 +296,9 @@ repoIndexAdminRoutes.post(
     const grant = await findGrant(scope.id, pathParam(c, "grantId"));
     if (!grant) return answer(c, CODE.GRANT_NOT_FOUND);
     const result = await revokeGrant(scope.id, grant.id);
+    // A revocation changes who may act on this project, so the answers cached under the previous
+    // grant are answered again instead of being served to the caller that just lost it.
+    if (result.revoked) await invalidateProjectAnswers(scope.projectId);
     return answer(c, result.revoked ? CODE.GRANT_REVOKED : CODE.GRANT_ALREADY_REVOKED, {
       grant: serializeGrant(result.grant),
     });
@@ -317,7 +322,29 @@ repoIndexAdminRoutes.post("/v1/repo-index/admin/scopes/:scopeId/withdraw", requi
 async function stateAnswer(c: Context<{ Variables: Variables }>, action: ScopeAction, scopeId: string) {
   const result = await applyScopeTransition(db as ScopeStore, c.get("auth"), scopeId, action);
   if (!result.scope) return answer(c, result.code);
+  // Withdraw is terminal, so the tree this scope published is retired with it: a withdrawn scope
+  // serves nothing, and the answers cached while it was active must not outlive the state that
+  // produced them. Pause and resume leave the published tree in place, so neither retires anything.
+  // Withdraw is terminal. Its cached answers must not outlive the state that produced them, so the
+  // project's answers are dropped here. The published rows are deliberately NOT deleted: the search
+  // path does not yet filter a non-readable scope, so this keeps the content for audit until that
+  // filter exists or the owner decides rows should be destroyed on withdraw. Pause and resume leave
+  // the published tree in place, so neither clears anything.
+  if (result.scope.state === SCOPE_STATE.WITHDRAWN) await invalidateProjectAnswers(result.scope.projectId);
   return answer(c, result.code, { scope: serializeScope(result.scope) });
+}
+
+/**
+ * Retires what a withdrawn scope made searchable, then drops this project's cached answers.
+ *
+ * The rows are dropped through the same deletion half materialisation owns: an empty path list
+ * means the withdrawn tree keeps no document, and every chunk of it goes with the documents. The
+ * order matters - the content goes first, so a search that runs while the caches are being cleared
+ * reads a project that already holds none of it.
+ */
+async function retireScope(scope: ScopeRow): Promise<void> {
+  await retireUnlistedPaths(db, { scopeId: scope.id, projectId: scope.projectId, paths: [] });
+  await invalidateProjectAnswers(scope.projectId);
 }
 
 /**

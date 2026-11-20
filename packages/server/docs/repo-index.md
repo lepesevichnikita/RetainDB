@@ -383,6 +383,34 @@ content, an unusable vector, a tree above the ceiling) throws, and the seal, the
 and the path rows roll back together. No generation becomes visible while half its chunks are
 missing, and the generation it replaced stays current.
 
+### A cached answer does not outlive the change it describes
+
+Two caches answer a search for one project, and neither key names the generation or the content
+revision the answer was computed from: `engine/retriever.ts` keeps a context answer under
+`whisper:context:query:<projectId>:<hash(params)>` for 300 seconds, and `engine/memory/search.ts`
+keeps a memory answer under `whisper:context:search:<projectId>:<user>:<scope>:<query>` - an empty
+memory answer for 60 seconds.
+
+`invalidateProjectAnswers(projectId)` in `store.ts` clears every answer of one project by pattern
+(`query:<projectId>:` and `search:<projectId>:`). It runs after each transition that changes what
+that project should answer:
+
+- **A committed publication.** `finalizeAttempt` calls it after the transaction returns, never
+  inside it: a clear that ran before the commit could be refilled by a concurrent search from the
+  tree being replaced, and that answer would then outlive the commit by its full TTL. Adding,
+  replacing and dropping a path are one event here, so a dropped path is covered by the same clear.
+- **A withdrawal** (`POST /v1/repo-index/admin/scopes/:scopeId/withdraw`). The scope is terminal, so
+  what it made searchable is retired: `retireUnlistedPaths` with an empty path list deletes its
+  documents and their chunks, and then the project's answers are cleared. A withdrawn scope
+  therefore stops being visible to a search, cached or not. Pause and resume leave the tree alone
+  and retire nothing, because a paused scope can be resumed.
+- **A grant revocation** (`POST /v1/repo-index/admin/scopes/:scopeId/grants/:grantId/revoke`). The
+  tree is untouched - a credential is not content - so the recomputed answer still finds it, but
+  the answers cached under the previous grant are gone.
+
+`test/repo-index.search-cache.integration.test.ts` pins each direction through the real publish
+transaction and the real admin routes, in one process, against the cache the earlier search filled.
+
 ## The connector path
 
 `connector-run.ts` is the only place where the committed-ref reader and the store meet. It takes

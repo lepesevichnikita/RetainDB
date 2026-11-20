@@ -42,6 +42,8 @@ import { searchRoutes } from "./search.js";
 import { fileRoutes } from "./files.js";
 import { agentTaskRoutes } from "./agent-tasks.js";
 import { researchAgentRoutes } from "./research-agent.js";
+import { registerRepoIndexRoutes } from "./repo-index.js";
+import { registerRepoIndexAdminRoutes } from "./repo-index-admin.js";
 import { resolveProjectReference, ensureProject, getEffectiveOrgId } from "./helpers.js";
 import { getContractHeaders, getPublicContractMetadata } from "../contracts/runtime.mjs";
 import { getLatencySummary, getLatencyTraceConfig, getLatencyGateStatus, resetLatencySummary } from "../engine/latency-tracing.js";
@@ -216,6 +218,8 @@ api.route("/", searchRoutes);
 api.route("/", fileRoutes);
 api.route("/", agentTaskRoutes);
 api.route("/", researchAgentRoutes);
+registerRepoIndexRoutes(api);
+registerRepoIndexAdminRoutes(api);
 
 // ─── Helper ──────────────────────────────────────────────────
 

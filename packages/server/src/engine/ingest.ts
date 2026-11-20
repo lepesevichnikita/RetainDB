@@ -5,11 +5,42 @@ import { chunkText } from "./chunker.js";
 import { embed } from "./embeddings.js";
 import { extractEntities } from "./extractor.js";
 import type { IngestionProfile, ProfileConfig, StrategyOverride } from "./ingestion-profiles.js";
+// EMBEDDING_DIMENSIONS is the width of chunks.embedding (vector(1024)); a narrower vector cannot be stored.
+import { EMBEDDING_DIMENSIONS, isUsableVector } from "./repo-index/receipt.js";
 import { refreshSourceVersionCounts, resolveSourceVersionForWrite } from "./source-versions.js";
 
 const queue = new PQueue({ concurrency: 20 });
 const ENABLE_AUTO_EXTRACTION = process.env.DISABLE_AUTO_EXTRACTION !== "true";
 const EMBED_BATCH_SIZE = 500;
+
+/**
+ * The modes whose embedder answers a vector `chunks.embedding` cannot hold. gemini's
+ * text-embedding-004 answers 768 dimensions (engine/embeddings.ts), while the column is
+ * vector(EMBEDDING_DIMENSIONS); every other mode this process ships answers that stored width.
+ */
+const MODES_BELOW_STORAGE_WIDTH = new Set(["gemini"]);
+
+/**
+ * Refuses a configured embedder whose vectors this schema cannot store, once at load instead of once
+ * per document. The width check in embedSearchableChunks stays, because an injected embedder can
+ * answer a wrong width too; but a *configured* mode that cannot be stored must not reach it at all:
+ * a gemini process previously wrote the document row, marked it PROCESSING and then failed every
+ * batch against vector(1024), so each document became an ERROR row for a deployment-wide setting.
+ *
+ * Consequence for a gemini deployment: the process now refuses to start. That is the honest state of
+ * the mismatch - 768 dimensions cannot be written to vector(1024) at all - so using gemini needs a
+ * migration of chunks.embedding to the width gemini produces (and a re-index, because 768 differs
+ * from every stored vector), not a looser check here.
+ */
+function refuseUnstorableEmbeddingMode(mode: string | undefined): void {
+  if (!mode || !MODES_BELOW_STORAGE_WIDTH.has(mode)) return;
+  throw new Error(
+    `EMBEDDING_MODE=${mode} answers a vector narrower than chunks.embedding vector(${EMBEDDING_DIMENSIONS}): ` +
+      `migrate the column to the width ${mode} produces, or configure openai, local, hybrid or remote`,
+  );
+}
+
+refuseUnstorableEmbeddingMode(process.env.EMBEDDING_MODE);
 
 export interface IngestDocumentInput {
   sourceId: string;
@@ -33,7 +64,7 @@ export interface IngestDocumentInput {
 
 type EmbeddedChunk = {
   tempId: string;
-  vector?: number[];
+  vector: number[];
 };
 
 export async function ingestDocument(input: IngestDocumentInput) {
@@ -178,7 +209,12 @@ export async function ingestDocument(input: IngestDocumentInput) {
       const searchContent = buildSearchContent(title, chunk.headingPath, chunk.sectionPath, chunk.content);
       const contentHash = createHash("sha256").update(chunk.content).digest("hex");
       try {
-        if (vector && vector.length > 0) {
+        // Only a non-searchable chunk may be stored without a vector; anything else
+        // would be published as searchable while being invisible to semantic search.
+        if (chunk.searchable && !vector) {
+          throw new Error(`Searchable chunk ${chunk.tempId} reached storage without an embedding`);
+        }
+        if (vector) {
           await prisma.$executeRaw`
             INSERT INTO "chunks" (
               id, "documentId", "projectId", content, "chunkType", "chunkIndex", metadata,
@@ -280,12 +316,15 @@ async function embedSearchableChunks(chunks: ReturnType<typeof chunkText>["chunk
     const vectors = await embedTexts(batch.map((chunk) => chunk.content));
 
     for (let j = 0; j < batch.length; j++) {
-      if (!vectors[j]) {
-        throw new Error(`Missing embedding for chunk ${batch[j].tempId}`);
+      const vector = vectors[j];
+      if (!isUsableVector(vector, EMBEDDING_DIMENSIONS)) {
+        throw new Error(
+          `Invalid embedding for chunk ${batch[j].tempId}: expected ${EMBEDDING_DIMENSIONS} finite, non-zero dimensions`,
+        );
       }
       embedded.push({
         tempId: batch[j].tempId,
-        vector: vectors[j],
+        vector,
       });
     }
   }

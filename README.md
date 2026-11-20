@@ -517,6 +517,14 @@ The self-hosted server can index external knowledge sources into agent context:
 | HuggingFace | Model cards |
 | Plain text | Inline content |
 
+## Repository index
+
+A self-hosted server can index a Git worktree into searchable chunks: a scope per worktree, a generation of path metadata published through a fence, and ordinary document chunks materialised from one pinned commit. It has its own credential surface (scope grants, one token per holder) separate from the deployment API key.
+
+Operator and developer documentation: [`packages/server/docs/repo-index.md`](packages/server/docs/repo-index.md).
+
+The feature is unreleased. Its migration has been applied to PostgreSQL 16 with pgvector 0.8.7 and the server suite runs against a real database rather than skipping it, but it is not verified end to end and nothing is deployed; the document's operational status section lists exactly what has and has not been executed.
+
 ## Configuration
 
 | Env var | Default | Description |
@@ -569,6 +577,7 @@ Self-hosted notes:
 | `packages/sdk` | `@retaindb/sdk` | TypeScript SDK |
 | `packages/mcp` | `@retaindb/mcp` | MCP server |
 | `packages/server` | not published | Self-hostable API server |
+| `packages/repo-sync` | not published | Rust `retaindb-repo` client: hook hints and Git reconcile |
 
 ## Development
 
@@ -600,6 +609,14 @@ Unit tests run without a database. Integration tests run when
 pgvector and the migrations applied; they create and drop their own temporary
 databases, so the test role needs permission to do that. Never point them at a
 production memory store.
+
+Client (`packages/repo-sync`, std-only Rust, no crates.io dependencies):
+
+```bash
+cargo fmt --manifest-path packages/repo-sync/Cargo.toml --check
+cargo clippy --manifest-path packages/repo-sync/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path packages/repo-sync/Cargo.toml
+```
 
 ## Contributing
 

@@ -8,6 +8,7 @@ import { prisma } from "../db/index.js";
 import { authMiddleware, type AuthContext } from "../middleware/auth.js";
 import { rateLimitMiddleware, RateLimits } from "../middleware/rate-limit.js";
 import { retrieve } from "../engine/retriever.js";
+import { exactDistanceOrder } from "../engine/vector-order.js";
 import { syncGitHub } from "../connectors/github.js";
 import { syncGitLab } from "../connectors/gitlab.js";
 import { syncUrl } from "../connectors/url.js";
@@ -2743,17 +2744,16 @@ api.post(
 
     const whereSql = Prisma.join(conditions, " AND ");
 
-    const memories = await prisma.$queryRaw(Prisma.sql`
-      SELECT
-        id, content, "memoryType", "userId",
-        "sessionId", "agentId", importance,
-        metadata, "accessCount", "createdAt",
-        1 - (embedding <=> ${queryEmbedding}::vector) as similarity
-      FROM memories
-      WHERE ${whereSql}
-      ORDER BY embedding <=> ${queryEmbedding}::vector
-      LIMIT ${body.top_k}
-    `);
+    const memories = await prisma.$queryRaw(exactDistanceOrder({
+      table: "memories",
+      alias: "m",
+      columns: Prisma.sql`m.id, m.content, m."memoryType", m."userId",
+        m."sessionId", m."agentId", m.importance,
+        m.metadata, m."accessCount", m."createdAt"`,
+      scope: whereSql,
+      embedding: `[${queryEmbedding.join(",")}]`,
+      limit: body.top_k,
+    }));
 
     // Update access counts
     const memoryIds = (memories as any[]).map((r: any) => r.id);

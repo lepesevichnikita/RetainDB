@@ -1,5 +1,6 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "../db/index.js";
+import { exactDistanceOrder } from "./vector-order.js";
 
 export type OracleSelectScope = {
   seed_hits: Array<{
@@ -85,15 +86,12 @@ export async function selectOracleScope(params: {
     sectionPath: string | null;
     headingPath: string | null;
     similarity: number;
-  }>>(Prisma.sql`
-    SELECT
-      c.id,
-      c."documentId",
-      c."sectionPath",
-      c."headingPath",
-      1 - (c.embedding <=> ${embeddingStr}::vector) as similarity
-    FROM chunks c
-    WHERE c."projectId" = ${projectId}
+  }>>(exactDistanceOrder({
+    table: "chunks",
+    alias: "c",
+    columns: Prisma.sql`c.id, c."documentId", c."sectionPath", c."headingPath"`,
+    scope: Prisma.sql`
+      c."projectId" = ${projectId}
       AND c.embedding IS NOT NULL
       AND COALESCE(c.metadata->>'content_kind', '') <> 'parent_context'
       ${chunkTypeFilterSql}
@@ -109,10 +107,10 @@ export async function selectOracleScope(params: {
             s."activeVersionId" IS NULL
             OR d."sourceVersionId" = s."activeVersionId"
           )
-      )
-    ORDER BY c.embedding <=> ${embeddingStr}::vector
-    LIMIT ${Math.max(10, Math.min(maxSeedHits, 400))}
-  `)) || [];
+      )`,
+    embedding: embeddingStr,
+    limit: Math.max(10, Math.min(maxSeedHits, 400)),
+  }))) || [];
 
   const normalizedSeedHits = seedHits.map((hit) => ({
     chunk_id: hit.id,

@@ -85,12 +85,15 @@ async function findGraphSeeds(db: GraphReader, options: GraphSearch, chunks: Pri
   const { projectId, embedding, topK, entityTypes } = options;
   const vector = vectorLiteral(embedding);
   const types = entityTypes?.length ? Prisma.sql`AND e."entityType" = ANY(${entityTypes}::text[])` : Prisma.empty;
-  await db.$executeRaw`SET LOCAL hnsw.iterative_scan = strict_order`;
+  // The manual seeds are ranked over their own distances, materialised first: an HNSW scan answers
+  // from the tuples it visited in distance order, so a filtered, ordered query can return nothing
+  // for entities that exist. See engine/vector-order.ts.
   return db.$queryRaw<{ id: string; similarity: number }[]>`
-    WITH manual_seeds AS (
+    WITH manual_distances AS MATERIALIZED (
       SELECT e.id, (e.embedding <=> ${vector}::vector) AS distance
       FROM entities e WHERE e."projectId" = ${projectId} AND e."isManual" AND e.embedding IS NOT NULL ${types}
-      ORDER BY e.embedding <=> ${vector}::vector LIMIT ${topK}
+    ), manual_seeds AS (
+      SELECT id, distance FROM manual_distances ORDER BY distance, id LIMIT ${topK}
     ), extracted_seeds AS (
       SELECT e.id, MIN(m.embedding <=> ${vector}::vector) AS distance
       FROM entities e JOIN entity_mentions m ON m."entityId" = e.id

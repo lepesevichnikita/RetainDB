@@ -10,6 +10,7 @@ import { recordRetrievalWorkloadSample, recordStageBreakdown } from "./latency-t
 import { rerankWithInferenceService } from "./inference-client.js";
 import { selectOracleCandidateChunkIds } from "./oracle-select.js";
 import { searchGraphChunks } from "./entity-graph.js";
+import { exactDistanceOrder } from "./vector-order.js";
 
 let openaiClient: OpenAI | null = null;
 
@@ -981,35 +982,32 @@ async function vectorSearch(
   const metadataFilterSql = metadataJson
     ? Prisma.sql`AND metadata @> ${metadataJson}::jsonb`
     : Prisma.empty;
-  const results = await prisma.$transaction(async tx => {
-    await tx.$executeRaw`SET LOCAL hnsw.iterative_scan = strict_order`;
-    return tx.$queryRaw<any[]>`
-      SELECT
-        id, content, "chunkType", metadata, "parentChunkId", "sectionPath", "headingPath",
-        1 - (embedding <=> ${embeddingStr}::vector) as similarity
-      FROM chunks
-      WHERE "projectId" = ${projectId}
-        AND embedding IS NOT NULL
+  const results = await prisma.$queryRaw<any[]>(exactDistanceOrder({
+    table: "chunks",
+    alias: "c",
+    columns: Prisma.sql`c.id, c.content, c."chunkType", c.metadata, c."parentChunkId", c."sectionPath", c."headingPath"`,
+    scope: Prisma.sql`
+      c."projectId" = ${projectId}
+        AND c.embedding IS NOT NULL
         ${chunkTypeFilterSql}
         ${metadataFilterSql}
-        AND COALESCE(metadata->>'content_kind', '') <> 'parent_context'
+        AND COALESCE(c.metadata->>'content_kind', '') <> 'parent_context'
         ${chunkIdFilterSql}
         AND EXISTS (
           SELECT 1
           FROM documents d
           INNER JOIN sources s ON s.id = d."sourceId"
-          WHERE d.id = chunks."documentId"
+          WHERE d.id = c."documentId"
             AND d."deletedAt" IS NULL
             ${sourceFilterSql}
             AND (
               s."activeVersionId" IS NULL
               OR d."sourceVersionId" = s."activeVersionId"
             )
-        )
-      ORDER BY embedding <=> ${embeddingStr}::vector
-      LIMIT ${limit}
-    `;
-  });
+        )`,
+    embedding: embeddingStr,
+    limit,
+  }));
 
   return results.map((r) => ({
     id: r.id,
@@ -1232,52 +1230,24 @@ async function memorySearch(
   if (!opts.userId) return [];
   const embeddingStr = `[${queryEmbedding.join(",")}]`;
 
-  let query;
-  if (opts.userId && opts.sessionId && opts.agentId) {
-    query = prisma.$queryRaw`
-      SELECT
-        id, content, "memoryType", metadata, importance,
-        1 - (embedding <=> ${embeddingStr}::vector) as similarity
-      FROM memories
-      WHERE "projectId" = ${projectId}
-        AND "isActive" = true
-        AND ("expiresAt" IS NULL OR "expiresAt" > NOW())
-        AND "userId" = ${opts.userId}
-        AND "sessionId" = ${opts.sessionId}
-        AND "agentId" = ${opts.agentId}
-      ORDER BY embedding <=> ${embeddingStr}::vector
-      LIMIT ${opts.topK}
-    `;
-  } else if (opts.userId && opts.sessionId) {
-    query = prisma.$queryRaw`
-      SELECT
-        id, content, "memoryType", metadata, importance,
-        1 - (embedding <=> ${embeddingStr}::vector) as similarity
-      FROM memories
-      WHERE "projectId" = ${projectId}
-        AND "isActive" = true
-        AND ("expiresAt" IS NULL OR "expiresAt" > NOW())
-        AND "userId" = ${opts.userId}
-        AND "sessionId" = ${opts.sessionId}
-      ORDER BY embedding <=> ${embeddingStr}::vector
-      LIMIT ${opts.topK}
-    `;
-  } else if (opts.userId) {
-    query = prisma.$queryRaw`
-      SELECT
-        id, content, "memoryType", metadata, importance,
-        1 - (embedding <=> ${embeddingStr}::vector) as similarity
-      FROM memories
-      WHERE "projectId" = ${projectId}
-        AND "isActive" = true
-        AND ("expiresAt" IS NULL OR "expiresAt" > NOW())
-        AND "userId" = ${opts.userId}
-      ORDER BY embedding <=> ${embeddingStr}::vector
-      LIMIT ${opts.topK}
-    `;
-  }
+  const sessionFilter = opts.sessionId ? Prisma.sql`AND m."sessionId" = ${opts.sessionId}` : Prisma.empty;
+  // The agent narrows the session's scope, as before: an agent without a session does not filter.
+  const agentFilter = opts.sessionId && opts.agentId ? Prisma.sql`AND m."agentId" = ${opts.agentId}` : Prisma.empty;
 
-  const results = await query;
+  const results = await prisma.$queryRaw(exactDistanceOrder({
+    table: "memories",
+    alias: "m",
+    columns: Prisma.sql`m.id, m.content, m."memoryType", m.metadata, m.importance`,
+    scope: Prisma.sql`
+      m."projectId" = ${projectId}
+        AND m."isActive" = true
+        AND (m."expiresAt" IS NULL OR m."expiresAt" > NOW())
+        AND m."userId" = ${opts.userId}
+        ${sessionFilter}
+        ${agentFilter}`,
+    embedding: embeddingStr,
+    limit: opts.topK,
+  }));
 
   // Update access counts
   const ids = (results as any[]).map((r) => r.id);

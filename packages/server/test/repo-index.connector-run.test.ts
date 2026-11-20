@@ -11,6 +11,7 @@ import {
   MATERIALISE_CODE,
   prepareMaterialisation,
   type Embedder,
+  type MaterialiseOutcome,
   type PreparedMaterialisation,
   type SourcePath,
 } from "../src/engine/repo-index/materialise.js";
@@ -32,6 +33,7 @@ const STORE_REPLY = {
   NO_GENERATION_PUBLISHED: "NO_GENERATION_PUBLISHED",
   SCOPE_NOT_FOUND: "SCOPE_NOT_FOUND",
   ATTEMPT_OPEN: "ATTEMPT_OPEN",
+  ATTEMPT_REPLAYED: "ATTEMPT_REPLAYED",
   ATTEMPT_CONFLICT: "ATTEMPT_CONFLICT",
   PART_ACCEPTED: "PART_ACCEPTED",
   PART_CONFLICT: "PART_CONFLICT",
@@ -121,6 +123,13 @@ function fakeStore(
     blind?: boolean;
     /** The embedder materialisation uses; the production one would reach a provider. */
     embed?: Embedder;
+    /**
+     * Answers PUBLISHED without the materialisation outcome store.ts attaches to a publication, so
+     * the run's evidence check is what has to refuse the claim.
+     */
+    omitMaterialise?: boolean;
+    /** Answers PUBLISHED with this outcome instead of the one it performed. */
+    materialiseAs?: MaterialiseOutcome;
   } = {},
 ) {
   const calls = {
@@ -153,7 +162,16 @@ function fakeStore(
       // back, and the run gets the refusal to report and an open attempt to abandon.
       const materialised = await materialiseLikeStore(input, memory, options.embed ?? fakeEmbed);
       if (materialised) calls.materialised.push(materialised);
-      return { code: STORE_REPLY.PUBLISHED, generationId: GENERATION_ID, generation: 1, receiptDigest: RECEIPT_DIGEST };
+      // A published generation says what it materialised, exactly as store.ts does: without that
+      // answer a PUBLISHED code alone would claim a searchability nothing established.
+      const evidence = options.materialiseAs ?? (materialised && !options.omitMaterialise ? outcomeOf(materialised.prepared) : undefined);
+      return {
+        code: STORE_REPLY.PUBLISHED,
+        generationId: GENERATION_ID,
+        generation: 1,
+        receiptDigest: RECEIPT_DIGEST,
+        ...(evidence ? { materialise: evidence } : {}),
+      };
     },
     async abandonAttempt(input) {
       calls.abandoned.push(input);
@@ -202,6 +220,19 @@ async function materialiseLikeStore(
   });
   rememberPublished(memory, paths, prepared);
   return { prepared, reads };
+}
+
+/**
+ * The outcome store.ts reports for a publication: every path reused from a previous generation or
+ * created here, and the chunk rows this call wrote. An empty tree answers three explicit zeroes,
+ * so a PUBLISHED answer always states what it materialised instead of leaving it to be assumed.
+ */
+function outcomeOf(prepared: PreparedMaterialisation): MaterialiseOutcome {
+  return {
+    reused: prepared.reuse.length,
+    created: prepared.pending.length,
+    chunks: prepared.pending.reduce((total, entry) => total + entry.chunks.length, 0),
+  };
 }
 
 /** What a publication leaves for the next one: the digest of each path and the chunk ids it holds. */
@@ -420,6 +451,108 @@ test("a store refusal at finalize is reported as a store-layer refusal, distinct
   // has to show its store stayed untouched; otherwise a "distinct code" assertion would
   // pass while the refused run published into its own store.
   assertNoStoreCalls(staleStore.calls);
+});
+
+// Behaviour: PUBLISHED is the store's claim that the generation is searchable, so the answer has to
+// carry the materialisation it documents. A store that answers PUBLISHED without it has written path
+// rows nothing can return, so the run refuses instead of reporting a search that cannot work: the
+// attempt it opened is abandoned after the answer, and no generation or receipt is reported.
+test("a PUBLISHED answer without materialisation evidence is refused", async () => {
+  const files = { "src/a.ts": "export const a = 1;\n" };
+  const { provider } = fakeProvider({ files });
+  const { store, calls } = fakeStore({ omitMaterialise: true });
+
+  const result = await runCommittedRef({
+    provider,
+    request: requestFor(),
+    context: contextFor(vectorsFor(Object.keys(files))),
+    store,
+  });
+
+  assert.equal(result.code, RUN_CODE.STORE_REFUSED);
+  assert.equal(result.layer, "store");
+  assert.equal(result.storeCode, STORE_REPLY.PUBLISHED);
+  assert.match(result.failure ?? "", /materialis/);
+  assert.equal(result.generation, undefined);
+  assert.equal(result.receiptDigest, undefined);
+  assert.equal(result.abandoned, true);
+  assert.equal(calls.finalized.length, 1);
+  assert.deepEqual(calls.abandoned, [STORE_IDENTITY]);
+});
+
+// Behaviour: evidence that accounts for fewer paths than the run submitted is not evidence for this
+// publication. A store that claims it materialised nothing while the manifest names a path is
+// refused exactly as an answer with no evidence at all, so the zeroes that are honest for an empty
+// tree cannot be used to publish a tree nothing can find.
+test("materialisation evidence that covers fewer paths than the manifest is refused", async () => {
+  const files = { "src/a.ts": "export const a = 1;\n", "src/b.ts": "export const b = 2;\n" };
+  const { provider } = fakeProvider({ files });
+  const { store, calls } = fakeStore({ materialiseAs: { reused: 0, created: 0, chunks: 0 } });
+
+  const result = await runCommittedRef({
+    provider,
+    request: requestFor(),
+    context: contextFor(vectorsFor(Object.keys(files))),
+    store,
+  });
+
+  assert.equal(result.code, RUN_CODE.STORE_REFUSED);
+  assert.equal(result.layer, "store");
+  assert.equal(result.storeCode, STORE_REPLY.PUBLISHED);
+  assert.equal(result.abandoned, true);
+  assert.equal(calls.finalized[0].manifest.entries.length, 2);
+  assert.deepEqual(calls.abandoned, [STORE_IDENTITY]);
+});
+
+// Behaviour: a count that is not a whole, non-negative number is not a report of chunks written.
+// NaN and a negative count are refused even when the path counts add up, so "an explicit zero" is
+// the only zero a publication may claim and an unreadable number cannot pass as evidence.
+test("materialisation counts that are not whole non-negative numbers are refused", async () => {
+  const files = { "src/a.ts": "export const a = 1;\n" };
+  const { provider } = fakeProvider({ files });
+  const context = contextFor(vectorsFor(Object.keys(files)));
+
+  const notANumber = await runCommittedRef({
+    provider,
+    request: requestFor(),
+    context,
+    store: fakeStore({ materialiseAs: { reused: 1, created: 0, chunks: Number.NaN } }).store,
+  });
+  const negative = await runCommittedRef({
+    provider,
+    request: requestFor(),
+    context,
+    store: fakeStore({ materialiseAs: { reused: 1, created: 0, chunks: -1 } }).store,
+  });
+
+  assert.equal(notANumber.code, RUN_CODE.STORE_REFUSED);
+  assert.equal(notANumber.layer, "store");
+  assert.equal(negative.code, RUN_CODE.STORE_REFUSED);
+  assert.equal(negative.layer, "store");
+});
+
+// Behaviour: a replayed attempt was opened and published by an earlier run of the same declaration,
+// so this call materialised nothing again and store.ts answers that publication without an outcome
+// (settledPublication). That is the replay contract rather than a missing claim, so the run reports
+// the publication the earlier run made and abandons nothing.
+test("a replayed attempt answers the publication it already made without materialising again", async () => {
+  const files = { "src/a.ts": "export const a = 1;\n" };
+  const { provider } = fakeProvider({ files });
+  const { store, calls } = fakeStore({ openCode: STORE_REPLY.ATTEMPT_REPLAYED, omitMaterialise: true });
+
+  const result = await runCommittedRef({
+    provider,
+    request: requestFor(),
+    context: contextFor(vectorsFor(Object.keys(files))),
+    store,
+  });
+
+  assert.equal(result.code, RUN_CODE.PUBLISHED);
+  assert.equal(result.layer, null);
+  assert.equal(result.receiptDigest, RECEIPT_DIGEST);
+  assert.equal(result.abandoned, false);
+  assert.equal(calls.finalized.length, 1);
+  assert.equal(calls.abandoned.length, 0);
 });
 
 // Behaviour: a manifest larger than one part is submitted in bounded chunks whose sizes

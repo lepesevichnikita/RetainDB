@@ -216,9 +216,11 @@ repoIndexRoutes.put(
     const scopeId = c.req.param("scopeId");
     const attemptId = c.req.param("attemptId");
     const partNo = Number(c.req.param("partNo"));
-    if (!Number.isInteger(partNo) || partNo < 1) return answer(c, STORE_CODE.PART_OUT_OF_RANGE);
     const denial = await authorize(scopeId, CAPABILITY.PUT_PART, grantToken(c));
     if (denial) return answer(c, denial);
+    // After the grant, like every other refusal on this route: a stranger that sends a part number
+    // this route would refuse still learns GRANT_MISSING, not what this scope accepts.
+    if (!Number.isInteger(partNo) || partNo < 1) return answer(c, STORE_CODE.PART_OUT_OF_RANGE);
     const result = await putPart({ scopeId, attemptId, partNo, part: c.req.valid("json") });
     return answer(c, result.code, {
       partNo: result.partNo,

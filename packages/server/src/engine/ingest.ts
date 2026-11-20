@@ -205,15 +205,14 @@ export async function ingestDocument(input: IngestDocumentInput) {
         content_kind: chunk.metadata.content_kind || (chunk.role === "parent" ? "parent_context" : chunk.role),
       };
       const metadataJson = JSON.stringify(enrichedMetadata);
+      // Only a non-searchable chunk may be stored without a vector; anything else
+      // would be published as searchable while being invisible to semantic search.
+      // Whether a vector is usable is decided once, in embedSearchableChunks: a
+      // searchable chunk that reaches here already holds a validated one.
       const vector = chunk.searchable ? embeddedByTempId.get(chunk.tempId) : undefined;
       const searchContent = buildSearchContent(title, chunk.headingPath, chunk.sectionPath, chunk.content);
       const contentHash = createHash("sha256").update(chunk.content).digest("hex");
       try {
-        // Only a non-searchable chunk may be stored without a vector; anything else
-        // would be published as searchable while being invisible to semantic search.
-        if (chunk.searchable && (!vector || vector.length === 0)) {
-          throw new Error(`Searchable chunk ${chunk.tempId} reached storage without an embedding`);
-        }
         if (vector && vector.length > 0) {
           await prisma.$executeRaw`
             INSERT INTO "chunks" (

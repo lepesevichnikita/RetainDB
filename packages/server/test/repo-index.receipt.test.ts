@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import {
   EMBEDDING_DIMENSIONS,
   PROMOTION_OUTCOME,
@@ -9,6 +12,12 @@ import {
 } from "../src/engine/repo-index/receipt.js";
 
 const DIMENSIONS = 1024;
+
+// The width this file pins is the width of a real column, so the live column is checked too whenever
+// a database is attached. Every check below still runs without one.
+const databaseUrl = process.env.RETAINDB_TEST_DATABASE_URL;
+const run = databaseUrl ? test : test.skip;
+if (databaseUrl) process.env.DATABASE_URL = databaseUrl;
 
 function vector(fill = 0.5): number[] {
   return Array<number>(DIMENSIONS).fill(fill);
@@ -255,10 +264,87 @@ test("a manifest declaring a width other than the store width is refused", () =>
   assert.deepEqual(result.active, active);
 });
 
-// Behaviour: the store column is vector(1024). If this constant drifted, every vector stored or
-// published would be the wrong width for the column, so pin it to the schema.
-test("the shared embedding width matches the vector(1024) column", () => {
-  assert.equal(EMBEDDING_DIMENSIONS, 1024);
+// ─── the schema's own width ─────────────────────────────────────────────────
+// prisma/schema.prisma spells the column Unsupported("vector"), and Prisma's Unsupported type carries
+// no precision, so the width is not expressible there. The migrations that define the column are the
+// in-repo source of it, so the constant is pinned to what they declare, not to a second copy of 1024.
+
+const prismaRoot = fileURLToPath(new URL("../prisma", import.meta.url));
+
+/** The Chunk model's own declaration: the table it maps and how it spells the embedding column. */
+function chunkModelDeclaration(): { table: string; embedding: string } {
+  const model = readFileSync(join(prismaRoot, "schema.prisma"), "utf8").match(/^model Chunk \{([\s\S]*?)^\}/m)?.[1];
+  assert.ok(model, "prisma/schema.prisma must still declare the Chunk model");
+  const table = model.match(/@@map\("([^"]+)"\)/)?.[1];
+  const embedding = model.match(/^\s*embedding\s+(\S.*?)\s*$/m)?.[1];
+  assert.ok(table && embedding, "the Chunk model must map a table and declare embedding");
+  return { table, embedding };
+}
+
+/** The width one migration's text gives `table`.embedding, when that text (re)declares the column. */
+function declaredEmbeddingWidth(sql: string, table: string): number | undefined {
+  const tableNamed = new RegExp(`\\b(?:ALTER|CREATE)\\s+TABLE\\s+"?${table}"?\\b`, "i");
+  let width: number | undefined;
+  for (const statement of sql.replace(/--[^\n]*/g, "").split(";")) {
+    if (!tableNamed.test(statement)) continue;
+    const declared = statement.match(/"?embedding"?\s+vector\s*\(\s*(\d+)\s*\)/i);
+    if (declared) width = Number(declared[1]);
+  }
+  return width;
+}
+
+/** The width the migrations leave the column with: the last declaration in migration order wins. */
+function migratedEmbeddingWidth(table: string): number | undefined {
+  let width: number | undefined;
+  const migrations = readdirSync(join(prismaRoot, "migrations"), { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort();
+  for (const migration of migrations) {
+    const sql = readFileSync(join(prismaRoot, "migrations", migration, "migration.sql"), "utf8");
+    width = declaredEmbeddingWidth(sql, table) ?? width;
+  }
+  return width;
+}
+
+// Behaviour: chunks.embedding's width is the width every stored and published vector must have, so the
+// shared constant is pinned to the width the migrations give the column. A migration that changes the
+// column to vector(768) fails here, where comparing the constant with a literal 1024 kept passing.
+test("the shared embedding width matches the width the migrations give chunks.embedding", () => {
+  const { table, embedding } = chunkModelDeclaration();
+  assert.match(embedding, /^Unsupported\("vector"\)\??$/, "the column width is stated by the migrations, not by the Prisma type");
+  assert.equal(migratedEmbeddingWidth(table), EMBEDDING_DIMENSIONS);
+});
+
+// Behaviour: the width above is read out of SQL rather than assumed, so a migration that declares a
+// different width is read as that width. Without this, a parser that always answered 1024 would
+// satisfy the assertion above and the pin would be vacuous again.
+test("the migration parser reports the width a drifted migration declares", () => {
+  assert.equal(declaredEmbeddingWidth("ALTER TABLE chunks ADD COLUMN embedding vector(768);", "chunks"), 768);
+  assert.equal(declaredEmbeddingWidth('CREATE TABLE "chunks" ("embedding" vector, "id" text);', "chunks"), undefined);
+});
+
+// Behaviour: the deployed column, not only the migrations on disk, decides what can be stored, so with
+// a database attached the constant is pinned to the live column width too. This case runs whenever
+// RETAINDB_TEST_DATABASE_URL names a migrated database and is never skipped when it is set.
+run("the shared embedding width matches the live chunks.embedding column", async () => {
+  const { db } = await import("../src/db/index.js");
+  try {
+    const { table } = chunkModelDeclaration();
+    const columns = await db.$queryRaw<Array<{ width: string }>>`
+      SELECT format_type(attribute.atttypid, attribute.atttypmod) AS width
+      FROM pg_attribute attribute
+      JOIN pg_class relation ON relation.oid = attribute.attrelid
+      WHERE relation.relname = ${table}
+        AND attribute.attname = 'embedding'
+        AND attribute.attnum > 0
+        AND NOT attribute.attisdropped
+    `;
+    assert.equal(columns.length, 1, `the store must expose exactly one ${table}.embedding column`);
+    assert.equal(Number(columns[0].width.match(/^vector\((\d+)\)$/)?.[1]), EMBEDDING_DIMENSIONS);
+  } finally {
+    await db.$disconnect();
+  }
 });
 
 // Behaviour: a path that appears twice describes one chunk twice, so the manifest is

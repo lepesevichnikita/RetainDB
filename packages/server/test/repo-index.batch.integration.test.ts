@@ -1300,6 +1300,80 @@ run("a refused finalize reports the parts and drops it refused", { timeout: 30_0
   assert.deepEqual(droppedBody.error.undeclaredDrops, ["src/b.ts"]);
 });
 
+// Behaviour: the part number is a path parameter, so refusing it before the grant would answer a
+// stranger 400 PART_OUT_OF_RANGE and tell it what this route accepts, which no other refusal here
+// does. The parameter is still refused, but only after the caller proves a write grant on the
+// scope: an anonymous caller and a caller with a grant of the wrong kind both learn GRANT_MISSING,
+// and nothing is written by either.
+run("a parts request refuses an out-of-range part number only after the grant is proved", { timeout: 30_000 }, async () => {
+  const store = await import(storePath);
+  const { repoIndexRoutes } = await import(apiPath);
+  const { db, scope } = await fixture();
+  const uploaderToken = `uploader-${randomUUID()}`;
+  const readerToken = `reader-${randomUUID()}`;
+  await grantsFor(db, scope.id, { uploader: uploaderToken, reader: readerToken });
+  const opened = await store.openAttempt(attemptFor(scope.id, "attempt-1"));
+  assert.equal(opened.code, store.STORE_CODE.ATTEMPT_OPEN);
+  const url = `http://local/v1/repo-index/scopes/${scope.id}/generations/attempt-1/parts/0`;
+  const part = { upserts: ["src/a.ts"], tombstones: [] };
+
+  const anonymous = await repoIndexRoutes.request(grantRequest("PUT", url, undefined, part));
+  assert.equal(anonymous.status, 403);
+  assert.equal(((await anonymous.json()) as any).error.code, "GRANT_MISSING");
+
+  const wrongKind = await repoIndexRoutes.request(grantRequest("PUT", url, readerToken, part));
+  assert.equal(wrongKind.status, 403);
+  assert.equal(((await wrongKind.json()) as any).error.code, "GRANT_MISSING");
+
+  // The same part number from a caller that holds the write grant is refused by the parameter,
+  // so moving the check below the grant keeps the refusal instead of dropping it.
+  const authorised = await repoIndexRoutes.request(grantRequest("PUT", url, uploaderToken, part));
+  assert.equal(authorised.status, 400);
+  assert.equal(((await authorised.json()) as any).error.code, store.STORE_CODE.PART_OUT_OF_RANGE);
+
+  const attempt = await db.repoIndexGeneration.findUniqueOrThrow({ where: { id: opened.generationId } });
+  assert.equal(attempt.status, "open");
+  assert.equal(await db.repoIndexPart.count({ where: { generationId: opened.generationId } }), 0);
+});
+
+// Behaviour: `searchable: true` is a demand this route cannot meet, so an admin grant that asks for
+// it is told SEARCHABLE_UNAVAILABLE and nothing is published: the attempt stays open, the scope
+// keeps the generation it had, and no path row is written by the refusal.
+run("a searchable demand from an admin grant is refused and publishes nothing", { timeout: 30_000 }, async () => {
+  const store = await import(storePath);
+  const { repoIndexRoutes } = await import(apiPath);
+  const { db, scope } = await fixture();
+  const adminToken = `admin-${randomUUID()}`;
+  await grantsFor(db, scope.id, { admin: adminToken });
+  const opened = await store.openAttempt(attemptFor(scope.id, "attempt-1"));
+  assert.equal(opened.code, store.STORE_CODE.ATTEMPT_OPEN);
+  await store.putPart({ scopeId: scope.id, attemptId: "attempt-1", partNo: 1, part: { upserts: ["src/a.ts"], tombstones: [] } });
+
+  const url = `http://local/v1/repo-index/scopes/${scope.id}/generations/attempt-1/finalize`;
+  const refused = await repoIndexRoutes.request(
+    grantRequest("POST", url, adminToken, {
+      requiredPaths: ["src/a.ts"],
+      manifest: manifestFor("digest-1", [entry("src/a.ts")]),
+      searchable: true,
+    }),
+  );
+
+  assert.equal(refused.status, 422);
+  const body = (await refused.json()) as any;
+  assert.equal(body.success, false);
+  assert.equal(body.error.code, "SEARCHABLE_UNAVAILABLE");
+  // The refusal names the publication that does materialise, so a caller that needs search results
+  // is pointed at the connector run instead of at a retry of this call.
+  assert.equal(typeof body.error.detail, "string");
+
+  const attempt = await db.repoIndexGeneration.findUniqueOrThrow({ where: { id: opened.generationId } });
+  assert.equal(attempt.status, "open");
+  assert.equal(attempt.publishedAt, null);
+  const storedScope = await db.repoIndexScope.findUniqueOrThrow({ where: { id: scope.id } });
+  assert.equal(storedScope.activeGeneration, 0);
+  assert.equal(await db.repoIndexPath.count({ where: { scopeId: scope.id } }), 0);
+});
+
 after(async () => {
   if (!databaseUrl) return;
   const { db } = await import("../src/db/index.js");

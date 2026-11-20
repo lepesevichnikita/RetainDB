@@ -28,6 +28,12 @@
  * semantic search, and a blob that cannot be read refuses the publication (MATERIALISE_REFUSED
  * carrying CONTENT_UNAVAILABLE) instead of publishing a path row nothing can return.
  *
+ * That claim is checked here rather than trusted: a PUBLISHED answer has to report the
+ * materialisation it documents - every manifest path reused or created, and the chunk rows this
+ * call wrote - and an answer that states none of it is a store-layer refusal (STORE_REFUSED), not
+ * a publication. The one exception is a replayed attempt: store.ts answers the generation an
+ * earlier run already published (settledPublication), and that run is the call that materialised.
+ *
  * The reader answers from what the manifest scan already fetched. The scan digests every blob, so
  * fetching the same blob again for its text would double the run's API use and the provider's rate
  * limit for nothing; the content is retained under a byte budget (`contentCacheBytes`) and released
@@ -37,7 +43,7 @@
 
 import { createHash } from "node:crypto";
 import { readCommittedRef, REF_RUN_OUTCOME, type RefManifestEntry, type RefProvider, type RefRunOutcome, type RefRunRequest, type RefRunResult, type RefViolation } from "../../connectors/repo-ref.js";
-import { MATERIALISE_CODE, MaterialiseError, type ContentReader, type MaterialiseCode } from "./materialise.js";
+import { MATERIALISE_CODE, MaterialiseError, type ContentReader, type MaterialiseCode, type MaterialiseOutcome } from "./materialise.js";
 import { EMBEDDING_DIMENSIONS, isUsableVector } from "./receipt.js";
 import type {
   AbandonResult,
@@ -304,7 +310,10 @@ async function publish(
     const answer = await store.openAttempt(declared(input.context, manifest, parts.length));
     if (!isOpened(answer.code)) return storeAnswer(ref, answer.code);
     opened = true;
-    return await settle(ref, store, input.context, manifest, parts, readContent);
+    // An attempt the store replayed was opened by an earlier run of this same declaration; only a
+    // fresh one is published by this call, so only a fresh one owes this run its materialisation.
+    const replayed = answer.code === STORE_REPLY.ATTEMPT_REPLAYED;
+    return await settle(ref, store, input.context, manifest, parts, readContent, replayed);
   } catch (error) {
     return await failureOf(ref, store, input.context, error, opened, parts.length);
   }
@@ -318,10 +327,11 @@ async function settle(
   manifest: AttemptManifest,
   parts: PartPayload[],
   readContent: ContentReader,
+  replayed: boolean,
 ): Promise<CommittedRefRunResult> {
   const refused = await submit(store, context, parts);
   if (refused !== null) return abandonedStoreAnswer(ref, store, context, refused.code, parts.length);
-  return sealed(ref, store, context, manifest, parts.length, readContent);
+  return sealed(ref, store, context, manifest, parts.length, readContent, replayed);
 }
 
 async function submit(store: PublicationStore, context: CommittedRefContext, parts: PartPayload[]): Promise<PutPartResult | null> {
@@ -339,6 +349,7 @@ async function sealed(
   manifest: AttemptManifest,
   partCount: number,
   readContent: ContentReader,
+  replayed: boolean,
 ): Promise<CommittedRefRunResult> {
   // The reader is what makes the publication searchable: the store materialises the generation on
   // the same transaction that seals it, so PUBLISHED cannot answer while chunks are missing.
@@ -349,8 +360,33 @@ async function sealed(
     manifest,
     readContent,
   });
-  if (finalized.code === STORE_REPLY.PUBLISHED) return published(ref, finalized, partCount);
-  return abandonedStoreAnswer(ref, store, context, finalized.code, partCount);
+  if (finalized.code !== STORE_REPLY.PUBLISHED) return abandonedStoreAnswer(ref, store, context, finalized.code, partCount);
+  // A replayed attempt is the publication an earlier run of this declaration already made, so this
+  // call has nothing of its own to report (store.ts settledPublication). A fresh attempt owes the
+  // evidence: every manifest path reused or created, and the chunks this call wrote. A fresh open
+  // whose finalize replays another run of the same attempt is refused with it, because this run
+  // cannot tell that publication from a claim it never materialised.
+  if (replayed || materialised(finalized.materialise, manifest.entries.length)) return published(ref, finalized, partCount);
+  return unverified(await abandonedStoreAnswer(ref, store, context, finalized.code, partCount));
+}
+
+/**
+ * The evidence a PUBLISHED answer owes: every manifest path reused from an earlier generation or
+ * created by this call, and the chunk rows it wrote. Whole, non-negative counts only, and an
+ * explicit zero is a real answer - an empty file contributes no chunk and an empty tree no path -
+ * so an answer cannot satisfy this by leaving the field out, by omitting a count, or by reporting
+ * counts that account for some other, smaller tree.
+ */
+function materialised(evidence: MaterialiseOutcome | undefined, pathCount: number): boolean {
+  if (evidence === undefined) return false;
+  const counts = [evidence.reused, evidence.created, evidence.chunks];
+  if (!counts.every((count) => Number.isInteger(count) && count >= 0)) return false;
+  return evidence.reused + evidence.created === pathCount;
+}
+
+/** A PUBLISHED answer that states no publication this run can report is a store-layer refusal. */
+function unverified(answer: CommittedRefRunResult): CommittedRefRunResult {
+  return { ...answer, failure: "the store answered PUBLISHED without the materialisation a publication requires" };
 }
 
 /** One code per ref property: the run has to satisfy every one before the store is asked. */

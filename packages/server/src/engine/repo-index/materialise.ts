@@ -1,10 +1,26 @@
 /**
- * Materialisation: the stage that turns a published repository generation into searchable rows.
+ * Materialisation: the stage that turns a repository generation into searchable rows, in two steps.
  *
  * Publication writes `repo_index_paths` rows, and nothing in those rows can be returned by
- * semantic search. This module closes that gap. For each path of the generation it reads the file,
- * chunks it with the pipeline's own chunker, embeds the chunks, stores them as ordinary `chunks`
- * rows under a document of the scope's own source, and names the anchoring chunk on the path row.
+ * semantic search. This module closes that gap in the two phases the plan requires - stage before
+ * promotion - so the transaction that publishes never carries the reading, chunking, embedding and
+ * inserting of a whole tree.
+ *
+ * - `planMaterialisation` decides what the generation needs and reads, chunks and embeds the paths
+ *   whose content changed. It writes nothing, so every refusal it raises (unreadable content, an
+ *   unusable vector, the chunk ceiling) happens before the first row exists.
+ * - `stageBatch` writes one bounded batch of that plan: a document per path and its chunks, under
+ *   the scope's own source, marked with the attempt's generation and this stage's id. A staged
+ *   document carries `deletedAt`, which is the invisibility rule the read path already applies:
+ *   every query that returns a chunk joins `documents` with `deletedAt IS NULL`
+ *   (engine/retriever.ts, all four branches of its text query and both of its vector queries), and
+ *   every count here filters the same way. A staged row is therefore not searchable and not
+ *   countable, and a crash between batches leaves the last good generation exactly as it was.
+ * - `promoteStaged` is the visibility flip, and the caller runs it inside the transaction that
+ *   fences the attempt and moves the scope's active generation: the staged rows become live at the
+ *   same commit as the path rows that name them, and never before it.
+ * - `discardStaged` drops the rows of a stage that will not be promoted. They were never visible,
+ *   so this is garbage collection rather than a rollback.
  *
  * Scope of what is written, and why:
  * - One `sources` row per scope (`repo-index:<scopeId>`, type `repo_index`), because `documents`
@@ -20,10 +36,10 @@
  * - Only searchable chunks are stored. A parent-context chunk carries no vector and no similarity
  *   query can return it, so storing it would be a row nothing reads.
  *
- * Atomicity: the caller runs this on the transaction that publishes the generation, so a refusal
- * (unreadable content, an unusable vector, a generation above the chunk ceiling) rolls back the seal,
- * the generation bump and the path rows together. No generation can be visible while half its chunks
- * are missing, and the generation it replaced is untouched.
+ * Atomicity: the staged rows are invisible until `promoteStaged` runs in the sealing transaction,
+ * and that transaction is also what fences the attempt and moves the active generation. No
+ * generation can be visible while half its chunks are missing - a half-staged generation is not
+ * visible at all - and the generation it replaces stays searchable throughout.
  *
  * Content comes from the caller: `readContent` is the only way a file is read here, so this module
  * never reaches for the filesystem or the network and a caller can test it with plain strings.
@@ -92,13 +108,64 @@ export interface PrepareInput {
 
 export interface MaterialiseInput {
   scopeId: string;
-  generationId: string;
   projectId: string;
-  orgId: string;
   paths: readonly SourcePath[];
   readContent: ContentReader;
   embed?: Embedder;
   maxChunks?: number;
+}
+
+/** What one publication starts from and what it must write, decided before the first row. */
+export interface MaterialisationPlan {
+  /** The scope's source, or null when this scope never materialised anything. */
+  sourceId: string | null;
+  /** The paths whose chunks this generation keeps, with the chunks each of them anchors. */
+  reuse: ReusedPath[];
+  /** The paths this generation must write, read and chunked and embedded. */
+  pending: PreparedPath[];
+}
+
+/** The two document metadata keys that tie a staged row to the attempt and the stage that wrote it. */
+const STAGED_GENERATION_KEY = "repo_index_generation_id";
+const STAGED_STAGE_KEY = "repo_index_stage_id";
+
+/** The scope a source row belongs to: enough to find or create it. */
+interface SourceOwner {
+  scopeId: string;
+  projectId: string;
+  orgId: string;
+}
+
+/** One bounded batch of a plan, written in one transaction. */
+export interface StageBatchInput extends SourceOwner {
+  generationId: string;
+  stageId: string;
+  /** The moment this stage began; the value a staged document's `deletedAt` carries. */
+  stagedAt: Date;
+  paths: readonly PreparedPath[];
+}
+
+/** What one batch wrote: the source it staged into, and the chunk each of its paths anchors. */
+export interface StagedBatch {
+  sourceId: string;
+  anchors: Array<{ path: string; chunkId: string }>;
+}
+
+export interface PromoteStagedInput {
+  sourceId: string;
+  generationId: string;
+  stageId: string;
+  /** The paths this stage wrote documents for; the live document of each is replaced by it. */
+  staged: readonly string[];
+  /** Every path the manifest names; a live document whose path is not here is retired. */
+  kept: readonly string[];
+}
+
+export interface DiscardStagedInput {
+  sourceId: string;
+  generationId: string;
+  /** The stage that owns the rows; every stage of the generation when absent. */
+  stageId?: string;
 }
 
 /** The deletion half of materialisation: the paths a generation serves, and where they live. */
@@ -412,13 +479,17 @@ function usableVector(vector: number[] | undefined, path: string): number[] {
 }
 
 /**
- * Materialises one published generation and names each path's anchoring chunk on its path row.
- * Runs on the caller's transaction; every write rolls back with a refusal.
+ * Decides what one publication needs and reads, chunks and embeds everything it must write, without
+ * touching a row. A refusal here - content that cannot be read, a vector no search can consume, a
+ * generation above its chunk ceiling (`MATERIALISE_LIMITS`, or the variable that raises it) - leaves
+ * the database exactly as it was, which is what lets the caller stage afterwards.
+ *
+ * The previous materialisation is read from the live documents only: a staged document is not part
+ * of the generation readers see, so it can never be reused as if it were.
  */
-export async function materialiseGeneration(handle: Database, input: MaterialiseInput): Promise<MaterialiseOutcome> {
-  const source = await ensureScopeSource(handle, input);
-  const previous = await loadMaterialisedPaths(handle, source.id);
-  const previousByPath = new Map(previous.map((row) => [row.path, row]));
+export async function planMaterialisation(handle: Database, input: MaterialiseInput): Promise<MaterialisationPlan> {
+  const source = await findScopeSource(handle, input.scopeId, input.projectId);
+  const previous = source ? await loadMaterialisedPaths(handle, source.id) : [];
   const prepared = await prepareMaterialisation({
     paths: input.paths,
     previous: new Map(previous.map((row) => [row.path, { digest: row.digest, chunkIds: row.chunkIds }])),
@@ -426,15 +497,59 @@ export async function materialiseGeneration(handle: Database, input: Materialise
     embed: input.embed,
     maxChunks: input.maxChunks,
   });
-  const created = await writePendingPaths(handle, input, source.id, previousByPath, prepared.pending);
-  const reused = prepared.reuse.map((entry) => ({ path: entry.path, chunkId: entry.chunkIds[0] }));
-  await writeChunkAnchors(handle, input, [...reused, ...created]);
-  await retirePaths(handle, source.id, input.paths, previous);
-  return {
-    reused: reused.length,
-    created: prepared.pending.length,
-    chunks: prepared.pending.reduce((total, entry) => total + entry.chunks.length, 0),
-  };
+  return { sourceId: source?.id ?? null, reuse: prepared.reuse, pending: prepared.pending };
+}
+
+/**
+ * Writes one bounded batch of a plan: a document per path plus its chunks, with `deletedAt` set and
+ * the generation and stage that own them in their metadata. Runs on the caller's transaction, which
+ * is why the caller keeps batches small; every row of a batch appears at once, and none of them is
+ * visible until `promoteStaged`.
+ *
+ * The scope's source is created here, on the first batch that needs one, and never on a publication
+ * that only reuses what it already has.
+ */
+export async function stageBatch(handle: Database, input: StageBatchInput): Promise<StagedBatch> {
+  const source = await ensureScopeSource(handle, input);
+  const anchors: Array<{ path: string; chunkId: string }> = [];
+  for (const entry of input.paths) {
+    const documentId = await createStagedDocument(handle, input, source.id, entry);
+    const chunkIds = await insertChunks(handle, input, documentId, entry);
+    if (chunkIds.length > 0) anchors.push({ path: entry.path, chunkId: chunkIds[0] });
+  }
+  return { sourceId: source.id, anchors };
+}
+
+/**
+ * Makes one stage the generation readers see, inside the transaction that publishes it.
+ *
+ * Three writes, in this order, so that nothing is visible before the flip: the live documents of
+ * the paths this stage rewrote are dropped, every live document the manifest no longer names is
+ * dropped, and only then do the staged documents become live. A reader sees the generation it saw
+ * before the commit, or the whole new one after it - never both halves of a replaced file.
+ */
+export async function promoteStaged(handle: Database, input: PromoteStagedInput): Promise<void> {
+  await dropLiveDocuments(handle, input.sourceId, input.staged);
+  await retireUnlistedDocuments(handle, input.sourceId, input.kept);
+  await makeStagedLive(handle, input);
+  await refreshSourceCounts(handle, input.sourceId);
+}
+
+/**
+ * Drops the rows of a stage that will not be promoted. Without a stage id it drops every stage of
+ * the generation, which is what an abandonment knows; the rows were invisible either way, so this
+ * only decides whether they linger.
+ */
+export async function discardStaged(handle: Database, input: DiscardStagedInput): Promise<number> {
+  const stage = input.stageId ?? null;
+  const dropped = await handle.$executeRaw`
+    DELETE FROM "documents"
+    WHERE "sourceId" = ${input.sourceId}
+      AND "deletedAt" IS NOT NULL
+      AND metadata->>${STAGED_GENERATION_KEY} = ${input.generationId}
+      AND (${stage}::text IS NULL OR metadata->>${STAGED_STAGE_KEY} = ${stage}::text)
+  `;
+  return Number(dropped ?? 0);
 }
 
 /**
@@ -450,26 +565,37 @@ export async function materialiseGeneration(handle: Database, input: Materialise
 export async function retireUnlistedPaths(handle: Database, input: RetireInput): Promise<void> {
   const source = await findScopeSource(handle, input.scopeId, input.projectId);
   if (!source) return;
-  await retirePaths(handle, source.id, input.paths, await loadMaterialisedPaths(handle, source.id));
+  await retireUnlistedDocuments(handle, source.id, input.paths.map((entry) => entry.path));
+  await refreshSourceCounts(handle, source.id);
 }
 
 /**
  * The scope's own source, created once. `sources.projectId` is a real foreign key, so the scope's
  * project has to exist: a repository index is attributable to a project, not to a conversation.
+ *
+ * Two stages of one scope can reach this at the same time, and `@@unique([projectId, name])` lets
+ * one create it; the loser reads the row the winner wrote instead of failing its batch.
  */
-async function ensureScopeSource(handle: Database, input: MaterialiseInput): Promise<{ id: string }> {
+async function ensureScopeSource(handle: Database, input: SourceOwner): Promise<{ id: string }> {
   const existing = await findScopeSource(handle, input.scopeId, input.projectId);
   if (existing) return existing;
-  return handle.source.create({
-    data: {
-      projectId: input.projectId,
-      name: scopeSourceName(input.scopeId),
-      orgId: input.orgId,
-      type: REPO_INDEX_SOURCE_TYPE,
-      status: "READY",
-      config: { repo_scope_id: input.scopeId },
-    },
-  });
+  try {
+    return await handle.source.create({
+      data: {
+        projectId: input.projectId,
+        name: scopeSourceName(input.scopeId),
+        orgId: input.orgId,
+        type: REPO_INDEX_SOURCE_TYPE,
+        status: "READY",
+        config: { repo_scope_id: input.scopeId },
+      },
+    });
+  } catch (error) {
+    if ((error as { code?: string } | null)?.code !== "P2002") throw error;
+    const winner = await findScopeSource(handle, input.scopeId, input.projectId);
+    if (!winner) throw error;
+    return winner;
+  }
 }
 
 /** The source this scope mirrors into, or nothing when it was never materialised. */
@@ -485,9 +611,14 @@ interface MaterialisedDocument {
   chunkIds: string[];
 }
 
+/**
+ * The live documents of one source and the chunks each of them holds. Live means `deletedAt IS
+ * NULL`: a staged document mirrors a path the generation does not serve yet, so it is not something
+ * a later plan may reuse, count or duplicate.
+ */
 async function loadMaterialisedPaths(handle: Database, sourceId: string): Promise<MaterialisedDocument[]> {
   const documents = (await handle.document.findMany({
-    where: { sourceId },
+    where: { sourceId, deletedAt: null },
     select: { id: true, externalId: true, contentHash: true },
   })) as Array<{ id: string; externalId: string | null; contentHash: string | null }>;
   if (documents.length === 0) return [];
@@ -508,27 +639,8 @@ async function loadMaterialisedPaths(handle: Database, sourceId: string): Promis
   }));
 }
 
-/** Writes every pending path's document and chunks, returning the anchor of each non-empty path. */
-async function writePendingPaths(
-  handle: Database,
-  input: MaterialiseInput,
-  sourceId: string,
-  previousByPath: ReadonlyMap<string, MaterialisedDocument>,
-  pending: readonly PreparedPath[],
-): Promise<Array<{ path: string; chunkId: string }>> {
-  const anchors: Array<{ path: string; chunkId: string }> = [];
-  for (const entry of pending) {
-    const existing = previousByPath.get(entry.path);
-    const documentId = existing
-      ? await replaceDocument(handle, input, existing.id, entry)
-      : await createDocument(handle, input, sourceId, entry);
-    const chunkIds = await insertChunks(handle, input, documentId, entry);
-    if (chunkIds.length > 0) anchors.push({ path: entry.path, chunkId: chunkIds[0] });
-  }
-  return anchors;
-}
-
-function documentData(input: MaterialiseInput, entry: PreparedPath) {
+/** One document of one staged path, carrying the two markers that decide whether it may be published. */
+function documentData(input: StageBatchInput, entry: PreparedPath) {
   return {
     projectId: input.projectId,
     externalId: entry.path,
@@ -537,25 +649,26 @@ function documentData(input: MaterialiseInput, entry: PreparedPath) {
     contentHash: entry.digest,
     content: entry.content,
     tokens: Math.ceil(entry.content.length / 4),
-    metadata: { repo_scope_id: input.scopeId, repo_path: entry.path, repo_digest: entry.digest },
-    status: "READY",
-    indexedAt: new Date(),
+    metadata: {
+      repo_scope_id: input.scopeId,
+      repo_path: entry.path,
+      repo_digest: entry.digest,
+      [STAGED_GENERATION_KEY]: input.generationId,
+      [STAGED_STAGE_KEY]: input.stageId,
+    },
+    // Not indexed yet: this row is a stage, and the promotion is what makes it part of the index.
+    status: "PENDING",
   };
 }
 
-async function createDocument(handle: Database, input: MaterialiseInput, sourceId: string, entry: PreparedPath): Promise<string> {
-  const document = await handle.document.create({ data: { sourceId, ...documentData(input, entry) } });
+async function createStagedDocument(handle: Database, input: StageBatchInput, sourceId: string, entry: PreparedPath): Promise<string> {
+  const document = await handle.document.create({
+    data: { sourceId, ...documentData(input, entry), deletedAt: input.stagedAt },
+  });
   return document.id;
 }
 
-/** A changed digest replaces the path's chunks: the old ones describe text this tree no longer has. */
-async function replaceDocument(handle: Database, input: MaterialiseInput, documentId: string, entry: PreparedPath): Promise<string> {
-  await handle.chunk.deleteMany({ where: { documentId } });
-  await handle.document.update({ where: { id: documentId }, data: documentData(input, entry) });
-  return documentId;
-}
-
-async function insertChunks(handle: Database, input: MaterialiseInput, documentId: string, entry: PreparedPath): Promise<string[]> {
+async function insertChunks(handle: Database, input: StageBatchInput, documentId: string, entry: PreparedPath): Promise<string[]> {
   const owner = { documentId, path: entry.path, digest: entry.digest, projectId: input.projectId, scopeId: input.scopeId };
   const ids: string[] = [];
   for (const prepared of entry.chunks) {
@@ -608,42 +721,47 @@ function searchContentFor(path: string, chunk: Chunk): string {
   return [path, chunk.headingPath, chunk.sectionPath, chunk.content].filter(Boolean).join("\n").slice(0, SEARCH_CONTENT_LIMIT);
 }
 
-/**
- * Names each path's anchoring chunk. One statement for the whole generation: a published tree can
- * name thousands of paths, and one update per path would spend the transaction on round trips.
- */
-async function writeChunkAnchors(handle: Database, input: MaterialiseInput, anchors: ReadonlyArray<{ path: string; chunkId: string }>): Promise<void> {
-  if (anchors.length === 0) return;
+/** Drops the live documents of the given paths: the stage that rewrites them replaces their chunks. */
+async function dropLiveDocuments(handle: Database, sourceId: string, paths: readonly string[]): Promise<void> {
+  if (paths.length === 0) return;
   await handle.$executeRaw`
-    UPDATE "repo_index_paths" AS published
-    SET "chunkId" = anchor."chunkId", "updatedAt" = NOW()
-    FROM (
-      SELECT UNNEST(${anchors.map((anchor) => anchor.path)}::text[]) AS "path",
-             UNNEST(${anchors.map((anchor) => anchor.chunkId)}::text[]) AS "chunkId"
-    ) AS anchor
-    WHERE published."scopeId" = ${input.scopeId}
-      AND published."generationId" = ${input.generationId}
-      AND published."path" = anchor."path"
+    DELETE FROM "documents"
+    WHERE "sourceId" = ${sourceId} AND "deletedAt" IS NULL AND "externalId" = ANY(${[...paths]}::text[])
   `;
 }
 
 /** A path this manifest dropped must stop being searchable, or recall returns a file that is gone. */
-async function dropRemovedPaths(handle: Database, sourceId: string, paths: readonly SourcePath[], previous: readonly MaterialisedDocument[]): Promise<void> {
-  const kept = new Set(paths.map((entry) => entry.path));
-  const removed = previous.filter((row) => !kept.has(row.path)).map((row) => row.id);
-  if (removed.length > 0) await handle.document.deleteMany({ where: { id: { in: removed } } });
+async function retireUnlistedDocuments(handle: Database, sourceId: string, kept: readonly string[]): Promise<void> {
+  await handle.$executeRaw`
+    DELETE FROM "documents"
+    WHERE "sourceId" = ${sourceId} AND "deletedAt" IS NULL AND NOT ("externalId" = ANY(${[...kept]}::text[]))
+  `;
 }
 
-/** Drops what this generation no longer names, then keeps the source's counts honest about it. */
-async function retirePaths(handle: Database, sourceId: string, paths: readonly SourcePath[], previous: readonly MaterialisedDocument[]): Promise<void> {
-  await dropRemovedPaths(handle, sourceId, paths, previous);
-  await refreshSourceCounts(handle, sourceId);
+/**
+ * The visibility flip: the documents this stage wrote stop being deleted, and are indexed from this
+ * moment. The marker is the pair the stage wrote into their metadata, so a document another stage
+ * wrote - a concurrent one, or one that crashed - stays invisible instead of riding along.
+ */
+async function makeStagedLive(handle: Database, input: PromoteStagedInput): Promise<void> {
+  await handle.$executeRaw`
+    UPDATE "documents"
+    SET "deletedAt" = NULL, "status" = 'READY', "indexedAt" = NOW(), "updatedAt" = NOW()
+    WHERE "sourceId" = ${input.sourceId}
+      AND "deletedAt" IS NOT NULL
+      AND metadata->>${STAGED_GENERATION_KEY} = ${input.generationId}
+      AND metadata->>${STAGED_STAGE_KEY} = ${input.stageId}
+  `;
 }
 
-/** Keeps the scope's synthetic source honest about what it now holds. */
+/**
+ * Keeps the scope's synthetic source honest about what it now holds. Counts the live rows only: a
+ * staged document is not part of the index, and a count that included it would describe text no
+ * search could return.
+ */
 async function refreshSourceCounts(handle: Database, sourceId: string): Promise<void> {
-  const documentCount = await handle.document.count({ where: { sourceId } });
-  const chunkCount = await handle.chunk.count({ where: { document: { sourceId } } });
+  const documentCount = await handle.document.count({ where: { sourceId, deletedAt: null } });
+  const chunkCount = await handle.chunk.count({ where: { document: { sourceId, deletedAt: null } } });
   await handle.source.update({
     where: { id: sourceId },
     data: { documentCount, chunkCount, lastSyncAt: new Date(), status: "READY" },

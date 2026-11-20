@@ -25,13 +25,16 @@
  *   embed chunk text with a deterministic pseudo-vector instead of reaching for a model.
  *
  * What this file found at the pinned commit, and therefore asserts: the tree reads COMPLETE
- * (309 paths, 3.3 MB of blobs, no unsafe entry), and at the DOCUMENTED DEFAULT ceiling the run
- * REFUSES with MATERIALISE_REFUSED / CHUNK_LIMIT, because the tree materialises to more searchable
- * chunks than `MATERIALISE_LIMITS.maxChunksPerGeneration` allows. Nothing is published. The cases
- * whose premise is "the default refuses" delete `MATERIALISE_MAX_CHUNKS_ENV` for their duration and
- * restore it afterwards, so the premise holds whatever the ambient environment exports; the last
- * case sets the variable above the tree's plan and asserts the same run no longer refuses at the
- * ceiling at all.
+ * (hundreds of paths, megabytes of blobs, no unsafe entry), and at the DOCUMENTED DEFAULT ceiling
+ * the run REFUSES with MATERIALISE_REFUSED / CHUNK_LIMIT, because the tree materialises to more
+ * searchable chunks than `MATERIALISE_LIMITS.maxChunksPerGeneration` allows. Nothing is published.
+ * The cases whose premise is "the default refuses" delete `MATERIALISE_MAX_CHUNKS_ENV` for their
+ * duration and restore it afterwards, so the premise holds whatever the ambient environment exports.
+ *
+ * With the variable raised above the tree's plan the ceiling is no longer the obstacle, and the last
+ * two cases say what happens instead: the run no longer refuses at the ceiling, and the tree
+ * publishes end to end - staged in bounded transactions, promoted in one - after which a search
+ * through the production retriever returns a path git itself lists.
  */
 
 import assert from "node:assert/strict";
@@ -140,6 +143,8 @@ interface TreeFact {
   paths: string[];
   /** The same tree as path plus the sha256 of the blob read back from that commit. */
   entries: RefManifestEntry[];
+  /** The text of every blob at that commit, so a token can be located in the tree. */
+  contents: Map<string, string>;
   /** The largest blob by git's own size column, which is the largest blob a run reads. */
   largest: { path: string; bytes: number };
   /** Every blob's size added up, from git's own size column. */
@@ -151,6 +156,7 @@ async function treeOf(commit: string): Promise<TreeFact> {
   const listing = await git(["ls-tree", "-r", "-l", "--full-tree", commit]);
   const paths: string[] = [];
   const entries: RefManifestEntry[] = [];
+  const contents = new Map<string, string>();
   let largest = { path: "", bytes: 0 };
   let bytes = 0;
   for (const line of listing.split("\n")) {
@@ -158,12 +164,14 @@ async function treeOf(commit: string): Promise<TreeFact> {
     const tab = line.indexOf("\t");
     const size = Number(line.slice(0, tab).split(/\s+/)[3]);
     const path = line.slice(tab + 1);
+    const content = await blobAt(commit, path);
     paths.push(path);
     bytes += size;
     if (size > largest.bytes) largest = { path, bytes: size };
-    entries.push({ path, digest: sha256Of(await blobAt(commit, path)) });
+    contents.set(path, content);
+    entries.push({ path, digest: sha256Of(content) });
   }
-  return { paths, entries, largest, bytes };
+  return { paths, entries, contents, largest, bytes };
 }
 
 /** The searchable chunks one file contributes, decided exactly as materialise.ts decides it. */
@@ -221,6 +229,57 @@ function vectorsOf(entries: readonly RefManifestEntry[]): Map<string, number[]> 
 /** The embedding stage, replaced by a deterministic pseudo-vector per chunk text. */
 function deterministicEmbedder(): Embedder {
   return async (texts: string[]) => texts.map((text) => pseudoVector(`chunk:${text}`));
+}
+
+/**
+ * A word that appears in exactly one file of the tree, with that file: the answer a search must
+ * return, decided from the blobs rather than from anything a run wrote.
+ *
+ * The candidate is taken from a *searchable* chunk of a file - the same `chunkText` materialisation
+ * chunks with, and only the chunks it stores - so it is guaranteed to sit in a stored chunk's
+ * `searchContent`, and it is then verified to appear in no other file's text. A word of twelve
+ * letters or more is used because a shorter one is likely to appear in prose elsewhere.
+ */
+async function uniqueTokenOf(tree: TreeFact): Promise<{ token: string; path: string }> {
+  const wordsByPath = new Map<string, Set<string>>();
+  for (const [path, content] of tree.contents) wordsByPath.set(path, new Set(content.match(/[A-Za-z][A-Za-z]{11,}/g) ?? []));
+  for (const [path, content] of tree.contents) {
+    for (const chunk of chunkText(content, { filePath: path }).chunks) {
+      if (!chunk.searchable) continue;
+      for (const token of new Set(chunk.content.match(/[A-Za-z][A-Za-z]{11,}/g) ?? [])) {
+        const holders = [...wordsByPath].filter(([, words]) => words.has(token)).map(([holder]) => holder);
+        if (holders.length === 1 && holders[0] === path) return { token, path };
+      }
+    }
+  }
+  throw new Error("this tree holds no word unique to one file, so a search cannot be asserted to name one path");
+}
+
+/**
+ * The production search for published content: `retrieve`, the call POST /v1/context/query makes,
+ * with its lexical half only (`useVector: false`). The published chunk vectors are a deterministic
+ * pseudo-vector here, so a vector query would answer from a space nothing was embedded into; the
+ * text of the chunk is what decides this answer, and every hit carries the repository path the
+ * materialiser wrote into its metadata.
+ */
+async function searchPaths(projectId: string, query: string): Promise<Array<{ path: string; content: string }>> {
+  const { retrieve } = await import("../src/engine/retriever.js");
+  const answer = await retrieve({
+    projectId,
+    query,
+    retrievalProfile: "legacy",
+    useCache: false,
+    useVector: false,
+    hybridSearch: true,
+    topK: 5,
+    threshold: 0,
+    rerank: false,
+    compress: false,
+  });
+  return answer.results.map((entry: { metadata?: Record<string, unknown>; content?: string }) => ({
+    path: String(entry.metadata?.repo_path ?? ""),
+    content: String(entry.content ?? ""),
+  }));
 }
 
 /**
@@ -574,6 +633,117 @@ test("with the ceiling raised above the plan, the same run does not refuse at th
   );
   assert.equal((await client.repoIndexScope.findUniqueOrThrow({ where: { id: scope.id } })).activeGeneration, 0, "a transaction that expired published nothing");
   assert.equal(await client.repoIndexPath.count({ where: { scopeId: scope.id } }), 0, "and left no path row with it");
+});
+
+// Behaviour: with the ceiling raised above the plan, this repository publishes end to end and a
+// search through the production retriever returns a file git itself lists. The publication runs in
+// the two phases the plan requires - the stage, in bounded transactions outside the publish one,
+// and the promotion, in one short transaction - so the time is measured per phase: what used to be
+// a single transaction that outran its 30s budget is now a promote that does not touch a blob.
+test("with the ceiling raised above the plan, this repository publishes; the promotion is one short transaction", async (t) => {
+  const raised = 50_000;
+  const saved = process.env[MATERIALISE_MAX_CHUNKS_ENV];
+  t.after(() => {
+    if (saved === undefined) delete process.env[MATERIALISE_MAX_CHUNKS_ENV];
+    else process.env[MATERIALISE_MAX_CHUNKS_ENV] = saved;
+  });
+  process.env[MATERIALISE_MAX_CHUNKS_ENV] = String(raised);
+
+  const commit = await pinnedCommit();
+  const tree = await treeOf(commit);
+  // git's own answer, spelled the way the task that asked for this case spelled it.
+  const listing = await git(["ls-tree", "-r", "--full-tree", commit]);
+  const listedPaths = listing.split("\n").filter((line) => line !== "").map((line) => line.slice(line.indexOf("\t") + 1));
+  const { client, project, scope } = await fixtureScope();
+  const store = await import("../src/engine/repo-index/store.js");
+  const provider = createGitRefProvider({ repoDir: REPO_DIR });
+  const token = await uniqueTokenOf(tree);
+
+  // 1. The connector's own read of the pinned commit, and the attempt that declares it.
+  const readStarted = Date.now();
+  const ref = await readCommittedRef(provider, { ref: commit });
+  assert.equal(ref.outcome, REF_RUN_OUTCOME.COMPLETE, `the tree must read cleanly: ${ref.failure}`);
+  const vectors = vectorsOf(ref.manifest);
+  const manifest: AttemptManifest = {
+    digest: manifestDigest(ref.manifest),
+    dimensions: EMBEDDING_DIMENSIONS,
+    entries: ref.manifest.map((entry) => ({ ...entry, vector: vectors.get(entry.path) as number[] })),
+  };
+  const attemptId = randomUUID();
+  const partCount = Math.max(1, Math.ceil(manifest.entries.length / 500));
+  const opened = await store.openAttempt({ scopeId: scope.id, attemptId, baseGeneration: 0, revision: 1, manifestDigest: manifest.digest, partCount });
+  assert.equal(opened.code, "ATTEMPT_OPEN", `the attempt opens against a scope that published nothing: ${opened.code}`);
+  for (let partNo = 1; partNo <= partCount; partNo++) {
+    const upserts = manifest.entries.slice((partNo - 1) * 500, partNo * 500).map((entry) => entry.path);
+    const part = await store.putPart({ scopeId: scope.id, attemptId, partNo, part: { upserts, tombstones: [] } });
+    assert.equal(part.code, "PART_ACCEPTED", `part ${partNo} of ${partCount} is accepted: ${part.code}`);
+  }
+  const readMs = Date.now() - readStarted;
+
+  // 2. The stage: every blob read, chunked and embedded outside the transaction that publishes.
+  const stageStarted = Date.now();
+  const staged = await store.stageAttempt({
+    scopeId: scope.id,
+    attemptId,
+    manifest,
+    readContent: (path) => provider.readBlob(commit, path),
+    embed: deterministicEmbedder(),
+  });
+  const stagingMs = Date.now() - stageStarted;
+  assert.equal(staged.code, "STAGED", `the tree stages: ${JSON.stringify(staged)}`);
+  assert.ok(staged.staged, "a STAGED answer carries what it staged");
+  assert.equal(staged.staged.materialise.created, tree.paths.length, "every path of the tree is staged");
+  const stagedChunks = staged.staged.materialise.chunks;
+  assert.ok(stagedChunks > MATERIALISE_LIMITS.maxChunksPerGeneration, `the tree is above the documented default: ${stagedChunks} chunks`);
+
+  // Nothing staged is visible: the same search that finds the token after the promotion finds
+  // nothing now, though every chunk of the tree is already in the database.
+  assert.equal(await client.chunk.count({ where: { projectId: project.id } }), stagedChunks, "the stage wrote every chunk");
+  assert.deepEqual(await searchPaths(project.id, token.token), [], "and no search can return any of them yet");
+  assert.equal((await client.repoIndexScope.findUniqueOrThrow({ where: { id: scope.id } })).activeGeneration, 0, "the scope serves nothing");
+
+  // 3. The promotion: the fence, the path rows, the generation bump and the flip of the stage.
+  const promoteStarted = Date.now();
+  const published = await store.finalizeAttempt({
+    scopeId: scope.id,
+    attemptId,
+    requiredPaths: manifest.entries.map((entry) => entry.path),
+    manifest,
+    staged: staged.staged,
+  });
+  const promoteMs = Date.now() - promoteStarted;
+  const totalMs = readMs + stagingMs + promoteMs;
+  assert.ok(totalMs < RUN_BUDGET_MS, `the publication finished inside its budget, took ${totalMs}ms`);
+
+  assert.equal(published.code, "PUBLISHED", `the tree publishes: ${JSON.stringify(published)}`);
+  assert.equal(published.generation, 1, "the first publication is generation 1");
+  assert.deepEqual(published.materialise, staged.staged.materialise, "the publication reports what the stage wrote");
+
+  // 4. The served tree, path for path, against git's own listing.
+  assert.equal(await client.repoIndexPath.count({ where: { scopeId: scope.id, state: "present" } }), listedPaths.length, `every path git lists has a row: ${listedPaths.length}`);
+  const servedPaths = (await client.repoIndexPath.findMany({ where: { scopeId: scope.id }, select: { path: true } })).map(
+    (row: { path: string }) => row.path,
+  );
+  // Sorted here, in one collation: the database's ORDER BY and git's byte order disagree about
+  // punctuation, and this assertion is about which paths were published, not about how each sorts.
+  assert.deepEqual(servedPaths.sort(), [...listedPaths].sort(), "and the rows are git's paths");
+  assert.equal(await client.document.count({ where: { projectId: project.id, deletedAt: null } }), listedPaths.length, "one live document per path");
+  assert.equal(await client.document.count({ where: { projectId: project.id, deletedAt: { not: null } } }), 0, "nothing is left staged");
+  assert.equal(await client.chunk.count({ where: { projectId: project.id } }), stagedChunks, "the generation holds every chunk the stage wrote");
+
+  // 5. The search: the production retriever finds the token, and every path it names is one git
+  // lists verbatim. The file the token came from is among them, and the hit carries its text.
+  const hits = await searchPaths(project.id, token.token);
+  assert.ok(hits.length > 0, `the production search finds the published token ${token.token}`);
+  for (const hit of hits) assert.ok(listedPaths.includes(hit.path), `${hit.path} is a path of the pinned commit`);
+  assert.ok(hits.some((hit) => hit.path === token.path), `the file that holds ${token.token} is one of them: ${hits.map((hit) => hit.path).join(", ")}`);
+  assert.ok(hits.some((hit) => hit.content.includes(token.token)), "and the answer carries the text it matched");
+
+  t.diagnostic(
+    `published ${listedPaths.length} paths and ${stagedChunks} chunks: read+declare ${readMs}ms, staged ${stagingMs}ms, ` +
+      `promoted ${promoteMs}ms, ${totalMs}ms in total; "${token.token}" was found in ${token.path}`,
+  );
+  assert.ok(promoteMs < RUN_BUDGET_MS, `the promotion outran its budget: ${promoteMs}ms`);
 });
 
 after(async () => {

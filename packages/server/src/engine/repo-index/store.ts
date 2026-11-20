@@ -5,13 +5,20 @@
  * those rules need, asks them, and applies the answer in one transaction; it never
  * re-implements scope identity, digest identity, revocation or the base compare-and-swap.
  *
+ * A publication is two phases, because the work that materialises a tree does not fit in one
+ * transaction and must not hold the generation's row lock while it runs: `stageAttempt` reads,
+ * chunks and embeds the tree in bounded transactions that write rows nobody can see yet, and
+ * `finalizeAttempt` promotes them in the one short transaction that fences the attempt, writes the
+ * path rows and moves the scope's active generation. `finalizeAttempt` stages on its own when the
+ * caller does not hand it a stage, so a connector still makes one call.
+ *
  * Configuration: REPO_INDEX_CURSOR_SECRET signs and verifies the manifest cursors this module
  * issues. A production process refuses to load without a non-empty value, because the fallback
  * below is published in this file and would let a caller mint its own cursors; anywhere else the
  * local value keeps runs working without a secret.
  */
 
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { prisma } from "../../db/index.js";
 // The canonical payload hash is shared with request idempotency: one canonicalisation,
 // one digest algorithm, so a part's stored hash and an HTTP replay hash never disagree.
@@ -29,7 +36,19 @@ import {
   type ScopeState,
   type ScopeStatus,
 } from "./receipt.js";
-import { materialiseGeneration, retireUnlistedPaths, type ContentReader, type Embedder, type MaterialiseOutcome } from "./materialise.js";
+import {
+  discardStaged,
+  planMaterialisation,
+  promoteStaged,
+  retireUnlistedPaths,
+  scopeSourceName,
+  stageBatch,
+  type ContentReader,
+  type Embedder,
+  type MaterialiseOutcome,
+  type PreparedPath,
+  type StagedBatch,
+} from "./materialise.js";
 
 // The Prisma client generated for this worktree can predate the repo-index models
 // (`prisma generate` is not run here), so the database handle is narrowed once, in
@@ -78,6 +97,20 @@ const LOCK_TIMEOUT_MS = 5_000;
 /** Entries per write in finalize: 500 rows stay far below PostgreSQL's parameter limit. */
 const PATH_BATCH = 500;
 
+/**
+ * Paths one staging transaction carries. Staging runs outside the sealing transaction, so its
+ * batches are bounded by wall-clock instead of by what must be atomic: one batch is one
+ * transaction, and a batch of this size is far below the 30s budget even on a slow database.
+ */
+const STAGE_PATHS = 20;
+
+/**
+ * Chunk rows one staging transaction carries. A single file can hold thousands of chunks, so a
+ * batch closes on either bound; the file that crossed it is written alone rather than with a
+ * neighbour that would make one transaction carry two files' work.
+ */
+const STAGE_CHUNKS = 400;
+
 
 export const STORE_CODE = {
   OK: "OK",
@@ -93,6 +126,7 @@ export const STORE_CODE = {
   PART_CONFLICT: "PART_CONFLICT",
   PART_OUT_OF_RANGE: "PART_OUT_OF_RANGE",
   PARTS_MISSING: "PARTS_MISSING",
+  STAGED: "STAGED",
   PUBLISHED: "PUBLISHED",
   ABANDONED: "ABANDONED",
   ALREADY_ABANDONED: "ALREADY_ABANDONED",
@@ -211,6 +245,47 @@ export interface FinalizeInput {
    * was silently dropped, which is how a test embedder could look unused.
    */
   embed?: Embedder;
+  /**
+   * The materialisation an earlier `stageAttempt` staged for this attempt. Finalize stages its own
+   * when the caller names none, which is what a connector does; naming one is how a caller stages,
+   * inspects what readers see in between, and only then promotes.
+   */
+  staged?: StagedPublication;
+}
+
+/**
+ * The materialisation one stage wrote, ready to be promoted. It names the generation and the stage
+ * that own the rows - only those become visible - and the chunk every manifest path anchors, so the
+ * promotion can write the path rows without reading anything.
+ */
+export interface StagedPublication {
+  scopeId: string;
+  attemptId: string;
+  generationId: string;
+  stageId: string;
+  /** The scope's source the rows were staged into, or null when nothing had to be written. */
+  sourceId: string | null;
+  /** The paths this stage wrote documents and chunks for; empty when every path was reused. */
+  stagedPaths: string[];
+  /** The chunk each manifest path anchors, reused from the served generation or written by this stage. */
+  anchors: ReadonlyMap<string, string>;
+  /** What this stage wrote, in the form a publication reports. */
+  materialise: MaterialiseOutcome;
+}
+
+export interface StageInput {
+  scopeId: string;
+  attemptId: string;
+  manifest: AttemptManifest;
+  readContent: ContentReader;
+  embed?: Embedder;
+}
+
+export interface StageResult {
+  code: StoreCode;
+  generationId?: string;
+  missingParts?: number[];
+  staged?: StagedPublication;
 }
 
 export interface FinalizeResult {
@@ -434,25 +509,151 @@ async function invalidatePublishedProject(scopeId: string, result: FinalizeResul
 }
 
 /**
+ * Stages the materialisation of one open attempt: reads, chunks and embeds what the generation must
+ * write, and stores it in bounded batches, each its own transaction. Nothing it writes is visible -
+ * a staged document carries `deletedAt`, which every query that returns a chunk filters on - so this
+ * runs before the fence, outside the transaction that publishes, and a refused or abandoned attempt
+ * leaves the generation readers see untouched.
+ *
+ * The refusals a plan raises (unreadable content, an unusable vector, the chunk ceiling) are thrown
+ * before the first row is written; the refusals an attempt raises are answered as codes, because the
+ * fence will answer them again under its row lock.
+ */
+export async function stageAttempt(input: StageInput): Promise<StageResult> {
+  const scope = (await db.repoIndexScope.findUnique({ where: { id: input.scopeId } })) as ScopeRow | null;
+  if (!scope) return { code: STORE_CODE.SCOPE_NOT_FOUND };
+  if (!isScopeReadable(scopeState(scope))) return { code: scopeRefusalCode(scope.state) };
+  const attempt = await loadGeneration(input.scopeId, input.attemptId);
+  if (!attempt) return { code: STORE_CODE.ATTEMPT_NOT_FOUND };
+  if (attempt.status !== "open") return { code: STORE_CODE.ATTEMPT_FENCED, generationId: attempt.id };
+  const missingParts = await missingPartNumbers(db, attempt);
+  if (missingParts.length > 0) return { code: STORE_CODE.PARTS_MISSING, generationId: attempt.id, missingParts };
+
+  const plan = await planMaterialisation(db, {
+    scopeId: input.scopeId,
+    projectId: scope.projectId,
+    paths: input.manifest.entries.map((entry) => ({ path: entry.path, digest: entry.digest })),
+    readContent: input.readContent,
+    embed: input.embed,
+  });
+  const stageId = randomUUID();
+  const stagedAt = new Date();
+  const anchors = new Map<string, string>(plan.reuse.map((entry) => [entry.path, entry.chunkIds[0]]));
+  let sourceId = plan.sourceId;
+  for (const paths of stageBatches(plan.pending)) {
+    const batch = (await prisma.$transaction(
+      (tx: Transaction) =>
+        stageBatch(tx, {
+          scopeId: input.scopeId,
+          projectId: scope.projectId,
+          orgId: scope.orgId,
+          generationId: attempt.id,
+          stageId,
+          stagedAt,
+          paths,
+        }),
+      TRANSACTION,
+    )) as StagedBatch;
+    sourceId = batch.sourceId;
+    for (const anchor of batch.anchors) anchors.set(anchor.path, anchor.chunkId);
+  }
+  return {
+    code: STORE_CODE.STAGED,
+    generationId: attempt.id,
+    staged: {
+      scopeId: input.scopeId,
+      attemptId: input.attemptId,
+      generationId: attempt.id,
+      stageId,
+      sourceId,
+      stagedPaths: plan.pending.map((entry) => entry.path),
+      anchors,
+      materialise: {
+        reused: plan.reuse.length,
+        created: plan.pending.length,
+        chunks: plan.pending.reduce((total, entry) => total + entry.chunks.length, 0),
+      },
+    },
+  };
+}
+
+/**
+ * Splits a plan's pending paths into the batches staging writes, one transaction each. A batch
+ * closes on either bound, so one large file still gets a transaction of its own instead of sharing
+ * one with everything before it.
+ */
+function* stageBatches(pending: readonly PreparedPath[]): Generator<PreparedPath[]> {
+  let batch: PreparedPath[] = [];
+  let chunks = 0;
+  for (const entry of pending) {
+    batch.push(entry);
+    chunks += entry.chunks.length;
+    if (batch.length < STAGE_PATHS && chunks < STAGE_CHUNKS) continue;
+    yield batch;
+    batch = [];
+    chunks = 0;
+  }
+  if (batch.length > 0) yield batch;
+}
+
+/**
  * Publishes an attempt: every declared part must be present, then the fence decides in
  * one transaction that either writes the active generation, the path rows and the
  * receipt, or writes nothing but the attempt's failure code.
  *
  * The attempt row is locked first, so an abandon that read the same status cannot commit
  * between the fence's decision and the seal: one of the two writes sees the other's outcome.
+ *
+ * The materialisation is staged before this call and only made visible here: the transaction that
+ * publishes does the fence, the path rows, the generation bump and the flip that turns the staged
+ * rows into the index, and nothing that reads a tree.
  */
 export async function finalizeAttempt(input: FinalizeInput): Promise<FinalizeResult> {
+  const staged = await stagedFor(input);
   try {
-    const result = await prisma.$transaction((tx: Transaction) => publish(tx, input), TRANSACTION);
+    const result = await prisma.$transaction((tx: Transaction) => publish(tx, input, staged), TRANSACTION);
     await invalidatePublishedProject(input.scopeId, result);
+    // A stage that did not become the publication is dropped once no transaction holds its rows.
+    // The rows were never visible, so this only decides whether they linger.
+    await discardUnpublishedStage(staged);
     return result;
   } catch (error) {
     // The seal found the attempt no longer open. Its transaction rolls back with the throw, so a
     // fenced attempt never leaves a bumped generation, new paths or a half-written receipt behind.
-    if (error instanceof FencedAttempt) return { code: STORE_CODE.ATTEMPT_FENCED, generationId: error.generationId };
+    if (error instanceof FencedAttempt) {
+      await discardUnpublishedStage(staged);
+      return { code: STORE_CODE.ATTEMPT_FENCED, generationId: error.generationId };
+    }
     // A transaction that queued too long for a row lock is contention, not a broken request.
-    if (isLockTimeout(error)) return { code: STORE_CODE.LOCK_TIMEOUT };
+    if (isLockTimeout(error)) {
+      await discardUnpublishedStage(staged);
+      return { code: STORE_CODE.LOCK_TIMEOUT };
+    }
     throw error;
+  }
+}
+
+/**
+ * The materialisation this call promotes: the one the caller staged, or a fresh stage of its own.
+ * A stage that answered a refusal is not an answer to this call - the fence decides under its row
+ * lock and answers with the same refusal - so it is dropped here and `publish` refuses to seal.
+ */
+async function stagedFor(input: FinalizeInput): Promise<StagedPublication | null> {
+  if (input.staged) return input.staged;
+  const readContent = input.readContent;
+  if (!readContent) return null;
+  const answer = await stageAttempt({ scopeId: input.scopeId, attemptId: input.attemptId, manifest: input.manifest, readContent, embed: input.embed });
+  return answer.code === STORE_CODE.STAGED ? (answer.staged ?? null) : null;
+}
+
+/** Drops the rows of a stage that will not be published; best effort, because they are invisible. */
+async function discardUnpublishedStage(staged: StagedPublication | null): Promise<void> {
+  if (!staged?.sourceId) return;
+  try {
+    await discardStaged(db, { sourceId: staged.sourceId, generationId: staged.generationId, stageId: staged.stageId });
+  } catch {
+    // The rows are invisible whether or not this cleanup lands, and a failure here must not replace
+    // the answer the publication already produced.
   }
 }
 
@@ -463,7 +664,7 @@ class FencedAttempt extends Error {
   }
 }
 
-async function publish(tx: Transaction, input: FinalizeInput): Promise<FinalizeResult> {
+async function publish(tx: Transaction, input: FinalizeInput, staged: StagedPublication | null): Promise<FinalizeResult> {
   await boundLockWaits(tx);
   const scope = (await tx.repoIndexScope.findUnique({ where: { id: input.scopeId } })) as ScopeRow | null;
   if (!scope) return { code: STORE_CODE.SCOPE_NOT_FOUND };
@@ -477,6 +678,11 @@ async function publish(tx: Transaction, input: FinalizeInput): Promise<FinalizeR
 
   const missingParts = await missingPartNumbers(tx, attempt);
   if (missingParts.length > 0) return { code: STORE_CODE.PARTS_MISSING, generationId: attempt.id, missingParts };
+
+  // The publication declared materialisation (it carries a reader) and none was staged for it. The
+  // seal must not happen: a generation whose chunks do not exist would answer searches with nothing.
+  if (input.readContent && !staged) throw new UnstagedPublication(attempt.id);
+  if (staged && (staged.generationId !== attempt.id || staged.scopeId !== input.scopeId)) throw new UnstagedPublication(attempt.id);
 
   const promotion = promoteAttempt({
     active: scopeState(scope),
@@ -498,48 +704,57 @@ async function publish(tx: Transaction, input: FinalizeInput): Promise<FinalizeR
   });
   if (claimed.count === 0) return fence(tx, attempt, await lostClaim(tx, input.scopeId));
 
-  await writePaths(tx, attempt, input);
+  await writePaths(tx, attempt, input, staged?.anchors);
+  await settleMaterialisation(tx, input, scope, staged);
   const published = await seal(tx, attempt);
-  const materialised = await materialise(tx, scope, attempt, input);
-  return materialised ? { ...published, materialise: materialised } : published;
+  return staged ? { ...published, materialise: staged.materialise } : published;
 }
 
 /**
- * Turns the generation this transaction just sealed into searchable rows, in this same transaction.
- * A refusal (content that cannot be read, an unusable vector, a generation above its chunk ceiling -
- * `MATERIALISE_LIMITS`, or the variable that raises it) throws, so the seal, the generation bump and
- * the path rows roll back together: no generation is ever visible while half its chunks are missing,
- * and the generation it replaced stays current.
- *
- * A publication without a reader still owes the deletion half. The paths its manifest no longer
- * names stop being searchable, whether or not anything was read: that half needs no content, so a
- * metadata-only publication drops here - in this transaction - instead of being skipped with the
- * rest, and a refused publication rolls the drop back with everything else.
- *
- * The embedder is passed on rather than defaulted here: materialiseGeneration owns the production
- * default, so a caller that injects one is answered by it instead of by a second choice in the store.
- * The outcome it returns is what this publication really wrote; without a reader there is none.
+ * A publication that declared materialisation reached the seal with none: a bug of this module, not
+ * of the caller. Thrown rather than answered so the transaction rolls back and the attempt stays
+ * open, instead of sealing a generation whose contents search could never return.
  */
-async function materialise(
+class UnstagedPublication extends Error {
+  constructor(readonly generationId: string) {
+    super(`the publication reached the seal without the materialisation it declared: ${generationId}`);
+  }
+}
+
+/**
+ * Applies the visibility half of a publication in the transaction that publishes it.
+ *
+ * A publication without a reader still owes the deletion half: the paths its manifest no longer
+ * names stop being searchable, whether or not anything was read. That half needs no content, so a
+ * metadata-only publication drops here - in this transaction - and a refused publication rolls the
+ * drop back with everything else.
+ *
+ * A staged publication hands over the rows its stage wrote, which become live here or not at all.
+ * The outcome it reports is what this publication really wrote; without a reader there is none.
+ */
+async function settleMaterialisation(
   tx: Transaction,
-  scope: ScopeRow,
-  attempt: GenerationRow,
   input: FinalizeInput,
-): Promise<MaterialiseOutcome | undefined> {
+  scope: ScopeRow,
+  staged: StagedPublication | null,
+): Promise<void> {
   const paths = input.manifest.entries.map((entry) => ({ path: entry.path, digest: entry.digest }));
+  if (staged) {
+    // No source means this scope never materialised anything and this stage had nothing to write:
+    // there is no row to make visible and none to retire.
+    if (!staged.sourceId) return;
+    await promoteStaged(tx, {
+      sourceId: staged.sourceId,
+      generationId: staged.generationId,
+      stageId: staged.stageId,
+      staged: staged.stagedPaths,
+      kept: paths.map((entry) => entry.path),
+    });
+    return;
+  }
   if (!input.readContent) {
     await retireUnlistedPaths(tx, { scopeId: input.scopeId, projectId: scope.projectId, paths });
-    return undefined;
   }
-  return materialiseGeneration(tx, {
-    scopeId: input.scopeId,
-    generationId: attempt.id,
-    projectId: scope.projectId,
-    orgId: scope.orgId,
-    paths,
-    readContent: input.readContent,
-    embed: input.embed,
-  });
 }
 
 function settledFailure(attempt: GenerationRow): FinalizeResult {
@@ -576,8 +791,16 @@ async function missingPartNumbers(tx: Transaction, attempt: GenerationRow): Prom
  * instead of one upsert per entry, because a 10,000-entry manifest must not become 10,000 round
  * trips inside one transaction. Path identity is (scopeId, path), so the row keeps its meaning;
  * only its synthetic id is renewed.
+ *
+ * The anchoring chunk comes from the stage: a path is named before its rows are visible, so the row
+ * this writes already points at the chunk the same commit makes searchable.
  */
-async function writePaths(tx: Transaction, attempt: GenerationRow, input: FinalizeInput): Promise<void> {
+async function writePaths(
+  tx: Transaction,
+  attempt: GenerationRow,
+  input: FinalizeInput,
+  anchors: ReadonlyMap<string, string> | undefined,
+): Promise<void> {
   const generationId = attempt.id;
   const rows = input.manifest.entries.map((entry) => ({
     scopeId: input.scopeId,
@@ -586,7 +809,7 @@ async function writePaths(tx: Transaction, attempt: GenerationRow, input: Finali
     digest: entry.digest,
     lineStart: entry.lineStart ?? null,
     lineEnd: entry.lineEnd ?? null,
-    chunkId: entry.chunkId ?? null,
+    chunkId: anchors?.get(entry.path) ?? entry.chunkId ?? null,
     state: "present",
     // createMany is not a create, so the @updatedAt column is filled here rather than by the client.
     updatedAt: new Date(),
@@ -703,10 +926,35 @@ async function fence(tx: Transaction, attempt: GenerationRow, code: StoreCode, d
  */
 export async function abandonAttempt(input: { scopeId: string; attemptId: string }): Promise<AbandonResult> {
   try {
-    return await prisma.$transaction((tx: Transaction) => abandonInTransaction(tx, input), TRANSACTION);
+    const result = await prisma.$transaction((tx: Transaction) => abandonInTransaction(tx, input), TRANSACTION);
+    if (result.code === STORE_CODE.ABANDONED) await discardAbandonedStage(input, result.generationId);
+    return result;
   } catch (error) {
     if (isLockTimeout(error)) return { code: STORE_CODE.LOCK_TIMEOUT };
     throw error;
+  }
+}
+
+/**
+ * Drops what an abandoned attempt had staged. The attempt can no longer publish, so no stage of it
+ * will ever become visible; the rows are removed once the transaction that fenced it has committed,
+ * and a failure here is not an answer about the abandonment itself.
+ */
+async function discardAbandonedStage(input: { scopeId: string; attemptId: string }, generationId: string | undefined): Promise<void> {
+  if (!generationId) return;
+  try {
+    const scope = (await db.repoIndexScope.findUnique({ where: { id: input.scopeId }, select: { projectId: true } })) as
+      | { projectId: string }
+      | null;
+    if (!scope) return;
+    const source = (await db.source.findFirst({
+      where: { projectId: scope.projectId, name: scopeSourceName(input.scopeId) },
+      select: { id: true },
+    })) as { id: string } | null;
+    if (!source) return;
+    await discardStaged(db, { sourceId: source.id, generationId });
+  } catch {
+    // Nothing was visible to begin with, so an abandoned attempt is still abandoned.
   }
 }
 

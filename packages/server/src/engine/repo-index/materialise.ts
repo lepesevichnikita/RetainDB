@@ -753,6 +753,10 @@ function stagedChunkMetadata(input: StageBatchInput, chunk: StagedChunk): string
     repo_scope_id: input.scopeId,
     repo_path: chunk.path,
     repo_digest: chunk.digest,
+    // The generation that wrote this text. The document carries it too, but a search answer is built
+    // from the CHUNK, so the chunk must carry it, or the answer cannot be labelled without reading a
+    // path row that a later publication moves - which is the race this key exists to avoid.
+    [STAGED_GENERATION_KEY]: input.generationId,
   });
 }
 

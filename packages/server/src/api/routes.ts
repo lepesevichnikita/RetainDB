@@ -1013,7 +1013,7 @@ async function repositoryAttributionOf(
   const byGeneration = generationIds.length === 0 ? [] : await prisma.$queryRaw<Array<{ id: string; scopeId: string; generation: number; revision: string }>>`
     SELECT g.id, g."scopeId" AS "scopeId", g.generation, g.revision
     FROM repo_index_generations g
-    WHERE g.id = ANY(${generationIds}::uuid[])
+    WHERE g.id = ANY(${generationIds}::text[])
   `;
   const generationById = new Map(byGeneration.map((row) => [row.id, row]));
 

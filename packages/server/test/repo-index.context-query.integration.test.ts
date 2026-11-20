@@ -283,6 +283,13 @@ test("the route answers a published repository path with its path, digest, gener
   assert.equal(hit.metadata.repo_scope_id, scope.id);
   assert.equal(hit.metadata.repo_path, TARGET, "the chunk metadata carries the published path");
   assert.equal(hit.metadata.repo_digest, digestOf(TREE[0].content), "and the digest of the blob it was materialised from");
+  // The chunk must name the generation that wrote its text. Without this key the route can only label
+  // an answer by reading the path row, which a later publication moves - so a hit built from generation
+  // 1 would be reported as generation 2. This is what makes the label independent of the path row, and
+  // it fails if the key is ever dropped from the chunk metadata again.
+  assert.ok(hit.metadata.repo_index_generation_id,
+    `the chunk names its own generation: ${JSON.stringify(Object.keys(hit.metadata))}`);
+  assert.equal(hit.repository?.generation, 1, "and the reported generation is the first publication");
   assert.ok(hit.content.includes("flux capacitor"), `the answer carries the text it matched: ${hit.content}`);
   assert.match(answer.body.context, /flux capacitor/, "the packed context a client forwards carries the text");
 

@@ -312,6 +312,36 @@ test("the route answers a published repository path with its path, digest, gener
 // deployment credential is refused before validation or retrieval, and a caller with it but an
 // empty query reaches the route's schema and is refused there. These are the two error answers a
 // client has to handle before it can consume a single result.
+/**
+ * Behaviour: the route's DEFAULT request must answer. The schema declares use_vector defaulting to
+ * true, so a client that says nothing about vectors is asking for them - and every other case in this
+ * file happens to pass use_vector:false, which is why the default was never exercised. With no
+ * embedder available in this environment, the default used to raise an opaque 500 ("Internal Server
+ * Error", not even JSON). It must instead answer from the lexical half and say the answer is partial,
+ * because a client that cannot tell a partial answer from a complete one will trust it.
+ */
+test("the default request answers without an embedder and says the answer is partial", { timeout: 180_000 }, async () => {
+  const { project, scope } = await fixture();
+  const published = await publish({ scopeId: scope.id, files: TREE });
+  assert.equal(published.code, "PUBLISHED", `the tree is published: ${JSON.stringify(published)}`);
+
+  // Built here rather than through ask(): ask() hardcodes use_vector:false, which is exactly how the
+  // default escaped notice. This body omits the field, which is what a client sends.
+  const { api } = await import("../src/api/routes.js");
+  const response = await api.request("/v1/context/query", {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${credential}` },
+    body: JSON.stringify({ project: project.id, query: QUERY, top_k: 5, threshold: 0, use_cache: false, rerank: false }),
+  });
+  const answer = { status: response.status, body: (await response.json()) as any };
+  assert.equal(answer.status, 200, `the default request is answered, not a 500: ${JSON.stringify(answer.body).slice(0, 300)}`);
+  assert.ok(Array.isArray(answer.body.results), "the response is the documented shape");
+
+  // The embedder is unavailable here, so the answer must be marked partial rather than silently short.
+  assert.equal(answer.body.meta?.timing?.embedding_unavailable, true,
+    `the answer says the vector half was skipped: ${JSON.stringify(answer.body.meta?.timing)}`);
+});
+
 test("the query route refuses a caller without the credential and a body its schema rejects", { timeout: 180_000 }, async () => {
   const { api } = await import("../src/api/routes.js");
   const body = JSON.stringify({ project: randomUUID(), query: QUERY, use_vector: false, rerank: false });

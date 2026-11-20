@@ -134,6 +134,8 @@ export interface ContextResponse {
     timing?: {
       cache_check_ms?: number;
       embed_ms?: number;
+      /** True when the embedder could not be reached, so this answer came from the lexical half only. */
+      embedding_unavailable?: boolean;
       oracle_ms?: number;
       vector_ms?: number;
       fts_ms?: number;
@@ -336,7 +338,20 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
   const tEmbed = Date.now();
   const oracleActive = shouldEnableOracle({ query, oracleMode, chunkTypes, metadataFilter });
   const needsEmbedding = useVector || includeMemories || includeGraph || oracleActive;
-  let queryEmbedding = needsEmbedding ? await embedSingle(query) : [];
+  // The route declares use_vector defaulting to true, so a client that says nothing about vectors is
+  // asking for them. If the embedder is unavailable that must not become a 500 - it becomes a lexical
+  // answer, and the caller is told the answer is partial rather than left to believe it is complete.
+  let embeddingUnavailable: string | null = null;
+  let queryEmbedding: number[] = [];
+  if (needsEmbedding) {
+    try {
+      queryEmbedding = await embedSingle(query);
+    } catch (error) {
+      embeddingUnavailable = (error as Error).message;
+      console.warn(`[Retriever] embeddings unavailable, answering without the vector half: ${embeddingUnavailable}`);
+      timing.embedding_unavailable = true;
+    }
+  }
   timing.embed_ms = Date.now() - tEmbed;
   const codebaseIntent = precisionV1Enabled
     ? await classifyCodebaseIntent({
@@ -444,7 +459,7 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
   }
 
   // ─── Memory Search ───────────────────────────────────────
-  if (includeMemories) {
+  if (includeMemories && embeddingUnavailable === null) {
     const tMem = Date.now();
     // Personal queries ("what do I prefer", "my name", "do you remember me")
     // dominate the result set — give them the full topK budget plus extra headroom.

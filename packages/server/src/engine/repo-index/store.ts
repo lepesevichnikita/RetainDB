@@ -26,6 +26,7 @@ import { hashIdempotencyPayload } from "../../api/idempotency.js";
 import { clearCacheByPattern } from "../cache.js";
 import {
   PROMOTION_OUTCOME,
+  baseRefusal,
   isScopeReadable,
   promoteAttempt,
   scopeRefusal,
@@ -519,6 +520,9 @@ async function invalidatePublishedProject(scopeId: string, result: FinalizeResul
  * The refusals a plan raises (unreadable content, an unusable vector, the chunk ceiling) are thrown
  * before the first row is written; the refusals an attempt raises are answered as codes, because the
  * fence will answer them again under its row lock.
+ *
+ * A declared base the scope has already left is answered as a code before the plan is made at all:
+ * nothing this stage could write would ever be sealed, so nothing is read.
  */
 export async function stageAttempt(input: StageInput): Promise<StageResult> {
   const scope = (await db.repoIndexScope.findUnique({ where: { id: input.scopeId } })) as ScopeRow | null;
@@ -527,6 +531,14 @@ export async function stageAttempt(input: StageInput): Promise<StageResult> {
   const attempt = await loadGeneration(input.scopeId, input.attemptId);
   if (!attempt) return { code: STORE_CODE.ATTEMPT_NOT_FOUND };
   if (attempt.status !== "open") return { code: STORE_CODE.ATTEMPT_FENCED, generationId: attempt.id };
+  // The seal compares the declared base with the active generation, so an attempt whose base has
+  // already moved can never publish. Asking here costs one read of the scope row - the same row
+  // read above, in the same order - and saves the whole tree: reading it, chunking it, embedding
+  // it and writing every chunk of it, all of which the fence would answer SUPERSEDED_BASE to and
+  // throw away. The seal keeps its own comparison as the authority: a publication can commit
+  // between this read and that one, and only the compare inside the sealing transaction sees it.
+  const superseded = baseRefusal(scopeState(scope), attemptReceipt(attempt));
+  if (superseded) return { code: superseded, generationId: attempt.id };
   const missingParts = await missingPartNumbers(db, attempt);
   if (missingParts.length > 0) return { code: STORE_CODE.PARTS_MISSING, generationId: attempt.id, missingParts };
 
@@ -723,11 +735,10 @@ async function publish(tx: Transaction, input: FinalizeInput, staged: StagedPubl
   const missingParts = await missingPartNumbers(tx, attempt);
   if (missingParts.length > 0) return { code: STORE_CODE.PARTS_MISSING, generationId: attempt.id, missingParts };
 
-  // The publication declared materialisation (it carries a reader) and none was staged for it. The
-  // seal must not happen: a generation whose chunks do not exist would answer searches with nothing.
-  if (input.readContent && !staged) throw new UnstagedPublication(attempt.id);
-  if (staged && (staged.generationId !== attempt.id || staged.scopeId !== input.scopeId)) throw new UnstagedPublication(attempt.id);
-
+  // The fence decides before the materialisation is judged: a publication it refuses needs no
+  // staged rows, and a caller whose stage was itself refused for the same reason (a base that had
+  // already moved) has none to offer. Judging the stage first would turn that refusal into a bug
+  // report about the module.
   const promotion = promoteAttempt({
     active: scopeState(scope),
     attempt: attemptReceipt(attempt),
@@ -735,6 +746,11 @@ async function publish(tx: Transaction, input: FinalizeInput, staged: StagedPubl
     requiredPaths: input.requiredPaths,
   });
   if (promotion.outcome !== PROMOTION_OUTCOME.PROMOTED) return fence(tx, attempt, promotion.outcome);
+
+  // The publication declared materialisation (it carries a reader) and none was staged for it. The
+  // seal must not happen: a generation whose chunks do not exist would answer searches with nothing.
+  if (input.readContent && !staged) throw new UnstagedPublication(attempt.id);
+  if (staged && (staged.generationId !== attempt.id || staged.scopeId !== input.scopeId)) throw new UnstagedPublication(attempt.id);
 
   const undeclared = await undeclaredDrops(tx, attempt, input);
   if (undeclared.length > 0) return fence(tx, attempt, STORE_CODE.UNDECLARED_DROP, { undeclaredDrops: undeclared });

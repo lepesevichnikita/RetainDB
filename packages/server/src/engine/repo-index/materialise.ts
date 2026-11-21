@@ -563,8 +563,10 @@ function tokenEstimate(content: string): number {
  *
  * Three writes, in this order, so that nothing is visible before the flip: the live documents of
  * the paths this stage rewrote are dropped, every live document the manifest no longer names is
- * dropped, and only then do the staged documents become live. A reader sees the generation it saw
- * before the commit, or the whole new one after it - never both halves of a replaced file.
+ * dropped, and only then do the staged documents become live - and only those the manifest keeps,
+ * so the flip and the retirement agree on what the generation contains. A reader sees the
+ * generation it saw before the commit, or the whole new one after it - never both halves of a
+ * replaced file, and never a file the commit dropped.
  */
 export async function promoteStaged(handle: Database, input: PromoteStagedInput): Promise<void> {
   await dropLiveDocuments(handle, input.sourceId, input.staged);
@@ -836,6 +838,13 @@ async function retireUnlistedDocuments(handle: Database, sourceId: string, kept:
  * The visibility flip: the documents this stage wrote stop being deleted, and are indexed from this
  * moment. The marker is the pair the stage wrote into their metadata, so a document another stage
  * wrote - a concurrent one, or one that crashed - stays invisible instead of riding along.
+ *
+ * The paths are the third marker, and they are what makes this agree with the retirement that ran
+ * just before it. The stage is materialisation for the manifest it was planned from; the seal
+ * declares its own, and a caller can stage one tree and then seal a manifest that keeps fewer paths
+ * (the fence compares the digest the attempt declared, not the entry list). Retirement has already
+ * decided that a path the manifest dropped is gone, so flipping it here would make a file
+ * searchable that no path row names. What the commit keeps is what may go live.
  */
 async function makeStagedLive(handle: Database, input: PromoteStagedInput): Promise<void> {
   await handle.$executeRaw`
@@ -843,6 +852,7 @@ async function makeStagedLive(handle: Database, input: PromoteStagedInput): Prom
     SET "deletedAt" = NULL, "status" = 'READY', "indexedAt" = NOW(), "updatedAt" = NOW()
     WHERE "sourceId" = ${input.sourceId}
       AND "deletedAt" IS NOT NULL
+      AND "externalId" = ANY(${[...input.kept]}::text[])
       AND metadata->>${STAGED_GENERATION_KEY} = ${input.generationId}
       AND metadata->>${STAGED_STAGE_KEY} = ${input.stageId}
   `;

@@ -133,7 +133,12 @@ export function scopeRefusal(status: ScopeStatus): PromotionOutcome | undefined 
   return status === "withdrawn" ? PROMOTION_OUTCOME.SCOPE_WITHDRAWN : PROMOTION_OUTCOME.SCOPE_REVOKED;
 }
 
-function baseRefusal(active: ScopeState, attempt: AttemptReceipt): PromotionOutcome | undefined {
+/**
+ * The base-generation refusal, exported because the seal is not the only place that can answer it:
+ * staging asks the same question before it reads a tree, so a publication that can never be sealed
+ * does not read, chunk, embed and write it first.
+ */
+export function baseRefusal(active: ScopeState, attempt: AttemptReceipt): PromotionOutcome | undefined {
   if (attempt.baseGeneration === active.generation) return undefined;
   return attempt.baseGeneration < active.generation
     ? PROMOTION_OUTCOME.SUPERSEDED_BASE

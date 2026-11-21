@@ -9,9 +9,12 @@
  *   generation it served before, a search returns that generation's text and nothing from the
  *   stage, and the path rows have not moved;
  * - the promotion is what makes the stage visible, in one commit, along with the path rows that
- *   name it;
+ *   name it, and only for the paths that commit keeps;
  * - a stage that never promotes - because the fence refused it, or because the attempt was
- *   abandoned - leaves the last good generation searchable and leaves no row behind.
+ *   abandoned - leaves the last good generation searchable and leaves no row behind;
+ * - a stage whose declared base has already moved is refused before it reads a single blob, and
+ *   the seal still compares the base under its row lock, which is what catches a publication that
+ *   commits between the stage and the promotion.
  *
  * The searches go through `engine/retriever.ts` `retrieve`, the call POST /v1/context/query makes,
  * with its lexical half only (`useVector: false`): the published chunk text holds the token and the
@@ -108,7 +111,7 @@ async function manifestOf(tree: readonly TreeFile[], attemptId: string) {
  * Declares one attempt for one tree: opens it against the generation the scope serves now, and
  * stores the single part that names every path it upserts. Nothing is published yet.
  */
-async function declare(client: any, scope: any, tree: readonly TreeFile[], options: { baseGeneration?: number } = {}) {
+async function declare(client: any, scope: any, tree: readonly TreeFile[], options: { baseGeneration?: number; tombstones?: readonly string[] } = {}) {
   const store = await import(storePath);
   const { EMBEDDING_DIMENSIONS } = await import(receiptPath);
   const attemptId = randomUUID();
@@ -128,12 +131,13 @@ async function declare(client: any, scope: any, tree: readonly TreeFile[], optio
     scopeId: scope.id,
     attemptId,
     partNo: 1,
-    part: { upserts: tree.map((file) => file.path), tombstones: [] },
+    part: { upserts: tree.map((file) => file.path), tombstones: [...(options.tombstones ?? [])] },
   });
   assert.equal(part.code, "PART_ACCEPTED", `the one part is accepted: ${part.code}`);
   const byPath = new Map(tree.map((file) => [file.path, file.content] as const));
   return {
     attemptId,
+    generationId: opened.generationId as string,
     manifest,
     requiredPaths: tree.map((file) => file.path),
     readContent: async (path: string) => byPath.get(path) as string,
@@ -171,8 +175,8 @@ async function promote(client: any, scope: any, declared: Awaited<ReturnType<typ
 }
 
 /** Stages and promotes in one call, which is what a connector does, and asserts it published. */
-async function publishTree(client: any, scope: any, tree: readonly TreeFile[]) {
-  const declared = await declare(client, scope, tree);
+async function publishTree(client: any, scope: any, tree: readonly TreeFile[], options: { tombstones?: readonly string[] } = {}) {
+  const declared = await declare(client, scope, tree, options);
   const staged = await stage(client, scope, declared);
   const published = await promote(client, scope, declared, staged);
   assert.equal(published.code, "PUBLISHED", `the tree publishes: ${JSON.stringify(published)}`);
@@ -205,6 +209,12 @@ async function search(projectId: string, query: string): Promise<string[]> {
 async function servedPaths(client: any, scopeId: string): Promise<string[]> {
   const rows = await client.repoIndexPath.findMany({ where: { scopeId, state: "present" }, orderBy: { path: "asc" } });
   return rows.map((row: { path: string }) => row.path);
+}
+
+/** Every document a search can return in this project, in path order: what the flip made visible. */
+async function livePaths(client: any, projectId: string): Promise<string[]> {
+  const rows = await client.document.findMany({ where: { projectId, deletedAt: null }, orderBy: { externalId: "asc" } });
+  return rows.map((row: { externalId: string | null }) => String(row.externalId));
 }
 
 /** The documents a search can see, and the ones a stage wrote and nobody may: both counted. */
@@ -271,32 +281,117 @@ test("a search between staging and promotion sees the generation it replaces, no
   assert.deepEqual(await documentCounts(client, project.id), { live: 3, staged: 0 }, "nothing is left staged");
 });
 
-// Behaviour: the fence still decides, and it decides after the work is staged. An attempt declared
-// against a generation that has already moved is refused, so the stage it wrote never becomes
-// visible, the scope keeps serving the generation it had, and the rows of the refused stage are
-// gone rather than left behind as a document nothing can read.
-test("a stage the fence refuses leaves the last good generation searchable and nothing behind", async () => {
+// Behaviour: the fence decides before the work, not after it. The case this replaces measured the
+// refusal only once the whole tree had been read, chunked, embedded and written - and then threw
+// all of it away. An attempt declared against a generation that has already moved can never be
+// sealed, so the stage asks the same question the fence asks, once, before it reads anything.
+test("a stage declared against a base that has already moved is refused before it reads anything", async () => {
   const { client, project, scope } = await fixture();
   const first = await publishTree(client, scope, [KEEPER, CHANGED_BEFORE]);
   assert.equal(first.generation, 1);
 
-  // Declared against generation 0 while the scope serves generation 1: the base has moved, so the
-  // fence answers SUPERSEDED_BASE - but only after this stage has written everything it has.
+  // Declared against generation 0 while the scope serves generation 1: the base has moved.
   const declared = await declare(client, scope, [KEEPER, CHANGED_AFTER, FRESH], { baseGeneration: 0 });
-  const staged = await stage(client, scope, declared);
-  assert.deepEqual(await documentCounts(client, project.id), { live: 2, staged: 2 }, "the refused attempt staged its rows first");
+  const store = await import(storePath);
+  let reads = 0;
+  const refused = await store.stageAttempt({
+    scopeId: scope.id,
+    attemptId: declared.attemptId,
+    manifest: declared.manifest,
+    readContent: async (path: string) => {
+      reads += 1;
+      return declared.readContent(path);
+    },
+    embed: declared.embed,
+  });
+  assert.equal(refused.code, "SUPERSEDED_BASE", `the stage refuses the stale base: ${JSON.stringify(refused)}`);
+  assert.equal(refused.generationId, declared.generationId, "and names the attempt it refused");
+  assert.equal(refused.staged, undefined, "a refused stage hands back no materialisation");
+  assert.equal(reads, 0, `no blob of the tree was read: ${reads}`);
+  assert.deepEqual(await documentCounts(client, project.id), { live: 2, staged: 0 }, "the refused attempt staged nothing");
+  assert.equal(await client.chunk.count({ where: { projectId: project.id } }), 2, "and wrote no chunk of its own");
 
-  const refused = await promote(client, scope, declared, staged);
-  assert.equal(refused.code, "SUPERSEDED_BASE", `the fence refuses the stale base: ${JSON.stringify(refused)}`);
-  assert.equal(refused.generationId, staged.generationId, "and names the attempt it refused");
+  // Finalize answers the same refusal, so the cheap pre-check did not change what a caller is told.
+  const fenced = await promote(client, scope, declared, undefined);
+  assert.equal(fenced.code, "SUPERSEDED_BASE", `the fence refuses the stale base: ${JSON.stringify(fenced)}`);
+  assert.equal(fenced.generationId, declared.generationId, "and names the attempt it refused");
 
   const after = await client.repoIndexScope.findUniqueOrThrow({ where: { id: scope.id } });
   assert.equal(after.activeGeneration, 1, "the scope still serves the generation it served");
   assert.deepEqual(await search(project.id, TOKEN.before), ["src/changed.ts"], "which is still searchable");
   assert.deepEqual(await search(project.id, TOKEN.after), [], "and the refused stage is not");
   assert.deepEqual(await search(project.id, TOKEN.fresh), [], "not even the path it would have added");
-  assert.deepEqual(await documentCounts(client, project.id), { live: 2, staged: 0 }, "the refused stage left no row behind");
+  assert.deepEqual(await documentCounts(client, project.id), { live: 2, staged: 0 }, "the refused publication left no row behind");
   assert.equal(await client.chunk.count({ where: { projectId: project.id } }), 2, "and no chunk of its own");
+});
+
+// Behaviour: the cheap pre-check must never replace the compare-and-swap. A base that is current
+// when the stage runs can be superseded by a publication that commits before this one finalizes:
+// the stage is legitimate at the base it declared, the promotion is not, and only the seal - which
+// compares the base under its row lock - can answer that.
+test("a publication that commits between the stage and its promotion is refused by the compare-and-swap", async () => {
+  const { client, project, scope } = await fixture();
+  await publishTree(client, scope, [KEEPER, CHANGED_BEFORE]);
+
+  const declared = await declare(client, scope, [KEEPER, CHANGED_AFTER, FRESH]);
+  const staged = await stage(client, scope, declared);
+  assert.deepEqual(await documentCounts(client, project.id), { live: 2, staged: 2 }, "the stage is legitimate at the base it declared");
+
+  // Another writer publishes generation 2 in between, so nothing re-reads the base before the seal.
+  // It declares the tombstone that drops the path the fixture tree no longer contains.
+  const winner = await publishTree(client, scope, [KEEPER, FRESH], { tombstones: [CHANGED_BEFORE.path] });
+  const moved = await client.repoIndexScope.findUniqueOrThrow({ where: { id: scope.id } });
+  assert.equal(moved.activeGeneration, winner.generation, "the interleaved publication moved the scope");
+  assert.ok(moved.activeGeneration > 1, `and moved it past the base this stage declared: ${moved.activeGeneration}`);
+
+  const refused = await promote(client, scope, declared, staged);
+  assert.equal(refused.code, "SUPERSEDED_BASE", `the seal refuses the base that moved under it: ${JSON.stringify(refused)}`);
+  assert.equal(refused.generationId, staged.generationId, "and names the attempt it refused");
+
+  const after = await client.repoIndexScope.findUniqueOrThrow({ where: { id: scope.id } });
+  assert.equal(after.activeGeneration, moved.activeGeneration, "the winner keeps serving its generation");
+  assert.deepEqual(await search(project.id, TOKEN.fresh), ["src/fresh.ts"], "which is searchable");
+  assert.deepEqual(await search(project.id, TOKEN.after), [], "and the stage the seal refused never was");
+  assert.deepEqual(await servedPaths(client, scope.id), ["src/fresh.ts", "src/keeper.ts"], "the served tree is the winner's");
+  assert.deepEqual(await documentCounts(client, project.id), { live: 2, staged: 0 }, "the refused stage left no row behind");
+});
+
+// Behaviour: the flip and the retirement agree on which paths go live. A caller can stage one tree
+// and then seal a manifest that keeps fewer paths: the fence compares the digest the attempt
+// declared, not the entry list, so the publication is accepted. Retirement then decides the
+// dropped path is gone while the flip would still make its staged document visible - a searchable
+// file that no path row names. What the manifest kept is what may go live.
+test("a staged path the sealed manifest no longer keeps does not go live", async () => {
+  const { client, project, scope } = await fixture();
+  await publishTree(client, scope, [KEEPER, CHANGED_BEFORE]);
+
+  // The stage writes two paths: the changed one and the new one.
+  const declared = await declare(client, scope, [KEEPER, CHANGED_AFTER, FRESH]);
+  const staged = await stage(client, scope, declared);
+  assert.deepEqual(staged.stagedPaths, [CHANGED_AFTER.path, FRESH.path], "both rewritten paths are staged");
+
+  // The manifest sealed below keeps the changed path and drops the new one; its digest is the one
+  // the attempt declared, so the fence accepts it.
+  const store = await import(storePath);
+  const sealed = { ...declared.manifest, entries: declared.manifest.entries.filter((entry) => entry.path !== FRESH.path) };
+  const promoted = await store.finalizeAttempt({
+    scopeId: scope.id,
+    attemptId: declared.attemptId,
+    requiredPaths: [KEEPER.path, CHANGED_AFTER.path],
+    manifest: sealed,
+    readContent: declared.readContent,
+    embed: declared.embed,
+    staged,
+  });
+  assert.equal(promoted.code, "PUBLISHED", `the fence accepts the manifest it declared: ${JSON.stringify(promoted)}`);
+
+  assert.deepEqual(await search(project.id, TOKEN.after), ["src/changed.ts"], "a path the manifest kept is searchable");
+  assert.deepEqual(await search(project.id, TOKEN.keeper), ["src/keeper.ts"], "and so is the reused one");
+  assert.deepEqual(await search(project.id, TOKEN.fresh), [], "a path it dropped is not, even though the stage had written it");
+  // The invariant behind that answer: every live document is named by a path row of the generation.
+  assert.deepEqual(await servedPaths(client, scope.id), ["src/changed.ts", "src/keeper.ts"], "the path rows name what the manifest kept");
+  assert.deepEqual(await livePaths(client, project.id), ["src/changed.ts", "src/keeper.ts"], "and no live document lies outside them");
+  assert.deepEqual(await documentCounts(client, project.id), { live: 2, staged: 0 }, "the dropped stage row is collected, not left invisible");
 });
 
 // Behaviour: abandoning an attempt between its stage and its promotion is the recovery a crash

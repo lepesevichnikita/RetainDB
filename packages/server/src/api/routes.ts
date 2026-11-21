@@ -1187,6 +1187,9 @@ api.post(
         compression: result.meta.compression,
         profile: result.meta.profile || "balanced",
         retrieval_profile: result.meta.retrievalProfile,
+        // Which halves of the answer were consulted, and why not when they were not: a client that
+        // receives the fused order instead of a reranked one has to be able to tell.
+        degraded: result.meta.degraded,
         region: DEPLOY_REGION,
         consistency_state: consistencyState,
         timing: result.meta.timing,

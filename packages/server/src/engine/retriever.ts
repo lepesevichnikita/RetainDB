@@ -334,6 +334,10 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
           profile: RETRIEVAL_PROFILE,
           retrievalProfile,
           sourceFamily,
+          // Only a complete answer is ever stored (see the write below), so a hit cannot be degraded.
+          // It says so rather than omitting the field: a client reading `degraded.reasons` on every
+          // answer must not have to tell "nothing was lost" from "the field is missing".
+          degraded: { reranked: true, reasons: [] },
           timing,
         },
       };
@@ -605,7 +609,13 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
   // re-checked: a partial one would keep presenting itself as complete, and would keep doing it after
   // the embedder recovered. Not writing it costs one recomputation per repeated question during an
   // outage and lets the next one be answered in full the moment the embedder is back.
-  if (cacheResults && allResults.length > 0 && embeddingUnavailable === null) {
+  //
+  // A degraded answer is partial for the same reason and is stored by the same rule: the fused order
+  // is what a reader gets when the reranker could not be consulted, and a stored copy would keep
+  // saying so only in a field nobody re-reads - the reranker may be healthy long before the entry
+  // expires. `degradedReasons` is empty for every answer that lost nothing, so the rule cannot drift
+  // into "never cache".
+  if (cacheResults && allResults.length > 0 && embeddingUnavailable === null && degradedReasons.length === 0) {
     const tSet = Date.now();
     await setCache(projectId, cacheParams, allResults, cacheTtlSeconds);
     timing.cache_set_ms = Date.now() - tSet;

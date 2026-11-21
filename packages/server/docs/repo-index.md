@@ -352,14 +352,19 @@ reading, chunking, embedding or inserting:
 
 1. **Plan.** `planMaterialisation` reads the live documents of the served generation, decides which
    paths are reused and which must be rewritten, and reads, chunks and embeds those. It writes
-   nothing, so every refusal it raises happens before the first row exists.
+   nothing, so every refusal it raises happens before the first row exists. A declared base the
+   scope has already left (`SUPERSEDED_BASE`, `MISMATCHED_BASE`) is answered before the plan is
+   made: the fence could never seal that attempt, so its tree is never read. The seal keeps its own
+   comparison as the authority, because a publication can commit between the two.
 2. **Stage.** `store.stageAttempt` writes that plan in batches, **one transaction per batch**
    (`STAGE_PATHS` 20 paths or `STAGE_CHUNKS` 400 chunks, whichever comes first; a single large file
    gets a transaction of its own). Each batch is far below the 30s budget on its own, so a tree that
    would never fit in one transaction is written in many.
 3. **Promote.** `store.finalizeAttempt` runs the fence, the path rows, the generation bump and the
    flip that makes the staged rows live, in one short transaction (`TRANSACTION` in `store.ts`,
-   unchanged at `maxWait` 10s / `timeout` 30s).
+   unchanged at `maxWait` 10s / `timeout` 30s). The flip is restricted to the paths the manifest
+   being sealed keeps, so it cannot make a path live that the retirement pass in the same
+   transaction has just decided to drop.
 
 **A staged row is invisible.** A staged document carries `deletedAt`, which is the rule the read
 path already applies: every query that returns a chunk joins `documents` with `deletedAt IS NULL`

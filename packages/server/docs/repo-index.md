@@ -8,8 +8,8 @@ client that produces the metadata is documented separately in
 Unreleased, and not verified end to end. The migration has been applied to a real PostgreSQL 16
 with pgvector 0.8.7 (75 tables, including all five `repo_index_*` tables), and the DB-gated tests
 now execute against a database instead of skipping: with `RETAINDB_TEST_DATABASE_URL` pointing at
-that database and `RETAINDB_TEST_LOCAL_EMBEDDINGS=true`, the full server suite reports 327 tests,
-327 pass, 0 fail, 0 skipped. Both variables are needed: without the second, the embedding-backed
+that database and `RETAINDB_TEST_LOCAL_EMBEDDINGS=true`, the full server suite reports 349 tests,
+349 pass, 0 fail, 0 skipped. Both variables are needed: without the second, the embedding-backed
 cases skip, and a skipped case is not a passing one. Read
 [Operational status](#operational-status) before relying on any of it.
 
@@ -295,9 +295,9 @@ a programming error, not a refusal.
 | `GRANT_MISSING` | 403 | no token, unknown token, wrong kind, or revoked grant | route |
 | `SCOPE_NOT_FOUND` | 404 | no such scope in this org | store |
 | `SCOPE_NOT_ACTIVE` | 409 | the admin grant route's answer for any non-active scope; the store keeps it as its fallback for a state it cannot classify | route, store |
-| `SCOPE_PAUSED` | 409 | the scope is paused | fence |
-| `SCOPE_WITHDRAWN` | 403 | the scope was withdrawn | fence |
-| `SCOPE_REVOKED` | 403 | the scope's state is not one the store knows | fence |
+| `SCOPE_PAUSED` | 409 | the scope is paused | fence, store |
+| `SCOPE_WITHDRAWN` | 403 | the scope was withdrawn | fence, store |
+| `SCOPE_REVOKED` | 403 | the scope's state is not one the store knows | fence, store |
 | `ATTEMPT_NOT_FOUND` | 404 | no such attempt id in this scope | store |
 | `ATTEMPT_CONFLICT` | 409 | the attempt id exists with a different declaration, or a re-finalize presents another manifest | store |
 | `ATTEMPT_FENCED` | 409 | the attempt is published, abandoned or failed | store |
@@ -372,10 +372,12 @@ leaves the last good generation exactly as it was, and the attempt can still be 
 - **One synthetic source per scope**, named `repo-index:<scopeId>`, type `repo_index`, created
   under the scope's project with `config.repo_scope_id`. It is created by the first stage batch
   that needs one - never by a publication that only reuses what it has, and never by the
-  metadata-only drop. It is visible in the project's source list, which is the recorded trade-off:
-  a shared source would make two repositories in one project indistinguishable. Nothing is written
-  to `memories`, `sessions` or `messages`, so repository text cannot be recalled as conversation
-  memory.
+  metadata-only drop. Two stages of one scope can need it at the same moment, so the row is
+  inserted with `skipDuplicates` (`ON CONFLICT DO NOTHING`) and read back: a unique violation
+  aborts the staging transaction, and the read that recovers from it could not run there. It is
+  visible in the project's source list, which is the recorded trade-off: a shared source would make
+  two repositories in one project indistinguishable. Nothing is written to `memories`, `sessions` or
+  `messages`, so repository text cannot be recalled as conversation memory.
 - **One document per path**, keyed by `externalId = path` with `contentHash = digest`, plus
   `path`, `title`, `content` and `metadata.repo_scope_id` / `repo_path` / `repo_digest`. A staged
   document additionally carries `metadata.repo_index_generation_id` and
@@ -413,8 +415,21 @@ Atomicity is the promotion's job, and only the promotion's: the fence, the path 
 of what the tree replaced and the flip of the staged rows commit together or not at all. No
 generation becomes visible while half its chunks are missing - a half-staged generation is not
 visible at all - and the generation it replaced stays current until the commit that replaces it.
+
 A stage that never promotes is dropped (`discardStaged`): an abandonment does it for the attempt it
-fences, and a publication drops the stage it made whenever it did not become the generation.
+fences, and a publication drops the stage it made whenever it did not become the generation. The
+targeted discard only knows the generation it was told about, so `sweepStaleStages` follows it from
+both paths: one bounded statement (`SWEEP_DOCUMENTS`, 200 documents per call) that removes staged
+rows of the same source whose generation is no longer `open` - a batch a crashed writer landed after
+its abandonment's discard had run, or a second stage of an attempt that was staged twice. Those rows
+can never be promoted, and they were invisible to every query, so nothing else would ever count or
+remove them. A cleanup that fails is logged (`[repo-index] ... staged rows were not discarded`) and
+does not change the answer the caller already has.
+
+A scope that becomes unreadable between the stage and the seal is answered by the stage's own
+refusal (`SCOPE_PAUSED`, `SCOPE_WITHDRAWN`, `SCOPE_REVOKED`), not as a store failure: the finalize
+does not open the seal's transaction for it, and the attempt stays open, because a refusal is not a
+fence.
 
 ### A cached answer does not outlive the change it describes
 
@@ -440,18 +455,27 @@ that project should answer:
   the content: `visibleSourceSql` in `engine/retriever.ts` excludes a chunk whose document belongs to
   a `repo_index` source whose scope `isScopeReadable` refuses (any state but `active`, so paused too),
   inside the scoped set - the rows are filtered before `LIMIT k` takes its `k`, so a hidden row cannot
-  occupy a slot a visible one should have answered. So a withdrawn scope is invisible to a search,
+  occupy a slot a visible one should have answered. The oracle path asks the same tables, so
+  `engine/oracle-visibility.ts` applies the same rule there (`/v1/oracle/search`, its seed selection,
+  its document listing and its tree gate), and staged documents are excluded by `deletedAt` on both.
+  So a withdrawn scope is invisible to a search,
   cached or not, while every row it published remains in the database. Pause and resume change that
   state and nothing else: a paused scope is not readable either, and resuming makes it readable again.
-  Neither clears the cache the way a withdrawal does, so an answer cached while the scope was active
-  can still be served until its 300-second TTL runs out.
+  All three transitions clear the project's cached answers, because each changes what the same
+  question must answer afterwards: without the clear a withdrawal would keep a withdrawn path
+  visible, a pause would keep answering from the answer computed while the scope was active, and a
+  resume would keep the repository content out of the answer cached while the scope was paused for
+  the cache's full 300 seconds.
 - **A grant revocation** (`POST /v1/repo-index/admin/scopes/:scopeId/grants/:grantId/revoke`). The
   tree is untouched - a credential is not content - so the recomputed answer still finds it, but
   the answers cached under the previous grant are gone.
 
 `test/repo-index.search-cache.integration.test.ts` pins each direction through the real publish
 transaction and the real admin routes, in one process, against the cache the earlier search filled.
-Its withdrawal case asserts the pair that matters: the uncached search answers nothing, and the
+`test/repo-index.context-query.integration.test.ts` pins the same rule through `/v1/context/query`,
+including the resume half: an answer cached while the scope was paused is gone once it resumes, and
+the repository content is part of the answer again. The search-cache file's withdrawal case asserts
+the pair that matters: the uncached search answers nothing, and the
 `source`, `document`, `chunk` and `repo_index_paths` counts read straight from the tables are the
 same before and after the withdrawal. `test/scoped-vector-search.integration.test.ts` pins the reason
 the filter is in the SQL and not after the fetch: with the withdrawn scope holding the nearest vector,
@@ -604,8 +628,8 @@ It created 75 tables, including all five `repo_index_*` tables: `repo_index_scop
 `repo_index_grants`, `repo_index_generations`, `repo_index_parts` and `repo_index_paths`. With
 that database attached, the DB-gated tests execute instead of skipping.
 
-**The suite is green.** The full server suite, run with the database attached, reports 327 tests:
-327 pass, 0 fail, 0 skipped. A green run is still not the same as verified end to end, but one
+**The suite is green.** The full server suite, run with the database attached, reports 349 tests:
+349 pass, 0 fail, 0 skipped. A green run is still not the same as verified end to end, but one
 specific gap has now closed: `repo-index.publish.integration.test.ts` drives a real on-disk git
 repository through the on-disk provider and `runCommittedRef`, publishes a generation, and then
 finds a published path with an actual pgvector nearest-neighbour query that resolves the hit back
@@ -637,7 +661,7 @@ force, so the vectors are the injected ones and the search is the retriever's le
 
 So: the enrolment surface, the fence, the cursor signing, the chunk partitioning and the run's
 decision logic are covered by tests that do not need a database. Tests that need rows now execute
-against a real PostgreSQL, and the full suite is green: 327 of 327 pass. Treat the feature as
+against a real PostgreSQL, and the full suite is green: 349 of 349 pass. Treat the feature as
 unreleased and not verified end to end: a publication has now been materialised and found by a
 pgvector query over its stored vectors, but with an injected deterministic embedder and against the
 store rather than through the HTTP query route, so the deployed search path remains unproven. The

@@ -697,6 +697,59 @@ test("a vector search cannot consume refuses the run and publishes nothing", asy
   assert.deepEqual((await servedPaths(db, scope.id)).map((row: any) => [row.path, row.chunkId]), before.map((row: any) => [row.path, row.chunkId]));
 });
 
+// Behaviour: a scope paused between the upload and the seal is a refusal about the scope, not a
+// broken store. The run must answer with the scope's own code (STORE_REFUSED carrying SCOPE_PAUSED)
+// instead of STORE_FAILED, which blames the database for an operator's pause; and the tree the scope
+// served before stays exactly as it was.
+test("a pause during a publication is a scope refusal, not a store failure", async () => {
+  const repo = await sharedRepo();
+  const { db, scope } = await fixtureScope();
+  const tree = await treeAt(repo.repoDir, "refs/heads/main");
+  const published = await committedRefRun({ repoDir: repo.repoDir, scopeId: scope.id, vectors: tree.vectors });
+  assert.equal(published.result.code, RUN_CODE.PUBLISHED, "the fixture scope serves a generation");
+  const served = await servedPaths(db, scope.id);
+
+  // The pause lands after every part is accepted and before the seal, which is the window an
+  // operator's pause actually hits. The store is the real one; only the accepted part is observed.
+  const store = await realStore();
+  const pausing = {
+    ...store,
+    putPart: async (input: Parameters<PublicationStore["putPart"]>[0]) => {
+      const answer = await store.putPart(input);
+      await db.repoIndexScope.update({ where: { id: scope.id }, data: { state: "paused" } });
+      return answer;
+    },
+  };
+  const { PROMOTION_OUTCOME } = await import("../src/engine/repo-index/receipt.js");
+  const refused = await runCommittedRef({
+    provider: createGitRefProvider({ repoDir: repo.repoDir }),
+    request: { ref: "refs/heads/main" },
+    context: {
+      scopeId: scope.id,
+      attemptId: randomUUID(),
+      baseGeneration: published.result.generation as number,
+      revision: (published.result.generation as number) + 1,
+      vectors: tree.vectors,
+    },
+    store: pausing,
+  });
+
+  assert.notEqual(refused.code, RUN_CODE.STORE_FAILED, `a pause is not a store failure: ${refused.failure}`);
+  assert.equal(refused.code, RUN_CODE.STORE_REFUSED, `the run refuses on the store's answer: ${JSON.stringify(refused)}`);
+  assert.equal(refused.storeCode, PROMOTION_OUTCOME.SCOPE_PAUSED, "and the code is the scope's own");
+  assert.equal(refused.failure, null, "a refusal is not a failure with a message");
+
+  const scopeAfter = await db.repoIndexScope.findUniqueOrThrow({ where: { id: scope.id } });
+  assert.equal(scopeAfter.activeGeneration, published.result.generation, "nothing was published into a paused scope");
+  assert.equal(scopeAfter.state, "paused", "and the run did not resume it");
+  assert.deepEqual((await servedPaths(db, scope.id)).map((row: any) => [row.path, row.chunkId]), served.map((row: any) => [row.path, row.chunkId]));
+  assert.equal(
+    await db.document.count({ where: { projectId: scope.projectId, deletedAt: { not: null } } }),
+    0,
+    "and the pause left no staged row behind",
+  );
+});
+
 /** Every table this file writes to, counted for the rows it created. */
 async function countsOf(client: any) {
   return {

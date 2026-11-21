@@ -339,6 +339,214 @@ test("an attempt abandoned after staging drops its stage and leaves the served g
 });
 
 /**
+ * A transaction handle whose first `source` statement waits until `parties` handles have reached
+ * theirs. Only that first statement is held, so the handle fixes the interleaving - both
+ * transactions are inside their batch when they ask about the scope's source - and passes every
+ * statement and every answer through unchanged afterwards.
+ */
+function openingTogether(parties: number) {
+  let arrived = 0;
+  let release = (): void => {};
+  const allArrived = new Promise<void>((resolve) => (release = resolve));
+  return (handle: any) => {
+    let opened = false;
+    const source = new Proxy(handle.source, {
+      get(target, method) {
+        const call = Reflect.get(target, method);
+        if (typeof call !== "function") return call;
+        return async (...args: any[]) => {
+          if (!opened) {
+            opened = true;
+            arrived += 1;
+            if (arrived === parties) release();
+            await allArrived;
+          }
+          return call.apply(target, args);
+        };
+      },
+    });
+    return new Proxy(handle, {
+      get(target, property) {
+        const value = property === "source" ? source : Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  };
+}
+
+// Behaviour: the first publication of a scope creates its source, and two stages of one scope can
+// reach that creation together. `sources` holds one row per (project, scope name), so one of the two
+// inserts is a unique violation - and a unique violation inside `prisma.$transaction` aborts the
+// transaction, which is why the loser cannot read the row the winner wrote and recover. Both stages
+// must finish: the scope has one source and both batches' rows are there.
+test("two concurrent first-stage batches of one scope both create its source", async () => {
+  const { client, project, scope } = await fixture();
+  const tree = [KEEPER, FRESH];
+  const { plan } = await plannedBatch(tree, scope.id, project.id);
+  assert.equal(plan.sourceId, null, "the scope has never materialised anything");
+  const materialise = await import(materialisePath);
+  const { prisma } = await import("../src/db/index.js");
+  const owner = { scopeId: scope.id, projectId: project.id, orgId: "default" };
+  const opening = openingTogether(2);
+
+  // Two real transactions, one staging batch each, both inside their batch when they ask about the
+  // source. Nothing is retried and nothing waits on a clock: the gate only orders the two arrivals.
+  const batch = (generationId: string) =>
+    prisma.$transaction((tx: any) =>
+      materialise.stageBatch(opening(tx), { ...owner, generationId, stageId: randomUUID(), stagedAt: new Date(), paths: plan.pending }),
+    );
+  const answers = await Promise.allSettled([batch(randomUUID()), batch(randomUUID())]);
+
+  assert.deepEqual(
+    answers.map((answer) => answer.status),
+    ["fulfilled", "fulfilled"],
+    `both first-time stages succeed: ${answers
+      .map((answer) => (answer.status === "rejected" ? String(answer.reason?.message ?? answer.reason) : "fulfilled"))
+      .join(" | ")}`,
+  );
+  const staged = answers.map((answer) => (answer as PromiseFulfilledResult<any>).value);
+  assert.equal(staged[0].sourceId, staged[1].sourceId, "both batches name the one source of the scope");
+  assert.equal(
+    await client.source.count({ where: { projectId: project.id, name: materialise.scopeSourceName(scope.id) } }),
+    1,
+    "the scope has exactly one source",
+  );
+  assert.equal(await client.document.count({ where: { projectId: project.id, deletedAt: { not: null } } }), 4, "both batches wrote both documents");
+  assert.equal(await client.chunk.count({ where: { projectId: project.id } }), 4, "and both wrote both chunks");
+});
+
+// Behaviour: a pause that lands between the declaration and the seal is a refusal about the scope,
+// not a broken publication. The answer is the scope's own code, the attempt stays open - a refusal
+// is not a fence - and no row of the stage it did not make is left behind.
+test("a scope paused before the seal answers with its own refusal and leaves the attempt open", async () => {
+  const { client, project, scope } = await fixture();
+  await publishTree(client, scope, [KEEPER]);
+  const declared = await declare(client, scope, [CHANGED_AFTER, FRESH]);
+  await client.repoIndexScope.update({ where: { id: scope.id }, data: { state: "paused" } });
+
+  const store = await import(storePath);
+  const { PROMOTION_OUTCOME } = await import(receiptPath);
+  const refused = await store.finalizeAttempt({
+    scopeId: scope.id,
+    attemptId: declared.attemptId,
+    requiredPaths: declared.requiredPaths,
+    manifest: declared.manifest,
+    readContent: declared.readContent,
+    embed: declared.embed,
+  });
+
+  assert.equal(refused.code, PROMOTION_OUTCOME.SCOPE_PAUSED, `a paused scope answers with its own refusal: ${JSON.stringify(refused)}`);
+  const attempt = await client.repoIndexGeneration.findFirstOrThrow({ where: { scopeId: scope.id, attemptId: declared.attemptId } });
+  assert.equal(attempt.status, "open", "a refusal is not a fence: the attempt can still be published or abandoned");
+  assert.equal(attempt.failureCode, null, "and it carries no failure code");
+  assert.deepEqual(await documentCounts(client, project.id), { live: 1, staged: 0 }, "the pause wrote no stage that lingers");
+  assert.deepEqual(await servedPaths(client, scope.id), ["src/keeper.ts"], "and the path rows the scope serves have not moved");
+  // A paused scope is not readable by design - the retriever skips it - so what it serves is checked
+  // again once it is resumed: the pause must not have deleted anything.
+  await client.repoIndexScope.update({ where: { id: scope.id }, data: { state: "active" } });
+  assert.deepEqual(await search(project.id, TOKEN.keeper), ["src/keeper.ts"], "and the generation the scope serves is untouched");
+});
+
+// Behaviour: a stage written by an attempt that never came back is garbage once that attempt
+// publishes. Its documents, chunks and vectors are invisible to every query, so nothing counts them
+// and nothing removes them unless a publication sweeps what it did not promote. The retry below is
+// the same attempt staged twice - the shape a crash between committing a batch and sealing leaves -
+// and one publication is what has to collect the abandoned half.
+test("a stage a crashed attempt left behind is swept when that attempt publishes", async () => {
+  const { client, project, scope } = await fixture();
+  const declared = await declare(client, scope, [KEEPER, FRESH]);
+  await stage(client, scope, declared);
+  assert.deepEqual(await documentCounts(client, project.id), { live: 0, staged: 2 }, "the crashed stage committed its rows");
+
+  const retried = await stage(client, scope, declared);
+  const published = await promote(client, scope, declared, retried);
+  assert.equal(published.code, "PUBLISHED", `the retry publishes: ${JSON.stringify(published)}`);
+  assert.deepEqual(await documentCounts(client, project.id), { live: 2, staged: 0 }, "the crashed stage's documents are gone");
+  assert.equal(
+    await client.chunk.count({ where: { projectId: project.id, document: { deletedAt: { not: null } } } }),
+    0,
+    "and so are its chunks and vectors",
+  );
+  assert.deepEqual(await search(project.id, TOKEN.fresh), ["src/fresh.ts"], "the published tree is searchable");
+});
+
+// Behaviour: a writer that was staging when its attempt was abandoned lands one more batch after the
+// abandonment committed. That batch can never be promoted - its generation is abandoned - so it is
+// garbage the targeted discard already ran ahead of. The next abandonment on the scope has to sweep
+// what the first one could not see.
+test("a batch that lands after its attempt was abandoned is swept by the next abandonment", async () => {
+  const { client, project, scope } = await fixture();
+  const first = await declare(client, scope, [KEEPER]);
+  const second = await declare(client, scope, [FRESH]);
+  const store = await import(storePath);
+  const abandoned = await store.abandonAttempt({ scopeId: scope.id, attemptId: first.attemptId });
+  assert.equal(abandoned.code, "ABANDONED");
+  assert.ok(abandoned.generationId, "the abandonment names the generation it fenced");
+
+  // The late batch: a stage of the abandoned generation, written after its discard had run.
+  const { plan } = await plannedBatch([KEEPER], scope.id, project.id);
+  const materialise = await import(materialisePath);
+  const { prisma } = await import("../src/db/index.js");
+  await prisma.$transaction((tx: any) =>
+    materialise.stageBatch(tx, {
+      scopeId: scope.id,
+      projectId: project.id,
+      orgId: "default",
+      generationId: abandoned.generationId as string,
+      stageId: randomUUID(),
+      stagedAt: new Date(),
+      paths: plan.pending,
+    }),
+  );
+  assert.deepEqual(await documentCounts(client, project.id), { live: 0, staged: 1 }, "the late batch is in the database");
+
+  const swept = await store.abandonAttempt({ scopeId: scope.id, attemptId: second.attemptId });
+  assert.equal(swept.code, "ABANDONED");
+  assert.deepEqual(await documentCounts(client, project.id), { live: 0, staged: 0 }, "the next abandonment swept it");
+  assert.equal(await client.chunk.count({ where: { projectId: project.id } }), 0, "no chunk and no vector of it is left");
+});
+
+// Behaviour: the sweep is bounded, so a backlog is collected over successive calls instead of in one
+// unbounded delete. Two hundred and one stale documents take two sweeps, and neither call touches
+// the generation the scope serves.
+test("the sweep removes a stale backlog in bounded calls", async () => {
+  const { client, project, scope } = await fixture();
+  await publishTree(client, scope, [KEEPER]);
+  const first = await declare(client, scope, [KEEPER]);
+  const second = await declare(client, scope, [KEEPER]);
+  const third = await declare(client, scope, [KEEPER]);
+  const store = await import(storePath);
+  const materialise = await import(materialisePath);
+  const { prisma } = await import("../src/db/index.js");
+  const abandoned = await store.abandonAttempt({ scopeId: scope.id, attemptId: first.attemptId });
+  assert.equal(abandoned.code, "ABANDONED");
+  assert.ok(abandoned.generationId);
+
+  const backlog = Array.from({ length: materialise.SWEEP_DOCUMENTS + 1 }, (_, index) => sectionedFile(index, 1));
+  const { plan } = await plannedBatch(backlog, scope.id, project.id);
+  await prisma.$transaction((tx: any) =>
+    materialise.stageBatch(tx, {
+      scopeId: scope.id,
+      projectId: project.id,
+      orgId: "default",
+      generationId: abandoned.generationId as string,
+      stageId: randomUUID(),
+      stagedAt: new Date(),
+      paths: plan.pending,
+    }),
+  );
+  const staged = () => client.document.count({ where: { projectId: project.id, deletedAt: { not: null } } });
+  assert.equal(await staged(), materialise.SWEEP_DOCUMENTS + 1, "the backlog is one more than a sweep may remove");
+
+  assert.equal((await store.abandonAttempt({ scopeId: scope.id, attemptId: second.attemptId })).code, "ABANDONED");
+  assert.equal(await staged(), 1, "one call removes at most the bound");
+  assert.equal((await store.abandonAttempt({ scopeId: scope.id, attemptId: third.attemptId })).code, "ABANDONED");
+  assert.equal(await staged(), 0, "and the next call collects the rest");
+  assert.deepEqual(await documentCounts(client, project.id), { live: 1, staged: 0 }, "neither call touched the served generation");
+  assert.deepEqual(await search(project.id, TOKEN.keeper), ["src/keeper.ts"], "which is still searchable");
+});
+
+/**
  * A transaction handle that passes every call through to the real one and records the statement
  * each write issued. Purpose-built for the two cases below: they measure round trips, so what they
  * need from the handle is a name for every statement, not a different answer. A model delegate

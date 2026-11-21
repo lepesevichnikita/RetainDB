@@ -49,7 +49,7 @@ import { z } from "zod";
 import { prisma } from "../db/index.js";
 import { hashGrantToken, mintGrantToken } from "../engine/repo-index/grant-token.js";
 import { retireUnlistedPaths } from "../engine/repo-index/materialise.js";
-import { READABLE_SCOPE_STATES, invalidateProjectAnswers } from "../engine/repo-index/store.js";
+import { invalidateProjectAnswers } from "../engine/repo-index/store.js";
 import { resolveProjectReference } from "./helpers.js";
 // The grant kinds are declared once, by the router that accepts them; this surface only mints them.
 import { GRANT_KINDS } from "./repo-index.js";
@@ -329,9 +329,11 @@ async function stateAnswer(c: Context<{ Variables: Variables }>, action: ScopeAc
   // chosen from the visible rows. A withdrawal does invalidate the answers cached while the scope was
   // active, so they cannot outlive the state that produced them. Pause and resume change no row, but
   // they do change what is readable, and a cached answer was computed under the state being replaced -
-  // so it must go too. Leaving it would serve a paused scope's content from cache for its full TTL.
-  const readable = READABLE_SCOPE_STATES.includes(result.scope.state as never);
-  if (!readable) await invalidateProjectAnswers(result.scope.projectId);
+  // so it must go too. That covers resume as well as pause: a scope coming back changes what the same
+  // question answers, and an answer cached while it was paused would otherwise keep its content out
+  // for the cache's full TTL. Only the write that changed the state clears; a retry or a refusal left
+  // the state as it was, so the answers computed under it are still the right ones.
+  if (result.code === TRANSITION[action].done) await invalidateProjectAnswers(result.scope.projectId);
   return answer(c, result.code, { scope: serializeScope(result.scope) });
 }
 

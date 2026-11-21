@@ -3,10 +3,12 @@
  * Like Nia's Oracle feature - SOTA search for complex queries
  */
 
+import { Prisma } from "@prisma/client";
 import { getOpenAIClient } from "./openai-client.js";
 import { prisma } from "../db/index.js";
 import { embedSingle } from "./embeddings.js";
 import { selectOracleScope } from "./oracle-select.js";
+import { visibleSourceSql } from "./oracle-visibility.js";
 
 interface DocumentTree {
   root: TreeNode;
@@ -57,6 +59,28 @@ function safeSectionPath(value: unknown): string {
   return raw.length > 0 ? raw : "Document";
 }
 
+/** One chunk row a tree node is built from: the text it holds, its metadata, and its stored vector. */
+interface TreeChunkRow {
+  id: string;
+  content: string;
+  metadata: any;
+  sectionPath: string | null;
+  embedding: string | null;
+}
+
+/**
+ * The stored vector of one chunk, or undefined when it has none.
+ *
+ * The column is `Unsupported("vector")` in the schema, so Prisma returns no value for it and every
+ * reader in this engine selects it as text; pgvector's text form is a JSON array. Without this the
+ * traversal scores every leaf as 0 and the route can only ever answer nothing.
+ */
+function vectorOf(stored: string | null): number[] | undefined {
+  if (!stored) return undefined;
+  const parsed = JSON.parse(stored);
+  return isNumberArray(parsed) ? parsed : undefined;
+}
+
 export async function buildDocumentTree(
   documentId: string,
   opts: {
@@ -69,20 +93,32 @@ export async function buildDocumentTree(
   const restrictChunkIds = (opts.restrictChunkIds || []).map(String).filter(Boolean);
   const sectionPaths = (opts.sectionPaths || []).map(safeSectionPath).filter(Boolean);
 
-  const document = await prisma.document.findUnique({ where: { id: documentId } });
+  // The document is the unit the read rule applies to: a document is served only when it is live
+  // (`deletedAt` is what keeps a staged row out of the index until its promotion) and its source is
+  // one a reader may see. An unreadable document is refused exactly like an absent one, because for
+  // this caller it is not there.
+  const [document] = await prisma.$queryRaw<Array<{ id: string; title: string; metadata: any }>>(Prisma.sql`
+    SELECT d.id, d.title, d.metadata
+    FROM documents d
+    INNER JOIN sources s ON s.id = d."sourceId"
+    WHERE d.id = ${documentId}
+      AND d."deletedAt" IS NULL
+      ${visibleSourceSql()}
+    LIMIT 1
+  `);
   if (!document) {
     throw new Error("Document not found");
   }
 
-  const chunks = await prisma.chunk.findMany({
-    where: {
-      documentId,
-      ...(restrictChunkIds.length > 0 ? { id: { in: restrictChunkIds } } : {}),
-      ...(sectionPaths.length > 0 ? { sectionPath: { in: sectionPaths } } : {}),
-    },
-    orderBy: { chunkIndex: "asc" },
-    take: maxChunks,
-  });
+  const chunks = await prisma.$queryRaw<TreeChunkRow[]>(Prisma.sql`
+    SELECT c.id, c.content, c.metadata, c."sectionPath", c.embedding::text AS embedding
+    FROM chunks c
+    WHERE c."documentId" = ${documentId}
+      ${restrictChunkIds.length > 0 ? Prisma.sql`AND c.id = ANY(${restrictChunkIds})` : Prisma.empty}
+      ${sectionPaths.length > 0 ? Prisma.sql`AND c."sectionPath" = ANY(${sectionPaths})` : Prisma.empty}
+    ORDER BY c."chunkIndex" ASC
+    LIMIT ${maxChunks}
+  `);
 
   const root: TreeNode = {
     id: document.id,
@@ -113,14 +149,13 @@ export async function buildDocumentTree(
     }
 
     const section = sectionMap.get(sectionPath)!;
-    const embedding = isNumberArray((chunk as any).embedding) ? ((chunk as any).embedding as number[]) : undefined;
     section.children.push({
       id: chunk.id,
       content: chunk.content,
       type: "chunk",
       children: [],
       metadata,
-      embedding,
+      embedding: vectorOf(chunk.embedding),
     });
   }
 
@@ -149,6 +184,41 @@ function calculateDepth(node: TreeNode): number {
 
 function countNodes(node: TreeNode): number {
   return 1 + node.children.reduce((sum, child) => sum + countNodes(child), 0);
+}
+
+/** One document the oracle may read: the row it needs, and how many chunks it holds. */
+interface OracleDocument {
+  id: string;
+  title: string;
+  chunkCount: number;
+}
+
+/**
+ * The documents the oracle may read, selected in SQL by the same rule as every chunk query: a
+ * document is listed only when it is live and its source is one a reader may see.
+ *
+ * It is the only place the oracle chooses a document on its own, and choosing from visible rows is
+ * the point - a hidden id would otherwise be discovered by the tree read refusing it, one round trip
+ * per document, and the answer would depend on that refusal rather than on this selection. Without
+ * `deletedAt` here the listing reaches documents a stage wrote and no promotion cleared.
+ *
+ * `documentIds` is the ranked set the seed hits selected. Empty means no seed hit matched, and the
+ * project's first live documents answer, bounded the way this route has always bounded that case.
+ */
+async function readableDocuments(projectId: string, documentIds: string[]): Promise<OracleDocument[]> {
+  const rankedOrBounded = documentIds.length > 0
+    ? Prisma.sql`AND d.id = ANY(${documentIds})`
+    : Prisma.sql`LIMIT 10`;
+  return prisma.$queryRaw<OracleDocument[]>(Prisma.sql`
+    SELECT d.id, d.title,
+           (SELECT COUNT(*) FROM chunks c WHERE c."documentId" = d.id)::int AS "chunkCount"
+    FROM documents d
+    INNER JOIN sources s ON s.id = d."sourceId"
+    WHERE d."projectId" = ${projectId}
+      AND d."deletedAt" IS NULL
+      ${visibleSourceSql()}
+      ${rankedOrBounded}
+  `);
 }
 
 /**
@@ -205,16 +275,7 @@ export async function oracleSearch(params: {
     : { seed_hits: [], documents: [], candidate_chunk_ids: [] };
 
   const candidateDocIds = scope.documents.map((d) => d.document_id).filter(Boolean);
-  const documents = candidateDocIds.length > 0
-    ? await prisma.document.findMany({
-      where: { projectId, id: { in: candidateDocIds } },
-      include: { _count: { select: { chunks: true } } },
-    })
-    : await prisma.document.findMany({
-      where: { projectId },
-      take: 10,
-      include: { _count: { select: { chunks: true } } },
-    });
+  const documents = await readableDocuments(projectId, candidateDocIds);
 
   console.log(`[Oracle] Found ${documents.length} documents in project`);
 
@@ -237,12 +298,12 @@ export async function oracleSearch(params: {
     : documents;
 
   for (const doc of orderedDocs) {
-    if (doc._count.chunks === 0) {
+    if (doc.chunkCount === 0) {
       console.log(`[Oracle] Skipping document ${doc.id} - no chunks`);
       continue;
     }
 
-    console.log(`[Oracle] Building tree for document: ${doc.title} (${doc._count.chunks} chunks)`);
+    console.log(`[Oracle] Building tree for document: ${doc.title} (${doc.chunkCount} chunks)`);
 
     try {
       const sectionPaths = [...new Set((sectionPathsByDoc.get(doc.id) || []).filter(Boolean))];
@@ -263,6 +324,10 @@ export async function oracleSearch(params: {
         queryEmbedding,
         maxDepth,
         topK,
+        // The document is the outermost node of the path a result is reported at, so it names the
+        // file the text came from. Without it a repository answer is labelled by its section alone,
+        // which names no path the reader can open.
+        path: builtTree.root.content,
       });
 
       console.log(`[Oracle] Traversal found ${traversalResults.length} results for ${doc.title}`);

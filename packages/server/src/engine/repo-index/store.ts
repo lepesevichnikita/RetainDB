@@ -43,6 +43,7 @@ import {
   retireUnlistedPaths,
   scopeSourceName,
   stageBatch,
+  sweepStaleStages,
   type ContentReader,
   type Embedder,
   type MaterialiseOutcome,
@@ -609,7 +610,13 @@ function* stageBatches(pending: readonly PreparedPath[]): Generator<PreparedPath
  * rows into the index, and nothing that reads a tree.
  */
 export async function finalizeAttempt(input: FinalizeInput): Promise<FinalizeResult> {
-  const staged = await stagedFor(input);
+  const staging = await stagedFor(input);
+  // The scope refused the stage this publication needs. The answer is the scope's own code, decided
+  // where the scope was found unreadable; the seal's transaction is not opened for it, because a
+  // scope that may not be read has nothing to publish, and the attempt is left as the stage found it
+  // - a refusal is not a fence, so a resumed scope can still publish it.
+  if (staging.refusal) return staging.refusal;
+  const staged = staging.staged;
   try {
     const result = await prisma.$transaction((tx: Transaction) => publish(tx, input, staged), TRANSACTION);
     await invalidatePublishedProject(input.scopeId, result);
@@ -634,27 +641,64 @@ export async function finalizeAttempt(input: FinalizeInput): Promise<FinalizeRes
 }
 
 /**
- * The materialisation this call promotes: the one the caller staged, or a fresh stage of its own.
- * A stage that answered a refusal is not an answer to this call - the fence decides under its row
- * lock and answers with the same refusal - so it is dropped here and `publish` refuses to seal.
+ * The materialisation this call promotes: the one the caller staged, a fresh stage of its own, or
+ * the refusal that fresh stage answered.
+ *
+ * A stage refuses before it writes anything, so a scope refusal arrives with nothing to discard and
+ * nothing to seal; it is handed back as this call's answer instead of being flattened into "no
+ * stage", which the seal cannot tell apart from a caller that forgot to materialise.
  */
-async function stagedFor(input: FinalizeInput): Promise<StagedPublication | null> {
-  if (input.staged) return input.staged;
+async function stagedFor(input: FinalizeInput): Promise<{ staged: StagedPublication | null; refusal: FinalizeResult | null }> {
+  if (input.staged) return { staged: input.staged, refusal: null };
   const readContent = input.readContent;
-  if (!readContent) return null;
+  if (!readContent) return { staged: null, refusal: null };
   const answer = await stageAttempt({ scopeId: input.scopeId, attemptId: input.attemptId, manifest: input.manifest, readContent, embed: input.embed });
-  return answer.code === STORE_CODE.STAGED ? (answer.staged ?? null) : null;
+  if (answer.code === STORE_CODE.STAGED) return { staged: answer.staged ?? null, refusal: null };
+  // Only a scope's own refusal is answered here. Every other stage refusal is left to the fence,
+  // which reads the same rows under its row lock and can tell a stale attempt from one an earlier
+  // call already published.
+  if (isScopeRefusal(answer.code)) return { staged: null, refusal: { code: answer.code, generationId: answer.generationId } };
+  return { staged: null, refusal: null };
 }
 
-/** Drops the rows of a stage that will not be published; best effort, because they are invisible. */
+/** The codes that name the scope itself - its state, or its absence - and never a store failure. */
+function isScopeRefusal(code: StoreCode): boolean {
+  return (
+    code === STORE_CODE.SCOPE_NOT_FOUND ||
+    code === STORE_CODE.SCOPE_NOT_ACTIVE ||
+    code === PROMOTION_OUTCOME.SCOPE_PAUSED ||
+    code === PROMOTION_OUTCOME.SCOPE_REVOKED ||
+    code === PROMOTION_OUTCOME.SCOPE_WITHDRAWN
+  );
+}
+
+/**
+ * Cleanup after a publication or an abandonment. The rows it removes were never visible, so a
+ * failure here must not replace the answer the caller already has - the publication or abandonment
+ * is decided either way - but it must not vanish silently either: rows nobody discards and no query
+ * counts are the leak this cleanup exists to end, so a failure is logged for an operator to see.
+ */
+async function discardQuietly(what: string, cleanup: () => Promise<void>): Promise<void> {
+  try {
+    await cleanup();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[repo-index] ${what}: staged rows were not discarded: ${message}`);
+  }
+}
+
+/**
+ * Drops the rows of a stage that will not be published, and any stage of this source that can no
+ * longer be promoted. Best effort in the sense that neither the publication nor the abandonment
+ * changes because of it; a failure is logged rather than swallowed.
+ */
 async function discardUnpublishedStage(staged: StagedPublication | null): Promise<void> {
   if (!staged?.sourceId) return;
-  try {
-    await discardStaged(db, { sourceId: staged.sourceId, generationId: staged.generationId, stageId: staged.stageId });
-  } catch {
-    // The rows are invisible whether or not this cleanup lands, and a failure here must not replace
-    // the answer the publication already produced.
-  }
+  const { sourceId, generationId, stageId } = staged;
+  await discardQuietly(`publication ${generationId}`, async () => {
+    await discardStaged(db, { sourceId, generationId, stageId });
+    await sweepStaleStages(db, { sourceId });
+  });
 }
 
 /** Thrown when the seal's conditional update matched nothing, so the transaction can roll back. */
@@ -936,13 +980,17 @@ export async function abandonAttempt(input: { scopeId: string; attemptId: string
 }
 
 /**
- * Drops what an abandoned attempt had staged. The attempt can no longer publish, so no stage of it
- * will ever become visible; the rows are removed once the transaction that fenced it has committed,
- * and a failure here is not an answer about the abandonment itself.
+ * Drops what an abandoned attempt had staged, and any stage of the scope that can no longer be
+ * promoted. The attempt can no longer publish, so no stage of it will ever become visible; the rows
+ * are removed once the transaction that fenced it has committed.
+ *
+ * The sweep is what collects a batch a crashed writer landed after its own abandonment's discard
+ * ran: that batch belongs to a generation this call was not the one to abandon, so the targeted
+ * discard cannot see it.
  */
 async function discardAbandonedStage(input: { scopeId: string; attemptId: string }, generationId: string | undefined): Promise<void> {
   if (!generationId) return;
-  try {
+  await discardQuietly(`abandonment of ${generationId}`, async () => {
     const scope = (await db.repoIndexScope.findUnique({ where: { id: input.scopeId }, select: { projectId: true } })) as
       | { projectId: string }
       | null;
@@ -953,9 +1001,8 @@ async function discardAbandonedStage(input: { scopeId: string; attemptId: string
     })) as { id: string } | null;
     if (!source) return;
     await discardStaged(db, { sourceId: source.id, generationId });
-  } catch {
-    // Nothing was visible to begin with, so an abandoned attempt is still abandoned.
-  }
+    await sweepStaleStages(db, { sourceId: source.id });
+  });
 }
 
 async function abandonInTransaction(tx: Transaction, input: { scopeId: string; attemptId: string }): Promise<AbandonResult> {

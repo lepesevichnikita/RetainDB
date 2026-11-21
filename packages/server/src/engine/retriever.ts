@@ -136,6 +136,12 @@ export interface ContextResponse {
       embed_ms?: number;
       /** True when the embedder could not be reached, so this answer came from the lexical half only. */
       embedding_unavailable?: boolean;
+      /**
+       * True when memories were asked for but never searched: that search is a vector query too, and an
+       * empty embedding would return unrelated rows. Without this a client cannot tell "no memories"
+       * from "we did not look".
+       */
+      memory_skipped?: boolean;
       oracle_ms?: number;
       vector_ms?: number;
       fts_ms?: number;
@@ -475,6 +481,10 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
     });
     timing.memory_ms = Date.now() - tMem;
     allResults.push(...memoryResults);
+  } else if (includeMemories) {
+    // Nothing was searched, so the absence of memory hits is not "no memories": the answer says the
+    // half was skipped, in the same place it says the vector half was.
+    timing.memory_skipped = true;
   }
 
   // ─── Graph Traversal ─────────────────────────────────────
@@ -591,7 +601,11 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
   }
 
   // ─── Cache results ───────────────────────────────────────
-  if (cacheResults && allResults.length > 0) {
+  // Only a complete answer is stored. A cached answer is served for the whole TTL and cannot be
+  // re-checked: a partial one would keep presenting itself as complete, and would keep doing it after
+  // the embedder recovered. Not writing it costs one recomputation per repeated question during an
+  // outage and lets the next one be answered in full the moment the embedder is back.
+  if (cacheResults && allResults.length > 0 && embeddingUnavailable === null) {
     const tSet = Date.now();
     await setCache(projectId, cacheParams, allResults, cacheTtlSeconds);
     timing.cache_set_ms = Date.now() - tSet;

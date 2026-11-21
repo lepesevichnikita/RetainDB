@@ -360,6 +360,79 @@ test("the default request answers without an embedder and says the answer is par
     `the answer says the vector half was skipped: ${JSON.stringify(answer.body.meta?.timing)}`);
 });
 
+/**
+ * Behaviour: a partial answer is not stored, so it can never be served as a complete one.
+ *
+ * The same body asked twice is one cache key. The first answer is computed while the embedder is
+ * unavailable, so it is the lexical half and it says so. If that answer were stored, the second
+ * request - the same question, a second later, or four minutes later - would be answered from it:
+ * `cache_hit: true`, no `embedding_unavailable`, and a client with no way to tell that half the
+ * answer was never looked for. A cached answer cannot be re-checked, so the only honest thing to
+ * store is a complete one.
+ */
+test("a partial answer is not cached, so the same question is answered partial again", { timeout: 180_000 }, async (t) => {
+  const { project, scope } = await fixture();
+  const published = await publish({ scopeId: scope.id, files: TREE });
+  assert.equal(published.code, "PUBLISHED", `the tree is published: ${JSON.stringify(published)}`);
+
+  // `use_vector: undefined` drops the key from the JSON body, which is how a client asks for the
+  // default - and the default is `true`, the only shape that reaches the embedder. `include_memories`
+  // is what makes the answer lose a second, requested half rather than just the vector search.
+  const partial = { use_vector: undefined, include_memories: true, rerank: false };
+
+  const first = await ask(project.id, partial);
+  assert.equal(first.status, 200, `the partial answer is an answer, not a 500: ${JSON.stringify(first.body).slice(0, 300)}`);
+  assert.equal(first.body.results.length, 1, `the lexical half answers the question: ${JSON.stringify(first.body.results)}`);
+  assert.equal(first.body.meta.cache_hit, false, "the first question is computed, not cached");
+  assert.equal(first.body.meta.timing?.embedding_unavailable, true,
+    `the first answer says the vector half was skipped: ${JSON.stringify(first.body.meta?.timing)}`);
+  assert.equal(first.body.meta.timing?.memory_skipped, true,
+    `and that the memories it asked for were not searched: ${JSON.stringify(first.body.meta?.timing)}`);
+
+  // The same body again, with the cache on. Whether this is recomputed or served from a stored
+  // answer, what comes back must carry the same disclosure: a hit that presents the partial answer
+  // as complete is the defect. `cache_hit: false` is the shape chosen here - a partial answer is
+  // never stored - so the second question recomputes and cannot outlive the outage either.
+  const second = await ask(project.id, partial);
+  assert.equal(second.status, 200, `the second question is answered too: ${JSON.stringify(second.body).slice(0, 300)}`);
+  assert.equal(second.body.meta.timing?.embedding_unavailable, true,
+    `the second answer still says the vector half was skipped: ${JSON.stringify(second.body.meta)}`);
+  assert.equal(second.body.meta.timing?.memory_skipped, true,
+    `and still says the memories were not searched: ${JSON.stringify(second.body.meta?.timing)}`);
+  assert.equal(second.body.meta.cache_hit, false, "a partial answer was not stored, so there is nothing to hit");
+  assert.equal(second.body.results.length, 1, "and it answers from the lexical half, not from an empty cache entry");
+
+  t.diagnostic(`partial answer twice: cache_hit ${first.body.meta.cache_hit} then ${second.body.meta.cache_hit}`);
+});
+
+/**
+ * Behaviour: an answer that lost nothing is still cached. The fix for the case above is not allowed
+ * to be "stop caching when anything is missing" - a global off switch, or a flag that is always on,
+ * would pass that case while quietly deleting the cache for every client. This shape asks for no
+ * vectors at all, so no embedding is attempted and the answer is missing nothing.
+ */
+test("an answer that lost nothing is still cached", { timeout: 180_000 }, async (t) => {
+  const { project, scope } = await fixture();
+  const published = await publish({ scopeId: scope.id, files: TREE });
+  assert.equal(published.code, "PUBLISHED", `the tree is published: ${JSON.stringify(published)}`);
+
+  const first = await ask(project.id);
+  assert.equal(first.status, 200, JSON.stringify(first.body).slice(0, 300));
+  assert.equal(first.body.meta.cache_hit, false, "the first question is computed");
+  assert.equal(first.body.meta.timing?.embedding_unavailable, undefined,
+    `an answer that asked for no vectors is not degraded: ${JSON.stringify(first.body.meta?.timing)}`);
+  assert.equal(first.body.meta.timing?.memory_skipped, undefined,
+    `and it skipped nothing it was asked for: ${JSON.stringify(first.body.meta?.timing)}`);
+
+  const second = await ask(project.id);
+  assert.equal(second.body.meta.cache_hit, true, "a complete answer fills the cache");
+  assert.equal(second.body.meta.timing?.embedding_unavailable, undefined,
+    "and the cached answer is not degraded either");
+  assert.equal(second.body.results.length, 1, "the hit answers with the content the first answer found");
+
+  t.diagnostic(`complete answer twice: cache_hit ${first.body.meta.cache_hit} then ${second.body.meta.cache_hit}`);
+});
+
 test("the query route refuses a caller without the credential and a body its schema rejects", { timeout: 180_000 }, async () => {
   const { api } = await import("../src/api/routes.js");
   const body = JSON.stringify({ project: randomUUID(), query: QUERY, use_vector: false, rerank: false });
@@ -487,6 +560,58 @@ test("a paused scope stops answering through the route, cached or not, and resum
   assert.equal(back.body.meta.cache_hit, false, "the answer is computed under the resumed state");
 
   t.diagnostic(`paused scope ${scope.id}: route answers ${gone.body.results.length} results, resumes to ${back.body.results.length}`);
+});
+
+// Behaviour: resume puts repository content back into the answer the project asks next. The answer
+// computed while the scope was paused is not empty here - the project's handbook still answers - so
+// it is the cached one (engine/retriever.ts stores an answer only when it has at least one result,
+// which is why the empty paused answer above can never show this defect). Resume decides that the
+// repository is readable again, so an answer cached under the paused state must go; otherwise the
+// repository stays missing from the same question for the cache's full five minutes.
+test("a resumed scope answers its content again instead of the answer cached while it was paused", { timeout: 180_000 }, async () => {
+  const { client, project, scope } = await fixture();
+  // An ordinary handbook document of the same project, answering the same question: what makes the
+  // paused answer non-empty, and therefore cached. The name is unique because a source is unique
+  // per org and name, and the sibling test above owns `handbook-source`.
+  const handbook = `handbook-${randomUUID()}`;
+  const source = await client.source.create({ data: { projectId: project.id, name: handbook, type: "manual" } });
+  const document = await client.document.create({
+    data: { projectId: project.id, sourceId: source.id, externalId: handbook, title: "Handbook" },
+  });
+  await client.chunk.create({
+    data: {
+      projectId: project.id,
+      documentId: document.id,
+      content: "The handbook records that the flux capacitor regulates the chronometer during every service visit.",
+    },
+  });
+
+  const published = await publish({ scopeId: scope.id, files: TREE });
+  assert.equal(published.code, "PUBLISHED", `the tree is published: ${JSON.stringify(published)}`);
+
+  const active = await ask(project.id);
+  assert.equal(active.body.results.length, 2, `the handbook and the repository path both answer while the scope is active: ${JSON.stringify(active.body.results)}`);
+  assert.equal(active.body.results.some((hit: any) => hit.metadata?.repo_path === TARGET), true, "the active answer names the published path");
+
+  const pause = await admin(scope.id, "pause");
+  assert.equal(pause.status, 200, JSON.stringify(pause.body));
+  assert.equal(pause.body.code, "PAUSE_APPLIED");
+
+  const paused = await ask(project.id);
+  assert.equal(paused.body.results.length, 1, "the handbook is the whole answer while the scope is paused");
+  assert.equal(paused.body.results[0].document, "Handbook");
+  assert.equal(paused.body.meta.cache_hit, false, "the paused answer is computed, because the pause cleared the active one");
+  const pausedAgain = await ask(project.id);
+  assert.equal(pausedAgain.body.meta.cache_hit, true, "the non-empty paused answer is cached under the body that asked");
+
+  const resume = await admin(scope.id, "resume");
+  assert.equal(resume.status, 200, JSON.stringify(resume.body));
+  assert.equal(resume.body.code, "RESUME_APPLIED");
+
+  const back = await ask(project.id);
+  assert.equal(back.body.meta.cache_hit, false, "the answer cached before the resume is gone");
+  assert.equal(back.body.results.length, 2, `the resumed scope answers alongside the handbook: ${JSON.stringify(back.body.results)}`);
+  assert.equal(back.body.results.some((hit: any) => hit.metadata?.repo_path === TARGET), true, "the repository path is answered again");
 });
 
 after(async () => {

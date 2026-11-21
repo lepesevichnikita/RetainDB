@@ -1,6 +1,7 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "../db/index.js";
 import { exactDistanceOrder } from "./vector-order.js";
+import { visibleSourceSql } from "./oracle-visibility.js";
 
 export type OracleSelectScope = {
   seed_hits: Array<{
@@ -67,10 +68,10 @@ export async function selectOracleScope(params: {
   const scopedSourceIds = uniqueStrings(sourceIds || []);
   const scopedChunkTypes = uniqueStrings(chunkTypes || []);
 
-  const sourceFilterSql =
-    scopedSourceIds.length > 0
-      ? Prisma.sql`AND d."sourceId" = ANY(${scopedSourceIds})`
-      : Prisma.empty;
+  // The source side of the scope: the caller's own narrowing, plus the rule that a repository scope
+  // no reader may see is not visible. It belongs inside the scoped set - the ranking takes its k
+  // from the rows this selected, so a hidden row cannot occupy a slot a visible one should have.
+  const sourceFilterSql = visibleSourceSql(scopedSourceIds);
   const chunkTypeFilterSql =
     scopedChunkTypes.length > 0
       ? Prisma.sql`AND c."chunkType" = ANY(${scopedChunkTypes})`
@@ -157,7 +158,11 @@ export async function selectOracleScope(params: {
     const rows = (await prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
       SELECT c.id
       FROM chunks c
+      INNER JOIN documents d ON d.id = c."documentId"
+      INNER JOIN sources s ON s.id = d."sourceId"
       WHERE c."documentId" = ${doc.document_id}
+        AND d."deletedAt" IS NULL
+        ${visibleSourceSql()}
         AND COALESCE(c.metadata->>'content_kind', '') <> 'parent_context'
         AND c."sectionPath" = ANY(${doc.section_paths})
         ${chunkTypeFilterSql}

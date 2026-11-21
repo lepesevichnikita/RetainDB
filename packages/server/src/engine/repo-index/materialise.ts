@@ -608,18 +608,67 @@ export async function retireUnlistedPaths(handle: Database, input: RetireInput):
 }
 
 /**
+ * Staged documents one sweep may remove. A backlog larger than this is collected by the next
+ * publication or abandonment of the same scope, so a sweep never becomes an unbounded delete.
+ */
+export const SWEEP_DOCUMENTS = 200;
+
+/** The scope's source whose abandoned and stale stages a sweep may remove. */
+export interface SweepStaleStagesInput {
+  sourceId: string;
+}
+
+/**
+ * Removes staged rows that can never become visible, in one bounded statement.
+ *
+ * A stage is garbage the moment its generation stops being open: the seal publishes only an open
+ * attempt, so nothing can promote those rows any more. They stay invisible either way - every read
+ * filters `deletedAt IS NULL` - which is why a crash between committing a batch and sealing, or a
+ * retry that staged the same attempt a second time, leaves text, chunks and vectors that nothing
+ * counts and nothing removes. The targeted discard cannot collect them: an abandonment ran before
+ * the crashed writer's last batch landed, and a publication only knows the stage it promoted.
+ *
+ * Live rows are excluded by `deletedAt`, and rows some other writer soft-deleted in this source are
+ * excluded by the generation marker, so what this removes is exactly what this module staged for a
+ * generation that is fenced, abandoned, published or gone. The bound is per call; the caller is a
+ * publication or an abandonment, which already knows that attempt is dead.
+ */
+export async function sweepStaleStages(handle: Database, input: SweepStaleStagesInput): Promise<number> {
+  const dropped = await handle.$executeRaw`
+    DELETE FROM "documents"
+    WHERE "id" IN (
+      SELECT staged."id"
+      FROM "documents" staged
+      LEFT JOIN "repo_index_generations" generation
+        ON generation."id"::text = staged."metadata"->>${STAGED_GENERATION_KEY}
+      WHERE staged."sourceId" = ${input.sourceId}
+        AND staged."deletedAt" IS NOT NULL
+        AND staged."metadata"->>${STAGED_GENERATION_KEY} IS NOT NULL
+        AND (generation."id" IS NULL OR generation."status" <> 'open')
+      LIMIT ${SWEEP_DOCUMENTS}
+    )
+  `;
+  return Number(dropped ?? 0);
+}
+
+/**
  * The scope's own source, created once. `sources.projectId` is a real foreign key, so the scope's
  * project has to exist: a repository index is attributable to a project, not to a conversation.
  *
  * Two stages of one scope can reach this at the same time, and `@@unique([projectId, name])` lets
- * one create it; the loser reads the row the winner wrote instead of failing its batch.
+ * exactly one row exist. The insert therefore asks the database to skip the duplicate instead of
+ * failing on it: this runs inside the caller's staging transaction, and a unique violation aborts
+ * that transaction - PostgreSQL answers 25P02 to every later statement - so catching `P2002` here
+ * could never be followed by the read it recovers with. `skipDuplicates` turns the insert into
+ * `ON CONFLICT DO NOTHING`: the second transaction waits for the first and then writes nothing, and
+ * the read below resolves the one row whichever of the two created it.
  */
 async function ensureScopeSource(handle: Database, input: SourceOwner): Promise<{ id: string }> {
   const existing = await findScopeSource(handle, input.scopeId, input.projectId);
   if (existing) return existing;
-  try {
-    return await handle.source.create({
-      data: {
+  await handle.source.createMany({
+    data: [
+      {
         projectId: input.projectId,
         name: scopeSourceName(input.scopeId),
         orgId: input.orgId,
@@ -627,13 +676,14 @@ async function ensureScopeSource(handle: Database, input: SourceOwner): Promise<
         status: "READY",
         config: { repo_scope_id: input.scopeId },
       },
-    });
-  } catch (error) {
-    if ((error as { code?: string } | null)?.code !== "P2002") throw error;
-    const winner = await findScopeSource(handle, input.scopeId, input.projectId);
-    if (!winner) throw error;
-    return winner;
-  }
+    ],
+    skipDuplicates: true,
+  });
+  const winner = await findScopeSource(handle, input.scopeId, input.projectId);
+  // Either this batch inserted it or the concurrent one did; a read that finds neither means it
+  // vanished in between, which is a broken source table rather than a race.
+  if (!winner) throw new Error(`the source of scope ${input.scopeId} is missing after its insert`);
+  return winner;
 }
 
 /** The source this scope mirrors into, or nothing when it was never materialised. */

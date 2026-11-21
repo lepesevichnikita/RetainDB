@@ -460,6 +460,8 @@ Server graph endpoints:
 
 In `/v1/context/query`, `include_graph: true` adds chunks linked by the entity graph and preserves the matched entities and relationships in each result's `metadata.graph`, even if vector or lexical search found the same chunk. `graph_depth` accepts 1–3. Graph queries bypass the response cache and respect project, source, chunk-type, metadata, and active-version filters.
 
+An answer produced while the embedder is unavailable is reported as partial: `meta.timing.embedding_unavailable` marks the vector half that was skipped, and `meta.timing.memory_skipped` marks memories that were asked for and never searched. Such an answer is not written to the response cache, so the next identical question is recomputed instead of being served a partial result as complete, and it comes back complete as soon as the embedder does.
+
 Entity and edge IDs are stable within the project. Extraction records claims per source chunk, so staged, failed, superseded, and deleted content does not replace the active graph. Graph search, export, and entity counts use the same visibility rule. Manually written entities and edges remain independent of source versions; extraction does not replace their annotations.
 
 Entity extraction runs only on eligible documents ingested with automatic extraction enabled and a configured inference provider. Native hook capture skips it. The migration preserves existing graph rows and backfills explicit legacy entity-to-chunk links. Old automatic edges without recorded provenance stay hidden until extraction confirms them. The migration does not extract from existing documents, and importing vector embeddings alone does not create graph edges.

@@ -1464,14 +1464,14 @@ api.get(
     const limit = Math.min(Number(c.req.query("limit") || 64), 256);
     const rows = await prisma.$queryRaw<Array<{ id: string; content: string }>>`
       SELECT id, content FROM chunks
-      WHERE "projectId" = ${project.id}::uuid
+      WHERE "projectId" = ${project.id}
         AND embedding IS NOT NULL
         AND (metadata->>'embedding_model' IS NULL OR metadata->>'embedding_model' <> ${model})
       ORDER BY id LIMIT ${limit}
     `;
     const [{ remaining }] = await prisma.$queryRaw<Array<{ remaining: bigint }>>`
       SELECT count(*) AS remaining FROM chunks
-      WHERE "projectId" = ${project.id}::uuid
+      WHERE "projectId" = ${project.id}
         AND embedding IS NOT NULL
         AND (metadata->>'embedding_model' IS NULL OR metadata->>'embedding_model' <> ${model})
     `;
@@ -1501,7 +1501,7 @@ api.post(
         UPDATE chunks SET embedding = ${literal}::vector,
                metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), '{embedding_model}', to_jsonb(${body.model}::text), true),
                "updatedAt" = NOW()
-        WHERE id = ${row.id}::uuid AND "projectId" = ${project.id}::uuid
+        WHERE id = ${row.id}::uuid AND "projectId" = ${project.id}
       `;
     }
     return c.json({ success: true, model: body.model, updated });

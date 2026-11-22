@@ -401,7 +401,7 @@ at `~/.retaindb-mcp/config.json`. Every tool below reads it; environment variabl
 
 ```bash
 git clone https://github.com/lepesevichnikita/RetainDB.git && cd RetainDB
-npm i -g ./packages/local-indexer
+npm i -g --install-links ./packages/local-indexer
 retaindb-index --root ~/src/my-project --graph --embed
 ```
 
@@ -563,10 +563,20 @@ The self-hosted server can index external knowledge sources into agent context:
 server. It is a separate package on purpose: the service stores what it is given, the machine that
 holds the files does the reading.
 
+`--install-links` matters: without it npm links the global command to the checkout, so moving or
+deleting `~/Documents/projects/RetainDB` breaks `retaindb-index` everywhere. With it npm installs a
+real copy of the package and the command survives the checkout.
+
+The file set is what git says it is: `git ls-files --cached --others --exclude-standard` inside the
+target. `.gitignore` therefore decides — `node_modules`, vendored code, build output and everything
+your global excludes skip are not indexed, and a tracked file under an ignored path still is. A
+directory outside a git work tree falls back to skipping the usual dependency and build stores
+(`node_modules`, `.venv`, `__pycache__`, `.next`, `coverage`, …).
+
 ```bash
 git clone https://github.com/lepesevichnikita/RetainDB.git
 cd RetainDB
-npm i -g ./packages/local-indexer          # provides the `retaindb-index` command
+npm i -g --install-links ./packages/local-indexer   # provides the `retaindb-index` command
 ```
 
 Configure once, in the same file the MCP server and the hooks read:

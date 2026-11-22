@@ -12,6 +12,14 @@ node packages/local-indexer/bin/retaindb-index.mjs \
 
 ## Install
 
+Install with `--install-links` so the global command is a real copy of the package, not a link into
+this checkout — a linked install breaks the moment the repository moves:
+
+```bash
+npm i -g --install-links ./packages/local-indexer
+```
+
+
 ```bash
 npm i -g ./packages/local-indexer    # puts `retaindb-index` on PATH
 retaindb-index --help
@@ -118,6 +126,13 @@ not choose to send.
 ```
 
 Max 600 items per request; this tool sends 200.
+
+## Which files are read
+
+The walk is git's: `git ls-files -z --cached --others --exclude-standard`. `.gitignore` decides what
+the index holds, including nested ignore files and the global excludes file; `node_modules`,
+vendored code and build output stay out, and a tracked file inside an ignored directory stays in.
+Outside a git work tree the walk skips the standard dependency and build stores instead.
 
 ## Incremental state
 

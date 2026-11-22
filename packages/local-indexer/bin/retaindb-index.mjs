@@ -16,6 +16,7 @@ import { chunkSource } from "../src/chunker.mjs";
 import { IndexQueue, drainQueue } from "../src/queue.mjs";
 import { createEmbedder, resolveModel } from "../src/embedder.mjs";
 import { referenceEdges } from "../src/references.mjs";
+import { listFiles } from "../src/files.mjs";
 
 const MAX_BYTES = 1024 * 1024;
 const DEFAULT_BATCH = 200;
@@ -25,10 +26,6 @@ const VECTOR_POST_SIZE = 16; // keeps one request well under the proxy body limi
 const RETRIES = 3;
 const MANIFEST_VERSION = 1;
 const MAX_SYMBOLS_PER_FILE = 20;
-
-const SKIP_DIRS = new Set([
-  ".git",
-]);
 
 const HELP = `retaindb-index: index a directory where it lives and ship chunks to RetainDB
 
@@ -87,19 +84,13 @@ async function saveManifest(manifest) {
   await writeFile(manifestFile(), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
 }
 
-async function listAllFiles(root, dir = root, found = []) {
-  const entries = await readdir(dir, { withFileTypes: true });
-  for (const entry of entries) {
-    if (SKIP_DIRS.has(entry.name)) continue;
-    const full = join(dir, entry.name);
-    if (entry.isDirectory()) await listAllFiles(root, full, found);
-    else if (entry.isFile()) found.push(relative(root, full));
-  }
-  return found;
-}
-
 async function readTextFile(absolutePath) {
-  const info = await stat(absolutePath);
+  let info;
+  try {
+    info = await stat(absolutePath);
+  } catch {
+    return null;
+  }
   if (info.size > MAX_BYTES) return null;
   const bytes = await readFile(absolutePath);
   if (bytes.includes(0)) return null;
@@ -236,7 +227,7 @@ export async function run(options) {
   const root = resolve(options.root);
   const manifest = await loadManifest();
   const known = (manifest.roots[root] ??= {});
-  const files = await listAllFiles(root);
+  const files = await listFiles(root);
   const chunks = await IndexQueue.open(queueFile("chunks.json"));
   const symbols = await IndexQueue.open(queueFile("graph.json"));
   const accepted = await enqueueFiles(root, files, known, chunks, symbols, options.graph);

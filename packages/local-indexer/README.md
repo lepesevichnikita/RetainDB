@@ -48,6 +48,28 @@ queues (`~/.retaindb-mcp/chunks.json`, `~/.retaindb-mcp/graph.json`) keyed by id
 
 `--dry-run` reports what would be sent and posts nothing.
 
+## Embedding on the client
+
+`--embed [model]` computes the vectors on the machine that owns the files and sends them
+with each item, so the server writes the vector and never runs the model. That removes the
+only part of indexing that used server CPU: with it, a push no longer keeps the service
+busy for a second per chunk.
+
+The model must emit 1024 dimensions, because that is what `chunks.embedding` and
+`entities.embedding` hold. The default is `Xenova/bge-large-en-v1.5`, the same model the
+server uses, so client and server vectors live in one space. `Xenova/multilingual-e5-large`
+is also 1024-dimensional and is the better choice for Russian text, but pick one model per
+project: mixing them makes similarities meaningless.
+
+```
+retaindb-index --root . --graph --embed                     # default model
+retaindb-index --root . --graph --embed Xenova/multilingual-e5-large
+```
+
+The model is an optional dependency (`@xenova/transformers`); without it `--embed` fails
+with a clear message and everything else keeps working. A device that cannot run 1024-dim
+models can still let the server embed by omitting the flag.
+
 ## Why it is built this way
 
 The remote deployment cannot read a client file system. A path sent to the server is a
@@ -56,8 +78,8 @@ file the server process can see. So the split is:
 
 | Side | Does |
 | --- | --- |
-| client (this tool) | walks the directory, reads bytes, splits into chunks, keeps the manifest |
-| server | receives `POST /v1/learn/batch` items of `type: "text"`, embeds, stores in pgvector |
+| client (this tool) | walks the directory, reads bytes, splits into chunks, keeps the manifest, and with `--embed` also computes the vectors |
+| server | receives `POST /v1/learn/batch` items of `type: "text"`, stores text and vectors in pgvector, and embeds itself only when no vector was sent |
 
 No git required and no extension filter: every file under `--root` is a candidate, `.git`
 except. A file is skipped only when it reads as binary (a NUL byte), exceeds 1 MB, or is

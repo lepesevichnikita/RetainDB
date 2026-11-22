@@ -400,7 +400,7 @@ at `~/.retaindb-mcp/config.json`. Every tool below reads it; environment variabl
 **1. Indexer CLI** — reads files on this machine and ships chunks and vectors:
 
 ```bash
-git clone git@github.com:lepesevichnikita/RetainDB.git && cd RetainDB
+git clone https://github.com/lepesevichnikita/RetainDB.git && cd RetainDB
 npm i -g ./packages/local-indexer
 retaindb-index --root ~/src/my-project --graph --embed
 ```
@@ -564,7 +564,7 @@ server. It is a separate package on purpose: the service stores what it is given
 holds the files does the reading.
 
 ```bash
-git clone git@github.com:lepesevichnikita/RetainDB.git
+git clone https://github.com/lepesevichnikita/RetainDB.git
 cd RetainDB
 npm i -g ./packages/local-indexer          # provides the `retaindb-index` command
 ```

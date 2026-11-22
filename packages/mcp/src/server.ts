@@ -2,7 +2,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { spawnSync } from "child_process";
+import { execFile as execFileCallback, spawnSync } from "child_process";
+import { promisify } from "util";
 import { readdirSync, readFileSync, statSync } from "fs";
 import { join, relative, extname } from "path";
 import { userInfo } from "os";
@@ -13,6 +14,7 @@ import {
   buildPrimaryToolSuccess,
   buildPrimaryToolError,
 } from "./search-payload.mjs";
+import { buildIndexArgs } from "./index-args.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
@@ -34,6 +36,8 @@ const client = makeClient();
 let cachedProject: string | undefined;
 
 // ─── Server ────────────────────────────────────────────────────────────────
+
+const execFile = promisify(execFileCallback);
 
 const server = new McpServer({
   name: "retaindb",
@@ -978,6 +982,32 @@ server.tool(
       });
     } catch (error: any) {
       return err(error.message);
+    }
+  }
+);
+
+server.tool(
+  "index_directory",
+  "Index every text file under a directory on this machine with tree-sitter and ship the chunks plus the symbol graph into RetainDB pgvector. " +
+  "Runs the installed `retaindb-index` CLI, so the same queue, dedup and batching apply. Returns what was sent.",
+  {
+    root: z.string().describe("Absolute path of the directory to index"),
+    project: z.string().optional().describe("Project to write into (defaults to the configured project)"),
+    graph: z.boolean().optional().default(true).describe("Also ship entities and relations"),
+    dry_run: z.boolean().optional().default(false).describe("Report what would be sent and post nothing"),
+    batch: z.number().optional().describe("Rows per request (default 200)"),
+    delay: z.number().optional().describe("Pause between batches in ms"),
+  },
+  async (options) => {
+    try {
+      const { stdout } = await execFile("retaindb-index", buildIndexArgs(options), {
+        maxBuffer: 8 * 1024 * 1024,
+        timeout: 30 * 60 * 1000,
+      });
+      const report = JSON.parse(stdout.trim().split("\n").pop() ?? "{}");
+      return ok({ tool: "index_directory", ...report });
+    } catch (error: any) {
+      return err(error?.stdout?.trim() || error?.message || "indexing failed");
     }
   }
 );

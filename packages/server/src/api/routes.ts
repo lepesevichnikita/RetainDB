@@ -28,7 +28,7 @@ import { syncHuggingFace } from "../connectors/huggingface.js";
 import { syncWeb } from "../connectors/web.js";
 import { ingestDocument } from "../engine/ingest.js";
 import { fireWebhookEvent } from "../engine/webhooks.js";
-import { embed, embedSingle } from "../engine/embeddings.js";
+import { embedSingle } from "../engine/embeddings.js";
 import { ensureGraphEntityId, entityRelationType, saveGraphBatch, saveGraphEntity, saveGraphRelation } from "../engine/entity-graph-write.js";
 import { countGraphEntities, searchEntityGraph } from "../engine/entity-graph.js";
 import { ingestSession as ingestMemorySession, searchMemories } from "../engine/memory/index.js";
@@ -1372,7 +1372,16 @@ api.post(
                 tags: itemTags,
                 options: { async: clientVector ? false : body.async !== false },
               },
-              embedTexts: clientVector ? async (texts: string[]) => (texts.length === 1 ? [clientVector] : embed(texts)) : undefined,
+              embedTexts: clientVector
+                ? async (texts: string[]) => {
+                    if (texts.length !== 1) {
+                      throw new Error(
+                        `client embedding covers one chunk, this item split into ${texts.length}: send one chunk per item`,
+                      );
+                    }
+                    return [clientVector];
+                  }
+                : undefined,
             });
             accepted.push({
               index, type: "text", custom_id: item.custom_id,

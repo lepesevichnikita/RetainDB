@@ -13,11 +13,22 @@ import { homedir } from "node:os";
 import { dirname, extname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { chunkSource } from "../src/chunker.mjs";
+import { IndexQueue, drainQueue, mapLimit } from "../src/queue.mjs";
 
 const MAX_BYTES = 1024 * 1024;
-const BATCH_ITEMS = 200;
+const DEFAULT_BATCH = 200;
+const DEFAULT_CONCURRENCY = 1;
+const DEFAULT_DELAY_MS = 200;
 const RETRIES = 3;
 const MANIFEST_VERSION = 1;
+const MAX_SYMBOLS_PER_FILE = 20;
+
+const IMPORT_PATTERNS = [
+  /^\s*import\s+(?:[^'"]*?from\s+)?["']([^"']+)["']/gm,
+  /^\s*from\s+["']([^"']+)["']/gm,
+  /^\s*from\s+(\.+[\w.]*)\s+import\s/gm,
+  /^\s*(?:const|let|var)\s+\w+\s*=\s*require\(\s*["']([^"']+)["']\s*\)/gm,
+];
 
 const SKIP_DIRS = new Set([
   ".git",
@@ -34,6 +45,10 @@ Options:
   --key       API key (default: $RETAINDB_API_KEY)
   --project   project name or slug (default: $RETAINDB_PROJECT or "default")
   --dry-run   report what would be sent, post nothing
+  --graph     also send the symbol graph to /v1/entities and /v1/relations
+  --batch     chunks per request (default 200)
+  --concurrency  graph requests in flight (default 3)
+  --delay     pause between batches in ms (default 200)
   --help      this text
 
 Flags beat environment, environment beats ~/.retaindb-mcp/config.json
@@ -127,6 +142,51 @@ async function postBatch(api, key, project, items) {
   return response.json().catch(() => ({}));
 }
 
+async function postJson(api, key, path, body) {
+  const response = await fetch(`${api.replace(/\/$/, "")}${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) throw new Error(`${path} ${response.status}: ${(await response.text()).slice(0, 200)}`);
+  return response.json().catch(() => ({}));
+}
+
+function importTargets(text) {
+  const found = new Set();
+  for (const pattern of IMPORT_PATTERNS) {
+    for (const match of text.matchAll(pattern)) {
+      const target = match[1].trim();
+      if (target.startsWith(".") || target.startsWith("/")) found.add(target);
+    }
+  }
+  return [...found];
+}
+
+function graphRows(path, chunks, text, sha) {
+  const symbols = [...new Set(chunks.map((chunk) => chunk.symbol).filter(Boolean))].slice(0, MAX_SYMBOLS_PER_FILE);
+  const entity = (name, entityType, description) => ({
+    key: `entity:${name}`,
+    payload: { kind: "entity", body: { name, entity_type: entityType, description, metadata: { sha } } },
+  });
+  const relation = (from, fromType, to, toType, type) => ({
+    key: `edge:${from}|${type}|${to}`,
+    payload: { kind: "relation", body: { from_entity: from, from_type: fromType, to_entity: to, to_type: toType, relation_type: type } },
+  });
+  return [
+    entity(path, "module", `${chunks.length} chunks`),
+    ...symbols.map((name) => entity(`${path}#${name}`, "symbol", name)),
+    ...symbols.map((name) => relation(`${path}#${name}`, "symbol", path, "module", "part_of")),
+    ...importTargets(text).map((target) => relation(path, "module", target, "module", "imports")),
+  ];
+}
+
+async function postGraphRow(api, key, project, row) {
+  const path = row.kind === "entity" ? "/v1/entities" : "/v1/relations";
+  await postJson(api, key, path, { project, ...row.body });
+  return row.kind;
+}
+
 async function withRetries(attempt) {
   let lastError;
   for (let tryNo = 1; tryNo <= RETRIES; tryNo += 1) {
@@ -147,40 +207,63 @@ async function chunksForFile(root, path) {
   return { sha: digest(text), chunks };
 }
 
-async function collectItems(root, files, known) {
-  const items = [];
+function queueFile(name) {
+  return join(homedir(), ".retaindb-mcp", name);
+}
+
+async function enqueueFiles(root, files, known, chunks, symbols, withGraph) {
   const accepted = [];
   for (const path of files) {
     const prepared = await chunksForFile(root, path);
     if (prepared === null) continue;
     if (known[path] === prepared.sha) continue;
-    for (const chunk of prepared.chunks) items.push(toItem(path, prepared.sha, chunk));
-    accepted.push({ path, sha: prepared.sha, chunks: prepared.chunks.length });
+    for (const chunk of prepared.chunks) {
+      chunks.add(`${path}#${chunk.start_line}-${chunk.end_line}`, toItem(path, prepared.sha, chunk));
+    }
+    if (withGraph) {
+      const text = await readTextFile(resolve(root, path));
+      for (const row of graphRows(path, prepared.chunks, text ?? "", prepared.sha)) symbols.add(row.key, row.payload);
+    }
+    accepted.push({ path, sha: prepared.sha });
   }
-  return { items, accepted };
-}
-
-async function pushAll(api, key, project, items) {
-  let sent = 0;
-  for (let index = 0; index < items.length; index += BATCH_ITEMS) {
-    const batch = items.slice(index, index + BATCH_ITEMS);
-    await withRetries(() => postBatch(api, key, project, batch));
-    sent += batch.length;
-  }
-  return sent;
+  return accepted;
 }
 
 export async function run(options) {
+  const batch = options.batch ?? DEFAULT_BATCH;
+  const concurrency = options.concurrency ?? DEFAULT_CONCURRENCY;
+  const delay = options.delay ?? DEFAULT_DELAY_MS;
   const root = resolve(options.root);
   const manifest = await loadManifest();
   const known = (manifest.roots[root] ??= {});
   const files = await listAllFiles(root);
-  const { items, accepted } = await collectItems(root, files, known);
-  if (options.dryRun) return { root, files: files.length, items: items.length, sent: 0 };
-  const sent = await pushAll(options.api, options.key, options.project, items);
+  const chunks = await IndexQueue.open(queueFile("chunks.json"));
+  const symbols = await IndexQueue.open(queueFile("graph.json"));
+  const accepted = await enqueueFiles(root, files, known, chunks, symbols, options.graph);
+  const pending = { chunks: chunks.size, graph: symbols.size };
+  if (options.dryRun) return { root, files: files.length, items: chunks.size, sent: 0, pending };
+  const sent = await drainQueue(
+    chunks,
+    (items) => withRetries(() => postBatch(options.api, options.key, options.project, items)),
+    { groupSize: batch, concurrency: 1, delayMs: delay },
+  );
+  const graph = options.graph ? await drainGraph(options, symbols, concurrency) : null;
   for (const entry of accepted) known[entry.path] = entry.sha;
   await saveManifest(manifest);
-  return { root, files: files.length, items: items.length, sent, changed: accepted.length };
+  return { root, files: files.length, items: sent, sent, changed: accepted.length, graph, pending };
+}
+
+async function drainGraph(options, symbols, concurrency) {
+  const counts = { entities: 0, relations: 0 };
+  await drainQueue(
+    symbols,
+    async (rows) => {
+      const kind = await withRetries(() => postGraphRow(options.api, options.key, options.project, rows[0]));
+      counts[kind === "entity" ? "entities" : "relations"] += 1;
+    },
+    { groupSize: 1, concurrency, delayMs: Math.max(delay, 50) },
+  );
+  return counts;
 }
 
 function readFlag(argv, name, fallback) {
@@ -195,8 +278,12 @@ export function parseOptions(argv, env, config = {}) {
   const key = readFlag(argv, "key", env.RETAINDB_API_KEY ?? config.token);
   const project = readFlag(argv, "project", env.RETAINDB_PROJECT ?? config.project ?? "default");
   const dryRun = argv.includes("--dry-run");
+  const graph = argv.includes("--graph");
+  const batch = Number(readFlag(argv, "batch", DEFAULT_BATCH));
+  const concurrency = Number(readFlag(argv, "concurrency", DEFAULT_CONCURRENCY));
+  const delay = Number(readFlag(argv, "delay", DEFAULT_DELAY_MS));
   if (!dryRun && (!api || !key)) throw new Error("no API target: pass --api/--key, set RETAINDB_BASE_URL/RETAINDB_API_KEY, or write ~/.retaindb-mcp/config.json");
-  return { root, api, key, project, dryRun };
+  return { root, api, key, project, dryRun, graph, batch, concurrency, delay };
 }
 
 async function main() {

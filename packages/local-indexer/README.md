@@ -31,6 +31,20 @@ retaindb-index --root /path/to/code
 Precedence: flags, then `RETAINDB_BASE_URL` / `RETAINDB_API_KEY` / `RETAINDB_PROJECT`, then
 the config file.
 
+## Queue, throttling and dedup
+
+Work is never posted straight from the walk. Chunks and graph rows go into two persisted
+queues (`~/.retaindb-mcp/chunks.json`, `~/.retaindb-mcp/graph.json`) keyed by identity:
+`path#start-end` for a chunk, `entity:<name>` and `edge:<from>|<type>|<to>` for the graph.
+
+- the same key queued twice keeps only its newest payload, so a file re-read in one run
+  replaces its earlier chunks instead of sending both
+- a batch is dropped from the queue only after the server accepted it, so a killed run
+  resumes with exactly what is left
+- `--batch` sets chunks per request (200), `--delay` pauses between batches (200 ms),
+  `--concurrency` caps graph requests in flight (1 by default: every entity write costs a
+  server-side embedding, so a wider window starves a single-pod deployment)
+
 `--dry-run` reports what would be sent and posts nothing.
 
 ## Why it is built this way

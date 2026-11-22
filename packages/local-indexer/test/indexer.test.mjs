@@ -119,7 +119,7 @@ test("config file supplies api, project and token, and flags still win", async (
   assert.equal(flagged.project, "flag");
 });
 
-test("--graph ships the module, its symbols and the import edges", async () => {
+test("--graph ships the module, its symbols and references resolved to real files", async () => {
   await writeFile(join(repository, "src", "gamma.ts"), "import { alpha } from \"./alpha\";\nexport function gamma() { return 3; }\n", "utf8");
   graph.length = 0;
   const report = await run({ root: repository, api, key: "test-key", project: "retaindb", dryRun: false, graph: true });
@@ -130,7 +130,7 @@ test("--graph ships the module, its symbols and the import edges", async () => {
   assert.ok(entities.some((entity) => entity.name === "src/gamma.ts" && entity.entity_type === "module"));
   assert.ok(entities.some((entity) => entity.name === "src/gamma.ts#gamma" && entity.entity_type === "symbol"));
   assert.ok(relations.some((relation) => relation.relation_type === "part_of"));
-  assert.ok(relations.some((relation) => relation.relation_type === "imports" && relation.to_entity === "./alpha"));
+  assert.ok(relations.some((relation) => relation.relation_type === "references" && relation.to_entity === "src/alpha.ts"));
 });
 
 test("a repeated chunk key keeps only the newest payload", async () => {

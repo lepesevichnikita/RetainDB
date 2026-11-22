@@ -14,6 +14,8 @@ import { dirname, extname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { chunkSource } from "../src/chunker.mjs";
 import { IndexQueue, drainQueue } from "../src/queue.mjs";
+import { createEmbedder, resolveModel } from "../src/embedder.mjs";
+import { referenceEdges } from "../src/references.mjs";
 
 const MAX_BYTES = 1024 * 1024;
 const DEFAULT_BATCH = 200;
@@ -22,13 +24,6 @@ const EMBED_BATCH = 8;
 const RETRIES = 3;
 const MANIFEST_VERSION = 1;
 const MAX_SYMBOLS_PER_FILE = 20;
-
-const IMPORT_PATTERNS = [
-  /^\s*import\s+(?:[^'"]*?from\s+)?["']([^"']+)["']/gm,
-  /^\s*from\s+["']([^"']+)["']/gm,
-  /^\s*from\s+(\.+[\w.]*)\s+import\s/gm,
-  /^\s*(?:const|let|var)\s+\w+\s*=\s*require\(\s*["']([^"']+)["']\s*\)/gm,
-];
 
 const SKIP_DIRS = new Set([
   ".git",
@@ -153,18 +148,7 @@ async function postJson(api, key, path, body) {
   return response.json().catch(() => ({}));
 }
 
-function importTargets(text) {
-  const found = new Set();
-  for (const pattern of IMPORT_PATTERNS) {
-    for (const match of text.matchAll(pattern)) {
-      const target = match[1].trim();
-      if (target.startsWith(".") || target.startsWith("/")) found.add(target);
-    }
-  }
-  return [...found];
-}
-
-function graphRows(path, chunks, text, sha) {
+function graphRows(path, chunks, text, sha, knownFiles) {
   const symbols = [...new Set(chunks.map((chunk) => chunk.symbol).filter(Boolean))].slice(0, MAX_SYMBOLS_PER_FILE);
   const entity = (name, entityType, description) => ({
     key: `entity:${name}`,
@@ -178,7 +162,7 @@ function graphRows(path, chunks, text, sha) {
     entity(path, "module", `${chunks.length} chunks`),
     ...symbols.map((name) => entity(`${path}#${name}`, "symbol", name)),
     ...symbols.map((name) => relation(`${path}#${name}`, "symbol", path, "module", "part_of")),
-    ...importTargets(text).map((target) => relation(path, "module", target, "module", "imports")),
+    ...referenceEdges(path, text, knownFiles).map((edge) => relation(edge.from, "module", edge.to, "module", edge.kind)),
   ];
 }
 
@@ -218,6 +202,7 @@ function queueFile(name) {
 
 async function enqueueFiles(root, files, known, chunks, symbols, withGraph) {
   const accepted = [];
+  const knownFiles = new Set(files);
   for (const path of files) {
     const prepared = await chunksForFile(root, path);
     if (prepared === null) continue;
@@ -227,7 +212,7 @@ async function enqueueFiles(root, files, known, chunks, symbols, withGraph) {
     }
     if (withGraph) {
       const text = await readTextFile(resolve(root, path));
-      for (const row of graphRows(path, prepared.chunks, text ?? "", prepared.sha)) symbols.add(row.key, row.payload);
+      for (const row of graphRows(path, prepared.chunks, text ?? "", prepared.sha, knownFiles)) symbols.add(row.key, row.payload);
     }
     accepted.push({ path, sha: prepared.sha });
   }

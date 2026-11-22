@@ -21,6 +21,7 @@ const MAX_BYTES = 1024 * 1024;
 const DEFAULT_BATCH = 200;
 const DEFAULT_DELAY_MS = 200;
 const EMBED_BATCH = 8;
+const VECTOR_POST_SIZE = 16; // keeps one request well under the proxy body limit
 const RETRIES = 3;
 const MANIFEST_VERSION = 1;
 const MAX_SYMBOLS_PER_FILE = 20;
@@ -272,7 +273,7 @@ async function reembedCorpus(options) {
   for (;;) {
     const page = await getJson(
       options.api, options.key,
-      `/v1/chunks/stale?model=${encodeURIComponent(options.embed)}&limit=64&project=${encodeURIComponent(options.project)}`,
+      `/v1/chunks/stale?model=${encodeURIComponent(options.embed)}&limit=${VECTOR_POST_SIZE}&project=${encodeURIComponent(options.project)}`,
     );
     if (!page.chunks?.length) return { model: options.embed, updated, remaining: 0 };
     const vectors = [];
@@ -281,10 +282,14 @@ async function reembedCorpus(options) {
       const embedded = await embed(slice.map((chunk) => chunk.content));
       slice.forEach((chunk, index) => vectors.push({ id: chunk.id, embedding: embedded[index] }));
     }
-    const result = await postJson(options.api, options.key, "/v1/chunks/vectors", {
-      project: options.project, model: options.embed, vectors,
-    });
-    updated += Number(result.updated || 0);
+    let accepted = 0;
+    for (let i = 0; i < vectors.length; i += VECTOR_POST_SIZE) {
+      const result = await postJson(options.api, options.key, "/v1/chunks/vectors", {
+        project: options.project, model: options.embed, vectors: vectors.slice(i, i + VECTOR_POST_SIZE),
+      });
+      accepted += Number(result.updated || 0);
+    }
+    updated += accepted;
     process.stderr.write(`[reembed] ${updated} updated, ${page.remaining} left\n`);
   }
 }

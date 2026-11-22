@@ -9,6 +9,7 @@ interface ChunkScope {
 
 interface GraphSearch {
   projectId: string;
+  query?: string;
   embedding: readonly number[];
   depth: number;
   topK: number;
@@ -82,9 +83,18 @@ function projectRelations(projectId: string, chunks: Prisma.Sql) {
 const relationColumns = Prisma.sql`r.id, r."fromEntityId", r."toEntityId", r."relationType", COALESCE(r.weight, 1) AS weight`;
 
 async function findGraphSeeds(db: GraphReader, options: GraphSearch, chunks: Prisma.Sql) {
-  const { projectId, embedding, topK, entityTypes } = options;
+  const { projectId, query, embedding, topK, entityTypes } = options;
   const vector = vectorLiteral(embedding);
   const types = entityTypes?.length ? Prisma.sql`AND e."entityType" = ANY(${entityTypes}::text[])` : Prisma.empty;
+  // Structural nodes carry no mention vector, so a name hit is a first-class seed.
+  const nameSeeds = query
+    ? Prisma.sql`, name_seeds AS (
+      SELECT e.id, 0::float8 AS distance FROM entities e
+      WHERE e."projectId" = ${projectId} AND e.name ILIKE ${`%${query}%`} ${types}
+      ORDER BY length(e.name), e.id LIMIT ${topK}
+    )`
+    : Prisma.empty;
+  const nameUnion = query ? Prisma.sql` UNION ALL SELECT * FROM name_seeds` : Prisma.empty;
   // The manual seeds are ranked over their own distances, materialised first: an HNSW scan answers
   // from the tuples it visited in distance order, so a filtered, ordered query can return nothing
   // for entities that exist. See engine/vector-order.ts.
@@ -100,9 +110,9 @@ async function findGraphSeeds(db: GraphReader, options: GraphSearch, chunks: Pri
       WHERE e."projectId" = ${projectId} AND m.embedding IS NOT NULL ${types}
         AND ${activeMention(Prisma.sql`m."chunkId"`, chunks)}
       GROUP BY e.id ORDER BY distance, e.id LIMIT ${topK}
-    )
+    )${nameSeeds}
     SELECT id, 1 - MIN(distance) AS similarity
-    FROM (SELECT * FROM manual_seeds UNION ALL SELECT * FROM extracted_seeds) ranked
+    FROM (SELECT * FROM manual_seeds UNION ALL SELECT * FROM extracted_seeds${nameUnion}) ranked
     GROUP BY id ORDER BY similarity DESC, id LIMIT ${topK}
   `;
 }

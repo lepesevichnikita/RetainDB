@@ -3341,7 +3341,7 @@ api.post(
     const body = c.req.valid("json");
     const project = await ensureProject(auth.orgId, body.project, auth.isAdmin);
     const { entities, relations } = await searchEntityGraph({
-      projectId: project.id, embedding: await embedSingle(body.query),
+      projectId: project.id, query: body.query, embedding: await embedSingle(body.query),
       depth: body.depth, topK: body.top_k, entityTypes: body.entity_types,
     });
     return c.json({

@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
-const BASE_URL = (process.env.RETAINDB_BASE_URL || "http://localhost:3111").replace(/\/+$/, "");
-const API_KEY = process.env.RETAINDB_API_KEY || "";
+import { API_KEY, BASE_URL } from "./_config.mjs";
 const AUTO_CONTEXT = process.env.RETAINDB_AUTO_CONTEXT !== "false";
 const COMPRESS_TOOL_OUTPUT = process.env.RETAINDB_COMPRESS_TOOL_OUTPUT !== "false";
 const TOKEN_BUDGET = Number(process.env.RETAINDB_TOKEN_BUDGET || 1200);

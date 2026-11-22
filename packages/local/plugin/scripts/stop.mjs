@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { capture } from "./_capture.mjs";
 
-const BASE_URL = (process.env.RETAINDB_BASE_URL || "http://localhost:3111").replace(/\/+$/, "");
+import { API_KEY, BASE_URL } from "./_config.mjs";
 let input = "";
 for await (const chunk of process.stdin) input += chunk;
 let data = {};

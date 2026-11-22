@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { capture, printContextPack } from "./_capture.mjs";
 
-const BASE_URL = (process.env.RETAINDB_BASE_URL || "http://localhost:3111").replace(/\/+$/, "");
+import { API_KEY, BASE_URL } from "./_config.mjs";
 
 let input = "";
 for await (const chunk of process.stdin) input += chunk;
@@ -11,7 +11,7 @@ try { data = input.trim() ? JSON.parse(input) : {}; } catch {}
 try {
   const res = await fetch(`${BASE_URL}/retaindb/session/start`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(API_KEY ? { Authorization: `Bearer ${API_KEY}` } : {}) },
     body: JSON.stringify({
       sessionId: data.session_id || data.sessionId || process.env.RETAINDB_SESSION_ID,
       project: process.env.RETAINDB_PROJECT || data.cwd || data.project || "default",

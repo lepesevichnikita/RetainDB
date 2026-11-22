@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
+import { rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -50,10 +53,11 @@ async function startRecorder(t, requests, apiKey) {
   return `http://127.0.0.1:${server.address().port}`;
 }
 
-async function invokeHook(baseUrl, kind, data, apiKey) {
+async function invokeHook(baseUrl, kind, data, apiKey, configPath = join(tmpdir(), "retaindb-absent-config.json")) {
   const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith("RETAINDB_")));
   Object.assign(env, {
     RETAINDB_BASE_URL: baseUrl,
+    RETAINDB_CONFIG: configPath,
     RETAINDB_PROJECT: "native-hook-regression",
     RETAINDB_SESSION_ID: "hook-session",
     RETAINDB_AUTO_CONTEXT: "true",
@@ -84,6 +88,29 @@ function assertRequests(requests, paths, protectedAccess) {
     assert.equal(request.contentType, "application/json");
   }
 }
+
+test("the config file supplies the base url and key when the environment has neither", { timeout: 20000 }, async (t) => {
+  const requests = [];
+  const key = randomUUID();
+  const baseUrl = await startRecorder(t, requests, key);
+  const configPath = join(tmpdir(), `retaindb-config-${randomUUID()}.json`);
+  await writeFile(configPath, JSON.stringify({ api: baseUrl, token: key, project: "native-hook-regression" }));
+  t.after(async () => { await rm(configPath, { force: true }); });
+
+  const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith("RETAINDB_")));
+  Object.assign(env, { RETAINDB_CONFIG: configPath, RETAINDB_SESSION_ID: "hook-session", TSX_DISABLE_CACHE: "1", NODE_NO_WARNINGS: "1" });
+  await new Promise((resolve, reject) => {
+    const child = execFile(process.execPath, [join(packageRoot, "plugin", "scripts", "session-start.mjs")],
+      { cwd: packageRoot, env, timeout: 10000 },
+      (error) => error ? reject(error) : resolve());
+    child.stdin.end(JSON.stringify({ prompt: "Recall project context", cwd: packageRoot }));
+  });
+
+  const accepted = requests.filter((request) => request.authorization === "accepted");
+  assert.ok(accepted.length > 0, "a hook configured from the file must authenticate");
+  assert.ok(accepted.some((request) => request.path === "/v1/context/pack"), "the context pack must be requested");
+  assert.equal(requests.filter((request) => request.authorization !== "accepted").length, 0, "no hook request may go out unauthenticated");
+});
 
 for (const mode of ["protected", "open-unset", "open-empty"]) {
   for (const kind of ["prompt", "pre_tool_use", "pre_compact"]) {

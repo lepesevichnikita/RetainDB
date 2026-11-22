@@ -1,4 +1,3 @@
--- Records which model produced a chunk vector, so a corpus can be checked for one model
--- and re-embedded without guessing. Existing rows stay NULL and read as "unknown model".
+-- The model that produced a vector belongs to the chunk's metadata, not to a column of its own.
 ALTER TABLE "chunks" ADD COLUMN IF NOT EXISTS "embeddingModel" TEXT;
-CREATE INDEX IF NOT EXISTS "chunks_embedding_model_idx" ON "chunks" ("embeddingModel");
+DROP INDEX IF EXISTS "chunks_embedding_model_idx";

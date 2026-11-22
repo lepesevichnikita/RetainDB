@@ -1466,14 +1466,14 @@ api.get(
       SELECT id, content FROM chunks
       WHERE "projectId" = ${project.id}::uuid
         AND embedding IS NOT NULL
-        AND ("embeddingModel" IS NULL OR "embeddingModel" <> ${model})
+        AND (metadata->>'embedding_model' IS NULL OR metadata->>'embedding_model' <> ${model})
       ORDER BY id LIMIT ${limit}
     `;
     const [{ remaining }] = await prisma.$queryRaw<Array<{ remaining: bigint }>>`
       SELECT count(*) AS remaining FROM chunks
       WHERE "projectId" = ${project.id}::uuid
         AND embedding IS NOT NULL
-        AND ("embeddingModel" IS NULL OR "embeddingModel" <> ${model})
+        AND (metadata->>'embedding_model' IS NULL OR metadata->>'embedding_model' <> ${model})
     `;
     return c.json({ model, remaining: Number(remaining), chunks: rows });
   }
@@ -1498,7 +1498,9 @@ api.post(
     for (const row of body.vectors) {
       const literal = `[${row.embedding.join(",")}]`;
       updated += await prisma.$executeRaw`
-        UPDATE chunks SET embedding = ${literal}::vector, "embeddingModel" = ${body.model}, "updatedAt" = NOW()
+        UPDATE chunks SET embedding = ${literal}::vector,
+               metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), '{embedding_model}', to_jsonb(${body.model}::text), true),
+               "updatedAt" = NOW()
         WHERE id = ${row.id}::uuid AND "projectId" = ${project.id}::uuid
       `;
     }

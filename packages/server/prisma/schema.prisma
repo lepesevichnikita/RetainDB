@@ -189,7 +189,6 @@ model Chunk {
   tokens          Int                    @default(0)
   metadata        Json                   @default("{}")
   embedding       Unsupported("vector")?
-  embeddingModel  String?
   keywords        String[]               @default([])
   importanceScore Float                  @default(0.0)
   parentChunkId   String?

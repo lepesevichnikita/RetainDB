@@ -319,6 +319,7 @@ async function writeChunkRow(chunk: Chunk, target: ChunkInsertTarget): Promise<v
     section_path: chunk.sectionPath || chunk.metadata.section_path || null,
     heading_path: chunk.headingPath || chunk.metadata.heading_path || null,
     parent_chunk_id: chunk.parentTempId || null,
+    ...(chunk.searchable && target.embeddingModel ? { embedding_model: target.embeddingModel } : {}),
     content_kind: chunk.metadata.content_kind || (chunk.role === "parent" ? "parent_context" : chunk.role),
   });
   const vector = chunk.searchable ? target.vectors.get(chunk.tempId) : undefined;
@@ -330,13 +331,13 @@ async function writeChunkRow(chunk: Chunk, target: ChunkInsertTarget): Promise<v
     INSERT INTO "chunks" (
       id, "documentId", "projectId", content, "chunkType", "chunkIndex", metadata,
       "tokenCount", tokens, "searchContent", "contentHash", "parentChunkId", "sectionPath",
-      "headingPath", embedding, "embeddingModel", "createdAt", "updatedAt"
+      "headingPath", embedding, "createdAt", "updatedAt"
     )
     VALUES (
       ${id}::uuid, ${target.documentId}, ${target.projectId}, ${chunk.content}, ${chunk.chunkType}, ${chunk.chunkIndex},
       ${metadataJson}::jsonb, ${tokens}, ${tokens},
       ${searchContent}, ${contentHash}, ${parentDbId}, ${chunk.sectionPath || null}, ${chunk.headingPath || null},
-      ${embedding}::vector, ${vector ? target.embeddingModel ?? null : null}, NOW(), NOW()
+      ${embedding}::vector, NOW(), NOW()
     )
   `;
 }

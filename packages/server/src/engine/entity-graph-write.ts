@@ -1,6 +1,5 @@
 import { z } from "zod";
 import { prisma, Prisma } from "../db/index.js";
-import { embed } from "./embeddings.js";
 
 type GraphWriter = Pick<Prisma.TransactionClient, "$queryRaw" | "$executeRaw">;
 
@@ -40,7 +39,6 @@ function jsonMetadata(metadata: Prisma.InputJsonObject | undefined) {
 
 export async function saveGraphEntity(input: EntityInput) {
   const id = await writeManualEntity(input);
-  await fillMissingVectors(prisma, input.projectId, [id]);
   await refreshEntityVectors(prisma, [id]);
   return prisma.entity.findUniqueOrThrow({ where: { id }, select: {
     id: true, documentId: true, projectId: true, name: true, type: true, entityType: true,
@@ -94,30 +92,6 @@ export async function refreshEntityVectors(
     WHERE e.id = m.id AND (e.embedding IS NULL OR e.embedding IS DISTINCT FROM m.centroid)
   `;
   return updated;
-}
-
-/**
- * A node nobody mentions has no chunk vector to inherit, so it gets one from its own label.
- * Batched: one model call per payload, not per row.
- */
-async function fillMissingVectors(
-  tx: Pick<Prisma.TransactionClient, "$queryRaw" | "$executeRaw">,
-  projectId: string,
-  entityIds: readonly string[],
-) {
-  if (entityIds.length === 0) return 0;
-  const rows = await tx.$queryRaw<{ id: string; name: string; entityType: string }[]>`
-    SELECT id, name, "entityType" FROM entities
-    WHERE "projectId" = ${projectId} AND id = ANY(${[...entityIds]}::text[]) AND embedding IS NULL
-  `;
-  if (rows.length === 0) return 0;
-  const vectors = await embed(rows.map((row) => `${row.entityType}: ${row.name}`));
-  for (const [index, row] of rows.entries()) {
-    await tx.$executeRaw`
-      UPDATE entities SET embedding = ${vectorLiteral(vectors[index])}::vector WHERE id = ${row.id}
-    `;
-  }
-  return rows.length;
 }
 
 export function saveGraphRelation(input: RelationInput) {
@@ -282,9 +256,7 @@ export async function saveGraphBatch(projectId: string, input: BatchGraphInput) 
   return prisma.$transaction(async (tx) => {
     const ids = await upsertBatchEntities(tx, projectId, entities);
     const relations = await upsertBatchRelations(tx, projectId, batchEdges(input.relations, ids));
-    const entityIds = [...ids.values()];
-    await fillMissingVectors(tx, projectId, entityIds);
-    await refreshEntityVectors(tx, entityIds);
+    await refreshEntityVectors(tx, [...ids.values()]);
     return { entities: ids.size, relations };
   });
 }

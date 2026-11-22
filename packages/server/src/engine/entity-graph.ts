@@ -94,7 +94,7 @@ async function findGraphSeeds(db: GraphReader, options: GraphSearch, chunks: Pri
       ORDER BY length(e.name), e.id LIMIT ${topK}
     )`
     : Prisma.empty;
-  const nameUnion = query ? Prisma.sql`UNION ALL SELECT * FROM name_seeds` : Prisma.empty;
+  const nameUnion = query ? Prisma.sql` UNION ALL SELECT * FROM name_seeds` : Prisma.empty;
   // The manual seeds are ranked over their own distances, materialised first: an HNSW scan answers
   // from the tuples it visited in distance order, so a filtered, ordered query can return nothing
   // for entities that exist. See engine/vector-order.ts.

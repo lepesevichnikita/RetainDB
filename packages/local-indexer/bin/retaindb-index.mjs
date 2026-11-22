@@ -18,6 +18,7 @@ import { IndexQueue, drainQueue } from "../src/queue.mjs";
 const MAX_BYTES = 1024 * 1024;
 const DEFAULT_BATCH = 200;
 const DEFAULT_DELAY_MS = 200;
+const EMBED_BATCH = 8;
 const RETRIES = 3;
 const MANIFEST_VERSION = 1;
 const MAX_SYMBOLS_PER_FILE = 20;
@@ -47,6 +48,8 @@ Options:
   --graph     also send the symbol graph to /v1/entities and /v1/relations
   --batch     chunks per request (default 200)
   --delay     pause between batches in ms (default 200)
+  --embed     compute vectors here with @xenova/transformers, so the server only stores them
+              optional value: model id (default Xenova/bge-large-en-v1.5, 1024 dimensions)
   --help      this text
 
 Flags beat environment, environment beats ~/.retaindb-mcp/config.json
@@ -243,15 +246,24 @@ export async function run(options) {
   const accepted = await enqueueFiles(root, files, known, chunks, symbols, options.graph);
   const pending = { chunks: chunks.size, graph: symbols.size };
   if (options.dryRun) return { root, files: files.length, items: chunks.size, sent: 0, pending };
+  const embedLocal = options.embed ? await createEmbedder(options.embed) : null;
   const sent = await drainQueue(
     chunks,
-    (items) => withRetries(() => postBatch(options.api, options.key, options.project, items)),
-    { groupSize: batch, concurrency: 1, delayMs: delay },
+    async (items) => {
+      const payload = embedLocal ? await withVectors(items, embedLocal) : items;
+      return withRetries(() => postBatch(options.api, options.key, options.project, payload));
+    },
+    { groupSize: embedLocal ? Math.min(batch, EMBED_BATCH) : batch, concurrency: 1, delayMs: delay },
   );
   const graph = options.graph ? await drainGraph(options, symbols, delay) : null;
   for (const entry of accepted) known[entry.path] = entry.sha;
   await saveManifest(manifest);
   return { root, files: files.length, items: sent, sent, changed: accepted.length, graph, pending };
+}
+
+async function withVectors(items, embed) {
+  const vectors = await embed(items.map((item) => item.content));
+  return items.map((item, index) => ({ ...item, embedding: vectors[index] }));
 }
 
 async function drainGraph(options, symbols, delay) {
@@ -283,8 +295,11 @@ export function parseOptions(argv, env, config = {}) {
   const graph = argv.includes("--graph");
   const batch = Number(readFlag(argv, "batch", DEFAULT_BATCH));
   const delay = Number(readFlag(argv, "delay", DEFAULT_DELAY_MS));
+  const embedFlag = argv.includes("--embed");
+  const embedNext = embedFlag ? argv[argv.indexOf("--embed") + 1] : undefined;
+  const embed = embedFlag ? resolveModel(embedNext && !embedNext.startsWith("--") ? embedNext : true) : "";
   if (!dryRun && (!api || !key)) throw new Error("no API target: pass --api/--key, set RETAINDB_BASE_URL/RETAINDB_API_KEY, or write ~/.retaindb-mcp/config.json");
-  return { root, api, key, project, dryRun, graph, batch, delay };
+  return { root, api, key, project, dryRun, graph, batch, delay, embed };
 }
 
 async function main() {

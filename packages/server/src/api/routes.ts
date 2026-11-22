@@ -28,7 +28,7 @@ import { syncHuggingFace } from "../connectors/huggingface.js";
 import { syncWeb } from "../connectors/web.js";
 import { ingestDocument } from "../engine/ingest.js";
 import { fireWebhookEvent } from "../engine/webhooks.js";
-import { embedSingle } from "../engine/embeddings.js";
+import { embed, embedSingle } from "../engine/embeddings.js";
 import { ensureGraphEntityId, entityRelationType, saveGraphBatch, saveGraphEntity, saveGraphRelation } from "../engine/entity-graph-write.js";
 import { countGraphEntities, searchEntityGraph } from "../engine/entity-graph.js";
 import { ingestSession as ingestMemorySession, searchMemories } from "../engine/memory/index.js";
@@ -675,6 +675,7 @@ async function learnTextContent(params: {
   project: { id: string; orgId: string; name: string; slug: string | null };
   traceId: string;
   input: z.infer<typeof learnRequestSchema> & { mode: "text" };
+  embedTexts?: (texts: string[]) => Promise<number[][]>;
 }) {
   const { auth, project, traceId, input } = params;
   const asyncMode = input.options?.async !== false;
@@ -721,6 +722,7 @@ async function learnTextContent(params: {
     ingestionProfile: input.options?.ingestion_profile,
     strategyOverride: input.options?.strategy_override,
     profileConfig: input.options?.profile_config as any,
+    ...(params.embedTexts ? { embedTexts: params.embedTexts } : {}),
   });
   return {
     success: true as const,
@@ -1300,6 +1302,7 @@ const batchLearnItemSchema = z.discriminatedUnion("type", [
     type: z.literal("text"),
     title: z.string().min(1),
     content: z.string().min(1),
+    embedding: z.array(z.number().finite()).length(1024).optional(),
     metadata: z.record(z.any()).optional(),
     tags: z.array(z.string()).optional(),
     custom_id: z.string().max(100).optional(),
@@ -1354,6 +1357,7 @@ api.post(
         const itemTags = [...(body.tags || []), ...(("tags" in item && item.tags) ? item.tags : [])];
         try {
           if (item.type === "text") {
+            const clientVector = item.embedding;
             const result = await learnTextContent({
               auth,
               project,
@@ -1366,10 +1370,15 @@ api.post(
                 metadata: { ...(item.metadata || {}), ...(item.custom_id ? { custom_id: item.custom_id } : {}) },
                 namespace: body.namespace,
                 tags: itemTags,
-                options: { async: body.async !== false },
+                options: { async: clientVector ? false : body.async !== false },
               },
+              embedTexts: clientVector ? async (texts: string[]) => (texts.length === 1 ? [clientVector] : embed(texts)) : undefined,
             });
-            accepted.push({ index, type: "text", custom_id: item.custom_id, status: "queued", job_id: result.job_id });
+            accepted.push({
+              index, type: "text", custom_id: item.custom_id,
+              status: clientVector ? "completed" : "queued",
+              job_id: (result as { job_id?: string }).job_id,
+            });
 
           } else if (item.type === "url") {
             const result = await learnSourceContent({

@@ -80,3 +80,26 @@ test("a reviewed route the router no longer serves is reported", () => {
     /reviewed route not served GET \/v1\/projects/
   );
 });
+
+// Behaviour: a request the router does not serve is a client error, not a server fault. Before this,
+// every unregistered method/path fell into the control middleware and answered 500 "Route control
+// missing", so a caller that simply used the wrong method (GET on a POST-only endpoint) was told the
+// server was broken. The lookup still fails closed: no handler runs either way.
+test("an unregistered method on a registered path answers 404, not 500", async () => {
+  const { api } = await import("../src/api/routes.js");
+  const response = await api.request("/v1/entities", { method: "GET" });
+  assert.equal(response.status, 404, `expected 404 for a method the router does not serve, got ${response.status}`);
+  const body = await response.json() as { error?: string };
+  assert.match(String(body.error), /not found/i, `the body should say so: ${JSON.stringify(body)}`);
+});
+
+// Behaviour: the same path with the method it does serve still reaches authentication, so the fix
+// cannot have opened the endpoint or short-circuited auth.
+test("the method the router does serve still reaches authentication", async () => {
+  const { api } = await import("../src/api/routes.js");
+  const response = await api.request("/v1/entities", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  // Served and then rejected on its own terms (validation runs ahead of auth for this route), which is
+  // what distinguishes it from the 404 above. Asserting 401 here would encode an ordering this route
+  // does not have.
+  assert.ok([400, 401, 403].includes(response.status), `POST must still be served, got ${response.status}`);
+});

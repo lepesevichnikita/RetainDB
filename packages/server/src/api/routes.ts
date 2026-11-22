@@ -199,7 +199,12 @@ api.use("/*", async (c, next) => {
   const routeMatrix = getNodeRouteMatrix();
   const control = getRouteControl(routeMatrix, c.req.method, c.req.path);
   if (!control) {
-    return c.json({ error: "Route control missing", trace_id: traceId }, 500);
+    // No control means the router does not serve this method/path combination, which is a client
+    // error: the request asked for something that does not exist. It used to answer 500 "Route
+    // control missing", so a wrong method on a real endpoint (GET on a POST-only route) read as a
+    // server fault. It still fails closed - no handler runs - and a registered route that is missing
+    // its control cannot reach here unnoticed, because the coverage test fails the build.
+    return c.json({ error: "Route not found", trace_id: traceId }, 404);
   }
   if (control.authMode === "admin_only" && !auth.isAdmin) {
     return c.json({ error: "Admin access required", trace_id: traceId }, 403);

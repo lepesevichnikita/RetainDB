@@ -8,14 +8,14 @@
  */
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
+import { realpathSync } from "node:fs";
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, extname, join, relative, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import { chunkSource } from "../src/chunker.mjs";
 
 const MAX_BYTES = 256 * 1024;
-const MAX_CHUNK_CHARS = 12_000;
-const CHUNK_LINES = 60;
-const OVERLAP_LINES = 8;
 const BATCH_ITEMS = 200;
 const RETRIES = 3;
 const MANIFEST_VERSION = 1;
@@ -30,6 +30,21 @@ const SKIP_DIRS = new Set([
   ".git", "node_modules", "dist", "build", "target", "vendor", ".venv", "venv",
   "__pycache__", ".next", ".turbo", ".cache",
 ]);
+
+const HELP = `retaindb-index: index a repository where it lives and ship chunks to RetainDB
+
+Usage:
+  retaindb-index --root <dir> --api <url> --key <key> [--project <name>] [--dry-run]
+
+Options:
+  --root      repository to index (default: current directory)
+  --api       RetainDB base URL (default: $RETAINDB_BASE_URL)
+  --key       API key (default: $RETAINDB_API_KEY)
+  --project   project name or slug (default: $RETAINDB_PROJECT or "default")
+  --dry-run   report what would be sent, post nothing
+  --help      this text
+
+Reads files here, posts POST /v1/learn/batch. Repository-relative paths only.`;
 
 function manifestFile() {
   return join(homedir(), ".retaindb-mcp", "index-manifest.json");
@@ -50,8 +65,7 @@ async function saveManifest(manifest) {
 }
 
 function isCodeFile(path) {
-  const dot = path.lastIndexOf(".");
-  return dot > 0 && CODE_EXTENSIONS.has(path.slice(dot).toLowerCase());
+  return CODE_EXTENSIONS.has(extname(path).toLowerCase());
 }
 
 function gitTrackedFiles(root) {
@@ -96,23 +110,6 @@ function digest(text) {
   return createHash("sha256").update(text).digest("hex");
 }
 
-function toChunk(lines, start, end) {
-  const text = lines.slice(start, end).join("\n").slice(0, MAX_CHUNK_CHARS);
-  return { start_line: start + 1, end_line: end, content: text };
-}
-
-function chunkText(text) {
-  const lines = text.split("\n");
-  const step = CHUNK_LINES - OVERLAP_LINES;
-  const chunks = [];
-  for (let start = 0; start < lines.length; start += step) {
-    const end = Math.min(start + CHUNK_LINES, lines.length);
-    chunks.push(toChunk(lines, start, end));
-    if (end === lines.length) break;
-  }
-  return chunks;
-}
-
 function toItem(path, sha, chunk) {
   const identity = `${path}#${chunk.start_line}#${sha.slice(0, 12)}`;
   return {
@@ -125,6 +122,7 @@ function toItem(path, sha, chunk) {
       path,
       start_line: chunk.start_line,
       end_line: chunk.end_line,
+      symbol: chunk.symbol ?? null,
       sha,
     },
   };
@@ -158,7 +156,8 @@ async function withRetries(attempt) {
 async function chunksForFile(root, path) {
   const text = await readTextFile(resolve(root, path));
   if (text === null) return null;
-  return { sha: digest(text), chunks: chunkText(text) };
+  const chunks = await chunkSource(text, extname(path).toLowerCase());
+  return { sha: digest(text), chunks };
 }
 
 async function collectItems(root, files, known) {
@@ -215,12 +214,16 @@ function parseOptions(argv, env) {
 }
 
 async function main() {
-  const options = parseOptions(process.argv.slice(2), process.env);
+  const argv = process.argv.slice(2);
+  if (argv.includes("--help") || argv.includes("-h")) return process.stdout.write(`${HELP}\n`);
+  const options = parseOptions(argv, process.env);
   const report = await run(options);
   process.stdout.write(`${JSON.stringify(report)}\n`);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+const entry = process.argv[1] ? pathToFileURL(realpathSync(process.argv[1])).href : "";
+
+if (import.meta.url === entry) {
   main().catch((error) => {
     process.stderr.write(`retaindb-index: ${error.message}\n`);
     process.exitCode = 1;

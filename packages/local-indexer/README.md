@@ -9,6 +9,13 @@ node packages/local-indexer/bin/retaindb-index.mjs \
   --api https://retaindb.home.lan --key "$RETAINDB_API_KEY"
 ```
 
+## Install
+
+```bash
+npm i -g ./packages/local-indexer    # puts `retaindb-index` on PATH
+retaindb-index --help
+```
+
 Environment fallbacks: `RETAINDB_BASE_URL`, `RETAINDB_API_KEY`, `RETAINDB_PROJECT`.
 `--dry-run` reports what would be sent and posts nothing.
 
@@ -57,12 +64,11 @@ This is the file name already used by `@retaindb/mcp-server` 2.17.0, so both agr
 
 ## Chunking
 
-v1 splits on 60-line windows with 8 lines of overlap, capped at 12,000 characters.
-
-Tree-sitter is the intended chunker: symbol boundaries instead of line windows. It needs
-two dependencies, `web-tree-sitter` and `tree-sitter-wasms`, and neither is installed in
-this checkout, so it is not in this commit. The chunker is one function (`chunkText`) with
-no callers that care how it produces its ranges.
+`src/chunker.mjs` parses with tree-sitter WASM grammars for TypeScript, TSX, JavaScript,
+Python, Go, Rust and Java, then emits symbol ranges (functions, classes, methods) merged
+into windows of at most 60 lines. Adjacent symbols closer than 3 lines merge. A file with
+no grammar, or one that yields no symbols, falls back to 60-line windows with 8 lines of
+overlap. Every chunk is capped at 12,000 characters.
 
 ## Tests
 
@@ -71,5 +77,5 @@ node --test packages/local-indexer/test/indexer.test.mjs
 ```
 
 Six end-to-end cases against a real git repository and a real HTTP receiver: indexing,
-relative-paths-only, binary exclusion, overlapping chunks, unchanged-file skip on the
-second run, and dry run.
+relative-paths-only, binary exclusion, chunk splitting, unchanged-file skip on the second
+run, and dry run. `npm test` inside the package runs the same file.

@@ -1,7 +1,8 @@
 # `@retaindb/local-indexer`
 
-One file, no dependencies. It indexes a repository where the repository lives and posts
-the result to RetainDB. The server never sees a path and never reads a file.
+One package, two dependencies (tree-sitter grammars). It indexes a directory where the
+directory lives and posts the result to RetainDB. The server never sees a path and never
+reads a file.
 
 ```
 node packages/local-indexer/bin/retaindb-index.mjs \
@@ -27,8 +28,13 @@ file the server process can see. So the split is:
 
 | Side | Does |
 | --- | --- |
-| client (this tool) | walks the worktree, reads bytes, splits into chunks, keeps the manifest |
+| client (this tool) | walks the directory, reads bytes, splits into chunks, keeps the manifest |
 | server | receives `POST /v1/learn/batch` items of `type: "text"`, embeds, stores in pgvector |
+
+No git required and no extension filter: every file under `--root` is a candidate, `.git`
+except. A file is skipped only when it reads as binary (a NUL byte), exceeds 1 MB, or is
+whitespace. Everything else is chunked and shipped, including source, docs, configs and
+notes.
 
 The request body contains chunk text and repository-relative paths only. The tests assert
 that the receiver never observes an absolute path, a binary file, or a file the client did

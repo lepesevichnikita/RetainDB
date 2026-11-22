@@ -8,7 +8,7 @@ import { readdirSync, readFileSync, statSync } from "fs";
 import { join, relative, extname } from "path";
 import { userInfo } from "os";
 import { createHash } from "crypto";
-import { RetainDBContext } from "../../sdk/src/index.js";
+import { RetainDBContext } from "@retaindb/sdk";
 import {
   buildMcpSearchPayload,
   buildPrimaryToolSuccess,
@@ -26,7 +26,7 @@ const BASE_URL = process.env.RETAINDB_BASE_URL || "http://localhost:3111";
 
 function makeClient(): RetainDBContext {
   return new RetainDBContext({
-    apiKey: API_KEY,
+    apiKey: API_KEY || "anonymous",
     project: DEFAULT_PROJECT,
     ...(BASE_URL ? { baseUrl: BASE_URL } : {}),
   });

@@ -17,7 +17,20 @@ npm i -g ./packages/local-indexer    # puts `retaindb-index` on PATH
 retaindb-index --help
 ```
 
-Environment fallbacks: `RETAINDB_BASE_URL`, `RETAINDB_API_KEY`, `RETAINDB_PROJECT`.
+Then write the target once, and run with no flags after that:
+
+```bash
+mkdir -p ~/.retaindb-mcp && chmod 700 ~/.retaindb-mcp
+cat > ~/.retaindb-mcp/config.json <<'JSON'
+{"api": "https://retaindb-api.home.lan", "project": "retaindb", "token": "<api key>"}
+JSON
+chmod 600 ~/.retaindb-mcp/config.json
+retaindb-index --root /path/to/code
+```
+
+Precedence: flags, then `RETAINDB_BASE_URL` / `RETAINDB_API_KEY` / `RETAINDB_PROJECT`, then
+the config file.
+
 `--dry-run` reports what would be sent and posts nothing.
 
 ## Why it is built this way

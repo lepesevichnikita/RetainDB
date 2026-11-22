@@ -36,10 +36,28 @@ Options:
   --dry-run   report what would be sent, post nothing
   --help      this text
 
+Flags beat environment, environment beats ~/.retaindb-mcp/config.json
+({"api": "...", "project": "...", "token": "..."}, chmod 600).
+
 Reads files here, posts POST /v1/learn/batch. Repository-relative paths only.`;
 
 function manifestFile() {
   return join(homedir(), ".retaindb-mcp", "index-manifest.json");
+}
+
+export function configFile() {
+  return join(homedir(), ".retaindb-mcp", "config.json");
+}
+
+export async function loadConfig() {
+  try {
+    const raw = await readFile(configFile(), "utf8");
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null) return {};
+    return parsed;
+  } catch {
+    return {};
+  }
 }
 
 async function loadManifest() {
@@ -171,20 +189,20 @@ function readFlag(argv, name, fallback) {
   return argv[index + 1] ?? fallback;
 }
 
-function parseOptions(argv, env) {
+export function parseOptions(argv, env, config = {}) {
   const root = readFlag(argv, "root", process.cwd());
-  const api = readFlag(argv, "api", env.RETAINDB_BASE_URL);
-  const key = readFlag(argv, "key", env.RETAINDB_API_KEY);
-  const project = readFlag(argv, "project", env.RETAINDB_PROJECT ?? "default");
+  const api = readFlag(argv, "api", env.RETAINDB_BASE_URL ?? config.api);
+  const key = readFlag(argv, "key", env.RETAINDB_API_KEY ?? config.token);
+  const project = readFlag(argv, "project", env.RETAINDB_PROJECT ?? config.project ?? "default");
   const dryRun = argv.includes("--dry-run");
-  if (!dryRun && (!api || !key)) throw new Error("--api and --key are required (or RETAINDB_BASE_URL / RETAINDB_API_KEY)");
+  if (!dryRun && (!api || !key)) throw new Error("no API target: pass --api/--key, set RETAINDB_BASE_URL/RETAINDB_API_KEY, or write ~/.retaindb-mcp/config.json");
   return { root, api, key, project, dryRun };
 }
 
 async function main() {
   const argv = process.argv.slice(2);
   if (argv.includes("--help") || argv.includes("-h")) return process.stdout.write(`${HELP}\n`);
-  const options = parseOptions(argv, process.env);
+  const options = parseOptions(argv, process.env, await loadConfig());
   const report = await run(options);
   process.stdout.write(`${JSON.stringify(report)}\n`);
 }

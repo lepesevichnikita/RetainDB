@@ -41,9 +41,10 @@ queues (`~/.retaindb-mcp/chunks.json`, `~/.retaindb-mcp/graph.json`) keyed by id
   replaces its earlier chunks instead of sending both
 - a batch is dropped from the queue only after the server accepted it, so a killed run
   resumes with exactly what is left
-- `--batch` sets chunks per request (200), `--delay` pauses between batches (200 ms),
-  `--concurrency` caps graph requests in flight (1 by default: every entity write costs a
-  server-side embedding, so a wider window starves a single-pod deployment)
+- `--batch` sets rows per request (200) for both chunks and graph: graph rows go through
+  `POST /v1/graph/batch`, which writes entities and relations in one transaction and never
+  calls the embedding model (node vectors are derived from the chunk vectors)
+- `--delay` pauses between batches (200 ms)
 
 `--dry-run` reports what would be sent and posts nothing.
 

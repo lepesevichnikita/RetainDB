@@ -206,6 +206,7 @@ model Chunk {
   memories      Memory[]      @relation("MemorySourceChunk")
   entityMentions EntityMention[]
   entityRelationMentions EntityRelationMention[]
+  entityRelationSources  EntityRelation[] @relation("EntityRelationSource")
 
   @@index([documentId])
   @@index([contentHash])
@@ -358,15 +359,18 @@ model EntityRelation {
   weight       Float    @default(1.0)
   metadata     Json     @default("{}")
   isManual     Boolean  @default(true)
+  sourceChunkId String?
   createdAt    DateTime @default(now())
 
   project    Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
   fromEntity Entity   @relation("EntityFrom", fields: [fromEntityId], references: [id], onDelete: Cascade)
   toEntity   Entity   @relation("EntityTo", fields: [toEntityId], references: [id], onDelete: Cascade)
+  sourceChunk Chunk?  @relation("EntityRelationSource", fields: [sourceChunkId], references: [id], onDelete: SetNull)
   mentions   EntityRelationMention[]
 
   @@unique([fromEntityId, toEntityId, relationType])
   @@index([projectId])
+  @@index([sourceChunkId])
   @@map("entity_relations")
 }
 

@@ -29,7 +29,7 @@ import { syncWeb } from "../connectors/web.js";
 import { ingestDocument } from "../engine/ingest.js";
 import { fireWebhookEvent } from "../engine/webhooks.js";
 import { embedSingle } from "../engine/embeddings.js";
-import { ensureGraphEntityId, entityRelationType, saveGraphEntity, saveGraphRelation } from "../engine/entity-graph-write.js";
+import { ensureGraphEntityId, entityRelationType, saveGraphBatch, saveGraphEntity, saveGraphRelation } from "../engine/entity-graph-write.js";
 import { countGraphEntities, searchEntityGraph } from "../engine/entity-graph.js";
 import { ingestSession as ingestMemorySession, searchMemories } from "../engine/memory/index.js";
 import { writeMemoryCanonical } from "../engine/memory/write.js";
@@ -3179,6 +3179,43 @@ api.post(
       description: body.description, metadata: body.metadata,
     });
     return c.json(entity, 201);
+  }
+);
+
+api.post(
+  "/v1/graph/batch",
+  zValidator("json", z.object({
+    project: z.string().optional(),
+    entities: z.array(z.object({
+      name: z.string().min(1),
+      entity_type: z.string().min(1),
+      description: z.string().optional(),
+    })).default([]),
+    relations: z.array(z.object({
+      from_entity: z.string().min(1),
+      from_type: z.string().min(1),
+      to_entity: z.string().min(1),
+      to_type: z.string().min(1),
+      relation_type: entityRelationType,
+      source_chunk_id: z.string().optional(),
+    })).default([]),
+  })),
+  async (c) => {
+    const auth = c.get("auth");
+    const body = c.req.valid("json");
+    const project = await ensureProject(auth.orgId, body.project, auth.isAdmin);
+    const written = await saveGraphBatch(project.id, {
+      entities: body.entities.map((entity) => ({
+        name: entity.name, entityType: entity.entity_type, description: entity.description,
+      })),
+      relations: body.relations.map((relation) => ({
+        from: { name: relation.from_entity, entityType: relation.from_type },
+        to: { name: relation.to_entity, entityType: relation.to_type },
+        type: relation.relation_type,
+        sourceChunkId: relation.source_chunk_id,
+      })),
+    });
+    return c.json(written, 201);
   }
 );
 

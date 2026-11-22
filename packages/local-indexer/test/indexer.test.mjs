@@ -13,6 +13,7 @@ import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, parseOptions, run } from "../bin/retaindb-index.mjs";
+import { IndexQueue, drainQueue } from "../src/queue.mjs";
 
 const HOME_BACKUP = process.env.HOME;
 let repository;
@@ -20,6 +21,9 @@ let home;
 let receiver;
 let api;
 let batches;
+let graph;
+let active;
+let maxActive;
 
 before(async () => {
   repository = await mkdtemp(join(tmpdir(), "retaindb-index-"));
@@ -33,11 +37,26 @@ before(async () => {
   await mkdir(join(repository, "docs"), { recursive: true });
   await writeFile(join(repository, "docs", "runbook.md"), "# runbook\nrollback steps\n", "utf8");
   batches = [];
+  graph = [];
+  active = 0;
+  maxActive = 0;
   receiver = createServer((request, response) => {
     let body = "";
     request.on("data", (part) => { body += part; });
     request.on("end", () => {
-      batches.push(JSON.parse(body));
+      const parsed = JSON.parse(body);
+      if (request.url.startsWith("/v1/entities") || request.url.startsWith("/v1/relations")) {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        setTimeout(() => {
+          active -= 1;
+          graph.push({ path: request.url, body: parsed });
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end("{\"success\":true}");
+        }, 10);
+        return;
+      }
+      batches.push(parsed);
       response.writeHead(200, { "content-type": "application/json" });
       response.end("{\"success\":true}");
     });
@@ -107,4 +126,46 @@ test("config file supplies api, project and token, and flags still win", async (
   assert.equal(fromFile.project, "from-config");
   const flagged = parseOptions(["--project", "flag"], {}, config);
   assert.equal(flagged.project, "flag");
+});
+
+test("--graph ships the module, its symbols and the import edges", async () => {
+  await writeFile(join(repository, "src", "gamma.ts"), "import { alpha } from \"./alpha\";\nexport function gamma() { return 3; }\n", "utf8");
+  graph.length = 0;
+  const report = await run({ root: repository, api, key: "test-key", project: "retaindb", dryRun: false, graph: true });
+  assert.equal(report.changed, 1);
+  assert.ok(report.graph.entities >= 2);
+  const entities = graph.filter((call) => call.path === "/v1/entities").map((call) => call.body);
+  const relations = graph.filter((call) => call.path === "/v1/relations").map((call) => call.body);
+  assert.ok(entities.some((entity) => entity.name === "src/gamma.ts" && entity.entity_type === "module"));
+  assert.ok(entities.some((entity) => entity.name === "src/gamma.ts#gamma" && entity.entity_type === "symbol"));
+  assert.ok(relations.some((relation) => relation.relation_type === "part_of"));
+  assert.ok(relations.some((relation) => relation.relation_type === "imports" && relation.to_entity === "./alpha"));
+});
+
+test("a repeated chunk key keeps only the newest payload", async () => {
+  const queue = await IndexQueue.open(join(home, "dedupe.json"));
+  queue.add("src/a.ts#1-2", { content: "old" });
+  queue.add("src/a.ts#1-2", { content: "new" });
+  assert.equal(queue.size, 1);
+  assert.equal(queue.take(10)[0][1].content, "new");
+});
+
+test("a failed drain leaves the whole queue on disk for the next run", async () => {
+  const path = join(home, "resume.json");
+  const queue = await IndexQueue.open(path);
+  queue.add("k1", { n: 1 });
+  queue.add("k2", { n: 2 });
+  await queue.save();
+  await assert.rejects(drainQueue(queue, async () => { throw new Error("boom"); }, { groupSize: 1, concurrency: 1 }));
+  const reopened = await IndexQueue.open(path);
+  assert.equal(reopened.size, 2);
+});
+
+test("in-flight graph requests stay within the concurrency limit", async () => {
+  await writeFile(join(repository, "src", "delta.ts"), "export function delta() { return 4; }\n", "utf8");
+  maxActive = 0;
+  const report = await run({ root: repository, api, key: "test-key", project: "retaindb", dryRun: false, graph: true, concurrency: 2, delay: 0 });
+  assert.ok(report.graph.entities >= 1);
+  assert.ok(maxActive <= 2, `saw ${maxActive} in flight`);
+  assert.ok(maxActive > 1, `never overlapped: ${maxActive}`);
 });

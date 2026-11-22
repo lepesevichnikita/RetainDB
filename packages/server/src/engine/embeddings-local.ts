@@ -38,6 +38,9 @@ let crossEncoder: any = null;
  * Dimensions: 1024
  * MTEB Score: 63.98 (beats OpenAI text-embedding-3-small!)
  */
+/** One multilingual model is the default: it embeds every language into the same space. */
+export const DEFAULT_LOCAL_MODEL = process.env.EMBEDDING_MODEL || 'Xenova/multilingual-e5-large';
+
 async function initEmbedder() {
   await ensureTransformersLoaded();
   if (!pipeline) {
@@ -45,12 +48,13 @@ async function initEmbedder() {
   }
 
   if (!embedder) {
-    console.log('[LocalEmbeddings] Loading BGE-large model (first time may take 1-2 min)...');
+    const model = process.env.EMBEDDING_MODEL || DEFAULT_LOCAL_MODEL;
+    console.log(`[LocalEmbeddings] Loading ${model} (first time may take 1-2 min)...`);
     const startTime = Date.now();
 
     embedder = await pipeline(
       'feature-extraction',
-      'Xenova/bge-large-en-v1.5',
+      model,
       { quantized: true } // Use quantized version for faster inference
     );
 

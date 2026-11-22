@@ -3,10 +3,11 @@
  * server only stores them, so indexing no longer spends server CPU.
  *
  * The model must produce exactly the dimension the database column holds, otherwise the
- * vector cannot be written at all.
+ * vector cannot be written at all. It also has to embed every language the corpus contains
+ * into one space, so the default is multilingual rather than English-only.
  */
 export const EMBEDDING_DIMENSIONS = 1024;
-export const DEFAULT_MODEL = "Xenova/bge-large-en-v1.5";
+export const DEFAULT_MODEL = "Xenova/multilingual-e5-large";
 
 export function resolveModel(flagValue) {
   if (flagValue === true) return DEFAULT_MODEL;

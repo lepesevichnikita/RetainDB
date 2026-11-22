@@ -61,6 +61,7 @@ export interface IngestDocumentInput {
   skipEntityExtraction?: boolean;
   sourceVersionId?: string | null;
   skipSourceCountUpdate?: boolean;
+  embeddingModel?: string;
   embedTexts?: (texts: string[]) => Promise<number[][]>;
 }
 
@@ -200,6 +201,7 @@ export async function ingestDocument(input: IngestDocumentInput) {
       title,
       vectors: embeddedByTempId,
       ids: chunkDbIds,
+      embeddingModel: input.embeddingModel,
     });
 
     readyDoc = await prisma.document.update({
@@ -268,6 +270,8 @@ interface ChunkInsertTarget {
   vectors: ReadonlyMap<string, number[]>;
   /** The row id pre-assigned to each chunk, so a parent's id is known before its children insert. */
   ids: ReadonlyMap<string, string>;
+  /** Model that produced the vectors, recorded so a mixed corpus is detectable. */
+  embeddingModel?: string;
 }
 
 /**
@@ -326,13 +330,13 @@ async function writeChunkRow(chunk: Chunk, target: ChunkInsertTarget): Promise<v
     INSERT INTO "chunks" (
       id, "documentId", "projectId", content, "chunkType", "chunkIndex", metadata,
       "tokenCount", tokens, "searchContent", "contentHash", "parentChunkId", "sectionPath",
-      "headingPath", embedding, "createdAt", "updatedAt"
+      "headingPath", embedding, "embeddingModel", "createdAt", "updatedAt"
     )
     VALUES (
       ${id}::uuid, ${target.documentId}, ${target.projectId}, ${chunk.content}, ${chunk.chunkType}, ${chunk.chunkIndex},
       ${metadataJson}::jsonb, ${tokens}, ${tokens},
       ${searchContent}, ${contentHash}, ${parentDbId}, ${chunk.sectionPath || null}, ${chunk.headingPath || null},
-      ${embedding}::vector, NOW(), NOW()
+      ${embedding}::vector, ${vector ? target.embeddingModel ?? null : null}, NOW(), NOW()
     )
   `;
 }

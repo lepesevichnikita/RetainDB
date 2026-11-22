@@ -303,6 +303,8 @@ const REVIEWED_ROUTES: Record<RouteAuthMode, readonly string[]> = {
     "POST /v1/entities",
     "POST /v1/files",
     "POST /v1/files/:fileId/ingest",
+    "GET /v1/chunks/stale",
+    "POST /v1/chunks/vectors",
     "POST /v1/graph/batch",
     "POST /v1/graph/search",
     "POST /v1/learn/batch",

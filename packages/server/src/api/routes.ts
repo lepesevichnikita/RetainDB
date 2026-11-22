@@ -676,6 +676,7 @@ async function learnTextContent(params: {
   traceId: string;
   input: z.infer<typeof learnRequestSchema> & { mode: "text" };
   embedTexts?: (texts: string[]) => Promise<number[][]>;
+  embeddingModel?: string;
 }) {
   const { auth, project, traceId, input } = params;
   const asyncMode = input.options?.async !== false;
@@ -723,6 +724,7 @@ async function learnTextContent(params: {
     strategyOverride: input.options?.strategy_override,
     profileConfig: input.options?.profile_config as any,
     ...(params.embedTexts ? { embedTexts: params.embedTexts } : {}),
+    ...(params.embeddingModel ? { embeddingModel: params.embeddingModel } : {}),
   });
   return {
     success: true as const,
@@ -1303,6 +1305,7 @@ const batchLearnItemSchema = z.discriminatedUnion("type", [
     title: z.string().min(1),
     content: z.string().min(1),
     embedding: z.array(z.number().finite()).length(1024).optional(),
+    embedding_model: z.string().max(120).optional(),
     metadata: z.record(z.any()).optional(),
     tags: z.array(z.string()).optional(),
     custom_id: z.string().max(100).optional(),
@@ -1372,6 +1375,7 @@ api.post(
                 tags: itemTags,
                 options: { async: clientVector ? false : body.async !== false },
               },
+              embeddingModel: clientVector ? item.embedding_model : undefined,
               embedTexts: clientVector
                 ? async (texts: string[]) => {
                     if (texts.length !== 1) {
@@ -1439,6 +1443,66 @@ api.post(
       items: accepted,
       trace_id: traceId,
     }, 202);
+  }
+);
+
+// ─── Chunk vectors ───────────────────────────────────────────
+
+/**
+ * Hands out the chunks whose vector came from a different model, so a client can embed them
+ * where the files live. One model per corpus is the goal; these two routes are how an existing
+ * corpus moves to it without re-reading a single file on the server.
+ */
+api.get(
+  "/v1/chunks/stale",
+  rateLimitMiddleware(RateLimits.ingest),
+  async (c) => {
+    const auth = c.get("auth") as AuthContext;
+    const project = await ensureLearnProject(auth, c.req.query("project"));
+    const model = String(c.req.query("model") || "");
+    if (!model) return c.json({ error: "model query parameter is required" }, 400);
+    const limit = Math.min(Number(c.req.query("limit") || 64), 256);
+    const rows = await prisma.$queryRaw<Array<{ id: string; content: string }>>`
+      SELECT id, content FROM chunks
+      WHERE "projectId" = ${project.id}::uuid
+        AND embedding IS NOT NULL
+        AND ("embeddingModel" IS NULL OR "embeddingModel" <> ${model})
+      ORDER BY id LIMIT ${limit}
+    `;
+    const [{ remaining }] = await prisma.$queryRaw<Array<{ remaining: bigint }>>`
+      SELECT count(*) AS remaining FROM chunks
+      WHERE "projectId" = ${project.id}::uuid
+        AND embedding IS NOT NULL
+        AND ("embeddingModel" IS NULL OR "embeddingModel" <> ${model})
+    `;
+    return c.json({ model, remaining: Number(remaining), chunks: rows });
+  }
+);
+
+api.post(
+  "/v1/chunks/vectors",
+  rateLimitMiddleware(RateLimits.ingest),
+  zValidator("json", z.object({
+    project: z.string().optional(),
+    model: z.string().min(1).max(120),
+    vectors: z.array(z.object({
+      id: z.string().uuid(),
+      embedding: z.array(z.number().finite()).length(1024),
+    })).min(1).max(256),
+  })),
+  async (c) => {
+    const auth = c.get("auth") as AuthContext;
+    const body = c.req.valid("json");
+    const project = await ensureLearnProject(auth, body.project);
+    let updated = 0;
+    for (const row of body.vectors) {
+      const literal = `[${row.embedding.join(",")}]`;
+      updated += await prisma.$executeRaw`
+        UPDATE chunks SET embedding = ${literal}::vector, "embeddingModel" = ${body.model}, "updatedAt" = NOW()
+        WHERE id = ${row.id}::uuid AND "projectId" = ${project.id}::uuid
+      `;
+    }
+    return c.json({ success: true, model: body.model, updated });
   }
 );
 

@@ -44,7 +44,8 @@ Options:
   --batch     chunks per request (default 200)
   --delay     pause between batches in ms (default 200)
   --embed     compute vectors here with @xenova/transformers, so the server only stores them
-              optional value: model id (default Xenova/bge-large-en-v1.5, 1024 dimensions)
+              optional value: model id (default Xenova/multilingual-e5-large, 1024 dimensions)
+  --reembed   move the stored corpus to that model: fetch stale chunk text, embed here, post vectors
   --help      this text
 
 Flags beat environment, environment beats ~/.retaindb-mcp/config.json
@@ -138,6 +139,14 @@ async function postBatch(api, key, project, items) {
   return response.json().catch(() => ({}));
 }
 
+async function getJson(api, key, path) {
+  const response = await fetch(`${api.replace(/\/$/, "")}${path}`, {
+    headers: { authorization: `Bearer ${key}` },
+  });
+  if (!response.ok) throw new Error(`${path} ${response.status}: ${(await response.text()).slice(0, 200)}`);
+  return response.json();
+}
+
 async function postJson(api, key, path, body) {
   const response = await fetch(`${api.replace(/\/$/, "")}${path}`, {
     method: "POST",
@@ -220,6 +229,7 @@ async function enqueueFiles(root, files, known, chunks, symbols, withGraph) {
 }
 
 export async function run(options) {
+  if (options.reembed) return reembedCorpus(options);
   const batch = options.batch ?? DEFAULT_BATCH;
   const delay = options.delay ?? DEFAULT_DELAY_MS;
   const root = resolve(options.root);
@@ -235,7 +245,7 @@ export async function run(options) {
   const sent = await drainQueue(
     chunks,
     async (items) => {
-      const payload = embedLocal ? await withVectors(items, embedLocal) : items;
+      const payload = embedLocal ? await withVectors(items, embedLocal, options.embed) : items;
       return withRetries(() => postBatch(options.api, options.key, options.project, payload));
     },
     { groupSize: embedLocal ? Math.min(batch, EMBED_BATCH) : batch, concurrency: 1, delayMs: delay },
@@ -246,9 +256,37 @@ export async function run(options) {
   return { root, files: files.length, items: sent, sent, changed: accepted.length, graph, pending };
 }
 
-async function withVectors(items, embed) {
+async function withVectors(items, embed, model) {
   const vectors = await embed(items.map((item) => item.content));
-  return items.map((item, index) => ({ ...item, embedding: vectors[index] }));
+  return items.map((item, index) => ({ ...item, embedding: vectors[index], embedding_model: model }));
+}
+
+/**
+ * Moves an existing corpus onto one model. The server hands out the text of chunks whose
+ * vector came from another model; this machine embeds them and posts the vectors back, so the
+ * service never runs the model and the corpus ends up in a single space.
+ */
+async function reembedCorpus(options) {
+  const embed = await createEmbedder(options.embed);
+  let updated = 0;
+  for (;;) {
+    const page = await getJson(
+      options.api, options.key,
+      `/v1/chunks/stale?model=${encodeURIComponent(options.embed)}&limit=64&project=${encodeURIComponent(options.project)}`,
+    );
+    if (!page.chunks?.length) return { model: options.embed, updated, remaining: 0 };
+    const vectors = [];
+    for (let i = 0; i < page.chunks.length; i += EMBED_BATCH) {
+      const slice = page.chunks.slice(i, i + EMBED_BATCH);
+      const embedded = await embed(slice.map((chunk) => chunk.content));
+      slice.forEach((chunk, index) => vectors.push({ id: chunk.id, embedding: embedded[index] }));
+    }
+    const result = await postJson(options.api, options.key, "/v1/chunks/vectors", {
+      project: options.project, model: options.embed, vectors,
+    });
+    updated += Number(result.updated || 0);
+    process.stderr.write(`[reembed] ${updated} updated, ${page.remaining} left\n`);
+  }
 }
 
 async function drainGraph(options, symbols, delay) {
@@ -280,11 +318,12 @@ export function parseOptions(argv, env, config = {}) {
   const graph = argv.includes("--graph");
   const batch = Number(readFlag(argv, "batch", DEFAULT_BATCH));
   const delay = Number(readFlag(argv, "delay", DEFAULT_DELAY_MS));
-  const embedFlag = argv.includes("--embed");
+  const reembed = argv.includes("--reembed");
+  const embedFlag = argv.includes("--embed") || reembed;
   const embedNext = embedFlag ? argv[argv.indexOf("--embed") + 1] : undefined;
   const embed = embedFlag ? resolveModel(embedNext && !embedNext.startsWith("--") ? embedNext : true) : "";
   if (!dryRun && (!api || !key)) throw new Error("no API target: pass --api/--key, set RETAINDB_BASE_URL/RETAINDB_API_KEY, or write ~/.retaindb-mcp/config.json");
-  return { root, api, key, project, dryRun, graph, batch, delay, embed };
+  return { root, api, key, project, dryRun, graph, batch, delay, embed, reembed };
 }
 
 async function main() {

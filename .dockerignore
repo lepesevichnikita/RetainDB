@@ -1,4 +1,6 @@
 .git
+.metrics
+target
 **/node_modules
 **/dist
 **/.turbo

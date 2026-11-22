@@ -8,6 +8,7 @@ import { prisma } from "../db/index.js";
 import { authMiddleware, type AuthContext } from "../middleware/auth.js";
 import { rateLimitMiddleware, RateLimits } from "../middleware/rate-limit.js";
 import { retrieve } from "../engine/retriever.js";
+import { exactDistanceOrder } from "../engine/vector-order.js";
 import { syncGitHub } from "../connectors/github.js";
 import { syncGitLab } from "../connectors/gitlab.js";
 import { syncUrl } from "../connectors/url.js";
@@ -28,7 +29,7 @@ import { syncWeb } from "../connectors/web.js";
 import { ingestDocument } from "../engine/ingest.js";
 import { fireWebhookEvent } from "../engine/webhooks.js";
 import { embedSingle } from "../engine/embeddings.js";
-import { ensureGraphEntityId, entityRelationType, saveGraphEntity, saveGraphRelation } from "../engine/entity-graph-write.js";
+import { ensureGraphEntityId, entityRelationType, saveGraphBatch, saveGraphEntity, saveGraphRelation } from "../engine/entity-graph-write.js";
 import { countGraphEntities, searchEntityGraph } from "../engine/entity-graph.js";
 import { ingestSession as ingestMemorySession, searchMemories } from "../engine/memory/index.js";
 import { writeMemoryCanonical } from "../engine/memory/write.js";
@@ -42,6 +43,8 @@ import { searchRoutes } from "./search.js";
 import { fileRoutes } from "./files.js";
 import { agentTaskRoutes } from "./agent-tasks.js";
 import { researchAgentRoutes } from "./research-agent.js";
+import { registerRepoIndexRoutes } from "./repo-index.js";
+import { registerRepoIndexAdminRoutes } from "./repo-index-admin.js";
 import { resolveProjectReference, ensureProject, getEffectiveOrgId } from "./helpers.js";
 import { getContractHeaders, getPublicContractMetadata } from "../contracts/runtime.mjs";
 import { getLatencySummary, getLatencyTraceConfig, getLatencyGateStatus, resetLatencySummary } from "../engine/latency-tracing.js";
@@ -196,7 +199,12 @@ api.use("/*", async (c, next) => {
   const routeMatrix = getNodeRouteMatrix();
   const control = getRouteControl(routeMatrix, c.req.method, c.req.path);
   if (!control) {
-    return c.json({ error: "Route control missing", trace_id: traceId }, 500);
+    // No control means the router does not serve this method/path combination, which is a client
+    // error: the request asked for something that does not exist. It used to answer 500 "Route
+    // control missing", so a wrong method on a real endpoint (GET on a POST-only route) read as a
+    // server fault. It still fails closed - no handler runs - and a registered route that is missing
+    // its control cannot reach here unnoticed, because the coverage test fails the build.
+    return c.json({ error: "Route not found", trace_id: traceId }, 404);
   }
   if (control.authMode === "admin_only" && !auth.isAdmin) {
     return c.json({ error: "Admin access required", trace_id: traceId }, 403);
@@ -216,6 +224,8 @@ api.route("/", searchRoutes);
 api.route("/", fileRoutes);
 api.route("/", agentTaskRoutes);
 api.route("/", researchAgentRoutes);
+registerRepoIndexRoutes(api);
+registerRepoIndexAdminRoutes(api);
 
 // ─── Helper ──────────────────────────────────────────────────
 
@@ -959,6 +969,99 @@ function normalizeMemoryType(memoryType?: string) {
 }
 
 
+// ─── Repository attribution ─────────────────────────────────
+
+/**
+ * The publication one repository result came from, as the query route answers it. Path and digest
+ * already travel in the chunk's own metadata (`repo_path`, `repo_digest`), written by
+ * materialisation; generation and revision belong to the publication and no chunk column holds
+ * them, so a client cannot tell which revision of a file it was handed. They are read here from the
+ * path row and the generation it points at, which is the same pairing the repository read routes
+ * serve, and attached to the result.
+ */
+interface RepositoryAttribution {
+  scope_id: string;
+  path: string;
+  digest: string;
+  generation: number;
+  revision: number;
+}
+
+/** The key one result's attribution is looked up under: a scope holds one path row per path. */
+function repositoryAttributionKey(result: { metadata?: Record<string, any> }): string {
+  const scopeId = String(result.metadata?.repo_scope_id ?? "");
+  const path = String(result.metadata?.repo_path ?? "");
+  return scopeId !== "" && path !== "" ? `${scopeId}\u0000${path}` : "";
+}
+
+/**
+ * Every repository result's publication, in one statement: the path row names the digest, and the
+ * generation row it points at names the number and revision a client reports. A result that is not
+ * repository content (no scope or no path in its metadata) is not looked up, and a query whose
+ * results carry none - the ordinary case - reaches no database at all.
+ */
+async function repositoryAttributionOf(
+  results: ReadonlyArray<{ metadata?: Record<string, any> }>,
+): Promise<Map<string, RepositoryAttribution>> {
+  const wanted = results.filter((result) => repositoryAttributionKey(result) !== "");
+  if (wanted.length === 0) return new Map();
+
+  // Prefer the generation the chunk itself recorded when it was staged: that value was written by the
+  // publication that produced this text, so it cannot disagree with the answer. Reading the path row
+  // instead is a race - a publication committing between the search and this lookup moves the path row
+  // to the newer generation, and the answer would then be labelled with a revision it did not come from.
+  const generationIds = [...new Set(
+    wanted
+      .map((result) => String(result.metadata?.repo_index_generation_id ?? ""))
+      .filter((id) => id !== ""),
+  )];
+  const byGeneration = generationIds.length === 0 ? [] : await prisma.$queryRaw<Array<{ id: string; scopeId: string; generation: number; revision: string }>>`
+    SELECT g.id, g."scopeId" AS "scopeId", g.generation, g.revision
+    FROM repo_index_generations g
+    WHERE g.id = ANY(${generationIds}::text[])
+  `;
+  const generationById = new Map(byGeneration.map((row) => [row.id, row]));
+
+  // Fallback for a result whose metadata carries no generation id: read the path row as before.
+  const needPath = wanted.filter((result) => !generationById.has(String(result.metadata?.repo_index_generation_id ?? "")));
+  const rows = needPath.length === 0 ? [] : await prisma.$queryRaw<Array<{ scopeId: string; path: string; digest: string; generation: number; revision: string }>>`
+    SELECT p."scopeId" AS "scopeId", p.path, p.digest, g.generation, g.revision
+    FROM repo_index_paths p
+    INNER JOIN repo_index_generations g ON g.id = p."generationId"
+    WHERE p.state = 'present'
+      AND p."scopeId" = ANY(${needPath.map((result) => String(result.metadata?.repo_scope_id))}::text[])
+      AND p.path = ANY(${needPath.map((result) => String(result.metadata?.repo_path))}::text[])
+  `;
+
+  const attribution = new Map<string, RepositoryAttribution>();
+  for (const result of wanted) {
+    const key = repositoryAttributionKey(result);
+    const path = String(result.metadata?.repo_path);
+    const digest = String(result.metadata?.repo_digest ?? "");
+    const generationId = String(result.metadata?.repo_index_generation_id ?? "");
+    const recorded = generationById.get(generationId);
+    if (recorded) {
+      attribution.set(key, {
+        scope_id: recorded.scopeId,
+        path,
+        digest,
+        generation: Number(recorded.generation),
+        revision: Number(recorded.revision),
+      });
+    }
+  }
+  for (const row of rows) {
+    attribution.set(`${row.scopeId}\u0000${row.path}`, {
+      scope_id: row.scopeId,
+      path: row.path,
+      digest: row.digest,
+      generation: Number(row.generation),
+      revision: Number(row.revision),
+    });
+  }
+  return attribution;
+}
+
 // ─── Query Context ───────────────────────────────────────────
 
 api.post(
@@ -1054,6 +1157,7 @@ api.post(
     // usage tracking not available in OSS
 
     const consistencyState = body.include_memories ? "eventual" : "fresh";
+    const repositoryAttribution = await repositoryAttributionOf(result.results);
 
     return c.json({
       results: result.results.map((r) => ({
@@ -1065,6 +1169,9 @@ api.post(
         document: r.documentTitle,
         type: r.chunkType,
         retrieval_source: r.source,
+        // Absent for ordinary content: JSON drops an undefined value, so a non-repository answer
+        // keeps exactly the shape it had. A repository hit names the publication it came from.
+        repository: repositoryAttribution.get(repositoryAttributionKey(r)),
       })),
       context: result.context,
       meta: {
@@ -1085,6 +1192,9 @@ api.post(
         compression: result.meta.compression,
         profile: result.meta.profile || "balanced",
         retrieval_profile: result.meta.retrievalProfile,
+        // Which halves of the answer were consulted, and why not when they were not: a client that
+        // receives the fused order instead of a reranked one has to be able to tell.
+        degraded: result.meta.degraded,
         region: DEPLOY_REGION,
         consistency_state: consistencyState,
         timing: result.meta.timing,
@@ -2739,17 +2849,16 @@ api.post(
 
     const whereSql = Prisma.join(conditions, " AND ");
 
-    const memories = await prisma.$queryRaw(Prisma.sql`
-      SELECT
-        id, content, "memoryType", "userId",
-        "sessionId", "agentId", importance,
-        metadata, "accessCount", "createdAt",
-        1 - (embedding <=> ${queryEmbedding}::vector) as similarity
-      FROM memories
-      WHERE ${whereSql}
-      ORDER BY embedding <=> ${queryEmbedding}::vector
-      LIMIT ${body.top_k}
-    `);
+    const memories = await prisma.$queryRaw(exactDistanceOrder({
+      table: "memories",
+      alias: "m",
+      columns: Prisma.sql`m.id, m.content, m."memoryType", m."userId",
+        m."sessionId", m."agentId", m.importance,
+        m.metadata, m."accessCount", m."createdAt"`,
+      scope: whereSql,
+      embedding: `[${queryEmbedding.join(",")}]`,
+      limit: body.top_k,
+    }));
 
     // Update access counts
     const memoryIds = (memories as any[]).map((r: any) => r.id);
@@ -3070,6 +3179,43 @@ api.post(
       description: body.description, metadata: body.metadata,
     });
     return c.json(entity, 201);
+  }
+);
+
+api.post(
+  "/v1/graph/batch",
+  zValidator("json", z.object({
+    project: z.string().optional(),
+    entities: z.array(z.object({
+      name: z.string().min(1),
+      entity_type: z.string().min(1),
+      description: z.string().optional(),
+    })).default([]),
+    relations: z.array(z.object({
+      from_entity: z.string().min(1),
+      from_type: z.string().min(1),
+      to_entity: z.string().min(1),
+      to_type: z.string().min(1),
+      relation_type: entityRelationType,
+      source_chunk_id: z.string().optional(),
+    })).default([]),
+  })),
+  async (c) => {
+    const auth = c.get("auth");
+    const body = c.req.valid("json");
+    const project = await ensureProject(auth.orgId, body.project, auth.isAdmin);
+    const written = await saveGraphBatch(project.id, {
+      entities: body.entities.map((entity) => ({
+        name: entity.name, entityType: entity.entity_type, description: entity.description,
+      })),
+      relations: body.relations.map((relation) => ({
+        from: { name: relation.from_entity, entityType: relation.from_type },
+        to: { name: relation.to_entity, entityType: relation.to_type },
+        type: relation.relation_type,
+        sourceChunkId: relation.source_chunk_id,
+      })),
+    });
+    return c.json(written, 201);
   }
 );
 

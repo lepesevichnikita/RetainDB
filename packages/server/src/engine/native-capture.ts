@@ -74,11 +74,18 @@ export function redactCapture(value: unknown): unknown {
   const ordered = [...secrets].sort((a, b) => b.length - a.length);
   function scrub(entry: unknown): unknown {
     if (typeof entry === "string") {
-      // Short values ("1", "true") are too common to replace inside prose; a
-      // whole-value match is the only safe place to redact them.
+      // A whole-value match is the only safe replacement for a one-character
+      // secret ("1", "f"): it has no information value and appears in ordinary
+      // prose, so replacing it inside a sentence corrupts the captured text.
       if (ordered.includes(entry)) return "[REDACTED]";
-      return ordered.reduce((text, secret) =>
-        secret.length >= 8 ? text.split(secret).join("[REDACTED]") : text, entry);
+      return ordered.reduce((text, secret) => {
+        if (secret.length >= 8) return text.split(secret).join("[REDACTED]");
+        if (secret.length < 2) return text;
+        // Two to seven characters are replaced as complete tokens, never inside a
+        // word, so a short echo is removed without touching "fixture-project".
+        const escaped = secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        return text.replace(new RegExp(`(^|[^\\p{L}\\p{N}_-])${escaped}(?=$|[^\\p{L}\\p{N}_-])`, "gu"), "$1[REDACTED]");
+      }, entry);
     }
     if ((typeof entry === "number" || typeof entry === "boolean") && secrets.has(String(entry))) return "[REDACTED]";
     if (Array.isArray(entry)) return entry.map(scrub);

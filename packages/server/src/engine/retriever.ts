@@ -10,6 +10,9 @@ import { recordRetrievalWorkloadSample, recordStageBreakdown } from "./latency-t
 import { rerankWithInferenceService } from "./inference-client.js";
 import { selectOracleCandidateChunkIds } from "./oracle-select.js";
 import { searchGraphChunks } from "./entity-graph.js";
+import { exactDistanceOrder } from "./vector-order.js";
+import { READABLE_SCOPE_STATES } from "./repo-index/store.js";
+import { REPO_INDEX_SOURCE_TYPE, scopeSourceName } from "./repo-index/materialise.js";
 
 let openaiClient: OpenAI | null = null;
 
@@ -131,6 +134,14 @@ export interface ContextResponse {
     timing?: {
       cache_check_ms?: number;
       embed_ms?: number;
+      /** True when the embedder could not be reached, so this answer came from the lexical half only. */
+      embedding_unavailable?: boolean;
+      /**
+       * True when memories were asked for but never searched: that search is a vector query too, and an
+       * empty embedding would return unrelated rows. Without this a client cannot tell "no memories"
+       * from "we did not look".
+       */
+      memory_skipped?: boolean;
       oracle_ms?: number;
       vector_ms?: number;
       fts_ms?: number;
@@ -323,6 +334,10 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
           profile: RETRIEVAL_PROFILE,
           retrievalProfile,
           sourceFamily,
+          // Only a complete answer is ever stored (see the write below), so a hit cannot be degraded.
+          // It says so rather than omitting the field: a client reading `degraded.reasons` on every
+          // answer must not have to tell "nothing was lost" from "the field is missing".
+          degraded: { reranked: true, reasons: [] },
           timing,
         },
       };
@@ -333,7 +348,20 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
   const tEmbed = Date.now();
   const oracleActive = shouldEnableOracle({ query, oracleMode, chunkTypes, metadataFilter });
   const needsEmbedding = useVector || includeMemories || includeGraph || oracleActive;
-  let queryEmbedding = needsEmbedding ? await embedSingle(query) : [];
+  // The route declares use_vector defaulting to true, so a client that says nothing about vectors is
+  // asking for them. If the embedder is unavailable that must not become a 500 - it becomes a lexical
+  // answer, and the caller is told the answer is partial rather than left to believe it is complete.
+  let embeddingUnavailable: string | null = null;
+  let queryEmbedding: number[] = [];
+  if (needsEmbedding) {
+    try {
+      queryEmbedding = await embedSingle(query);
+    } catch (error) {
+      embeddingUnavailable = (error as Error).message;
+      console.warn(`[Retriever] embeddings unavailable, answering without the vector half: ${embeddingUnavailable}`);
+      timing.embedding_unavailable = true;
+    }
+  }
   timing.embed_ms = Date.now() - tEmbed;
   const codebaseIntent = precisionV1Enabled
     ? await classifyCodebaseIntent({
@@ -441,7 +469,7 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
   }
 
   // ─── Memory Search ───────────────────────────────────────
-  if (includeMemories) {
+  if (includeMemories && embeddingUnavailable === null) {
     const tMem = Date.now();
     // Personal queries ("what do I prefer", "my name", "do you remember me")
     // dominate the result set — give them the full topK budget plus extra headroom.
@@ -457,11 +485,15 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
     });
     timing.memory_ms = Date.now() - tMem;
     allResults.push(...memoryResults);
+  } else if (includeMemories) {
+    // Nothing was searched, so the absence of memory hits is not "no memories": the answer says the
+    // half was skipped, in the same place it says the vector half was.
+    timing.memory_skipped = true;
   }
 
   // ─── Graph Traversal ─────────────────────────────────────
   let graph: Awaited<ReturnType<typeof searchGraphChunks>> | undefined;
-  if (includeGraph) {
+  if (includeGraph && embeddingUnavailable === null) {
     const tGraph = Date.now();
     graph = await searchGraphChunks({
       projectId,
@@ -573,7 +605,17 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
   }
 
   // ─── Cache results ───────────────────────────────────────
-  if (cacheResults && allResults.length > 0) {
+  // Only a complete answer is stored. A cached answer is served for the whole TTL and cannot be
+  // re-checked: a partial one would keep presenting itself as complete, and would keep doing it after
+  // the embedder recovered. Not writing it costs one recomputation per repeated question during an
+  // outage and lets the next one be answered in full the moment the embedder is back.
+  //
+  // A degraded answer is partial for the same reason and is stored by the same rule: the fused order
+  // is what a reader gets when the reranker could not be consulted, and a stored copy would keep
+  // saying so only in a field nobody re-reads - the reranker may be healthy long before the entry
+  // expires. `degradedReasons` is empty for every answer that lost nothing, so the rule cannot drift
+  // into "never cache".
+  if (cacheResults && allResults.length > 0 && embeddingUnavailable === null && degradedReasons.length === 0) {
     const tSet = Date.now();
     await setCache(projectId, cacheParams, allResults, cacheTtlSeconds);
     timing.cache_set_ms = Date.now() - tSet;
@@ -955,6 +997,43 @@ function scoreSourceIntentMatch(
 
 // ─── Vector Search ───────────────────────────────────────────
 
+/**
+ * `repo-index:`, the prefix `scopeSourceName` puts in front of a scope's id. Taken from that
+ * function - it is `repo-index:<scopeId>`, so an empty id leaves exactly the prefix - so this
+ * filter and the materialiser cannot disagree about how a scope's source is named.
+ */
+const SCOPE_SOURCE_PREFIX = scopeSourceName("");
+
+/**
+ * The `sources`-side scope of a chunk search, over the `s` alias every chunk query in this module
+ * joins: the caller's own source narrowing, plus the rule that a repository scope no reader may see
+ * is not visible.
+ *
+ * The rows are retained and this predicate is what makes them invisible. Withdrawal is terminal, so
+ * deleting what it published would be an irreversible answer; a predicate can be revisited, and
+ * nothing here writes. A chunk is hidden exactly when its document belongs to a `repo_index` source
+ * whose scope exists and whose state `isScopeReadable` refuses - and a source naming no readable
+ * scope is hidden too, because a missing authority is not a permission.
+ *
+ * It belongs inside the scoped set rather than after the fetch: the scoped ranking takes its k from
+ * the rows this predicate selected, so a hidden row cannot occupy a slot a visible one should have.
+ */
+function visibleSourceSql(narrowedSourceIds: string[]): Prisma.Sql {
+  const narrowed = narrowedSourceIds.length > 0
+    ? Prisma.sql`AND d."sourceId" = ANY(${narrowedSourceIds})`
+    : Prisma.empty;
+  return Prisma.sql`${narrowed}AND (
+      s.type <> ${REPO_INDEX_SOURCE_TYPE}
+      OR EXISTS (
+        SELECT 1
+        FROM repo_index_scopes visible_scope
+        WHERE visible_scope."projectId" = s."projectId"
+          AND s.name = ${SCOPE_SOURCE_PREFIX} || visible_scope.id
+          AND visible_scope.state = ANY(${READABLE_SCOPE_STATES})
+      )
+    )`;
+}
+
 async function vectorSearch(
   projectId: string,
   queryEmbedding: number[],
@@ -967,9 +1046,7 @@ async function vectorSearch(
   const embeddingStr = `[${queryEmbedding.join(",")}]`;
   const metadataJson = metadataFilter ? JSON.stringify(metadataFilter) : null;
   const scopedSourceIds = uniqueStrings(sourceIds || []);
-  const sourceFilterSql = scopedSourceIds.length > 0
-    ? Prisma.sql`AND d."sourceId" = ANY(${scopedSourceIds})`
-    : Prisma.empty;
+  const sourceFilterSql = visibleSourceSql(scopedSourceIds);
   const scopedChunkIds = uniqueStrings(chunkIds || []);
   const chunkIdFilterSql = scopedChunkIds.length > 0
     ? Prisma.sql`AND id = ANY(${scopedChunkIds}::uuid[])`
@@ -981,35 +1058,32 @@ async function vectorSearch(
   const metadataFilterSql = metadataJson
     ? Prisma.sql`AND metadata @> ${metadataJson}::jsonb`
     : Prisma.empty;
-  const results = await prisma.$transaction(async tx => {
-    await tx.$executeRaw`SET LOCAL hnsw.iterative_scan = strict_order`;
-    return tx.$queryRaw<any[]>`
-      SELECT
-        id, content, "chunkType", metadata, "parentChunkId", "sectionPath", "headingPath",
-        1 - (embedding <=> ${embeddingStr}::vector) as similarity
-      FROM chunks
-      WHERE "projectId" = ${projectId}
-        AND embedding IS NOT NULL
+  const results = await prisma.$queryRaw<any[]>(exactDistanceOrder({
+    table: "chunks",
+    alias: "c",
+    columns: Prisma.sql`c.id, c.content, c."chunkType", c.metadata, c."parentChunkId", c."sectionPath", c."headingPath"`,
+    scope: Prisma.sql`
+      c."projectId" = ${projectId}
+        AND c.embedding IS NOT NULL
         ${chunkTypeFilterSql}
         ${metadataFilterSql}
-        AND COALESCE(metadata->>'content_kind', '') <> 'parent_context'
+        AND COALESCE(c.metadata->>'content_kind', '') <> 'parent_context'
         ${chunkIdFilterSql}
         AND EXISTS (
           SELECT 1
           FROM documents d
           INNER JOIN sources s ON s.id = d."sourceId"
-          WHERE d.id = chunks."documentId"
+          WHERE d.id = c."documentId"
             AND d."deletedAt" IS NULL
             ${sourceFilterSql}
             AND (
               s."activeVersionId" IS NULL
               OR d."sourceVersionId" = s."activeVersionId"
             )
-        )
-      ORDER BY embedding <=> ${embeddingStr}::vector
-      LIMIT ${limit}
-    `;
-  });
+        )`,
+    embedding: embeddingStr,
+    limit,
+  }));
 
   return results.map((r) => ({
     id: r.id,
@@ -1042,9 +1116,7 @@ async function fullTextSearch(
 
   const metadataJson = metadataFilter ? JSON.stringify(metadataFilter) : null;
   const scopedSourceIds = uniqueStrings(sourceIds || []);
-  const sourceFilterSql = scopedSourceIds.length > 0
-    ? Prisma.sql`AND d."sourceId" = ANY(${scopedSourceIds})`
-    : Prisma.empty;
+  const sourceFilterSql = visibleSourceSql(scopedSourceIds);
   const scopedChunkIds = uniqueStrings(chunkIds || []);
   const chunkIdFilterSql = scopedChunkIds.length > 0
     ? Prisma.sql`AND id = ANY(${scopedChunkIds}::uuid[])`
@@ -1232,52 +1304,24 @@ async function memorySearch(
   if (!opts.userId) return [];
   const embeddingStr = `[${queryEmbedding.join(",")}]`;
 
-  let query;
-  if (opts.userId && opts.sessionId && opts.agentId) {
-    query = prisma.$queryRaw`
-      SELECT
-        id, content, "memoryType", metadata, importance,
-        1 - (embedding <=> ${embeddingStr}::vector) as similarity
-      FROM memories
-      WHERE "projectId" = ${projectId}
-        AND "isActive" = true
-        AND ("expiresAt" IS NULL OR "expiresAt" > NOW())
-        AND "userId" = ${opts.userId}
-        AND "sessionId" = ${opts.sessionId}
-        AND "agentId" = ${opts.agentId}
-      ORDER BY embedding <=> ${embeddingStr}::vector
-      LIMIT ${opts.topK}
-    `;
-  } else if (opts.userId && opts.sessionId) {
-    query = prisma.$queryRaw`
-      SELECT
-        id, content, "memoryType", metadata, importance,
-        1 - (embedding <=> ${embeddingStr}::vector) as similarity
-      FROM memories
-      WHERE "projectId" = ${projectId}
-        AND "isActive" = true
-        AND ("expiresAt" IS NULL OR "expiresAt" > NOW())
-        AND "userId" = ${opts.userId}
-        AND "sessionId" = ${opts.sessionId}
-      ORDER BY embedding <=> ${embeddingStr}::vector
-      LIMIT ${opts.topK}
-    `;
-  } else if (opts.userId) {
-    query = prisma.$queryRaw`
-      SELECT
-        id, content, "memoryType", metadata, importance,
-        1 - (embedding <=> ${embeddingStr}::vector) as similarity
-      FROM memories
-      WHERE "projectId" = ${projectId}
-        AND "isActive" = true
-        AND ("expiresAt" IS NULL OR "expiresAt" > NOW())
-        AND "userId" = ${opts.userId}
-      ORDER BY embedding <=> ${embeddingStr}::vector
-      LIMIT ${opts.topK}
-    `;
-  }
+  const sessionFilter = opts.sessionId ? Prisma.sql`AND m."sessionId" = ${opts.sessionId}` : Prisma.empty;
+  // The agent narrows the session's scope, as before: an agent without a session does not filter.
+  const agentFilter = opts.sessionId && opts.agentId ? Prisma.sql`AND m."agentId" = ${opts.agentId}` : Prisma.empty;
 
-  const results = await query;
+  const results = await prisma.$queryRaw(exactDistanceOrder({
+    table: "memories",
+    alias: "m",
+    columns: Prisma.sql`m.id, m.content, m."memoryType", m.metadata, m.importance`,
+    scope: Prisma.sql`
+      m."projectId" = ${projectId}
+        AND m."isActive" = true
+        AND (m."expiresAt" IS NULL OR m."expiresAt" > NOW())
+        AND m."userId" = ${opts.userId}
+        ${sessionFilter}
+        ${agentFilter}`,
+    embedding: embeddingStr,
+    limit: opts.topK,
+  }));
 
   // Update access counts
   const ids = (results as any[]).map((r) => r.id);

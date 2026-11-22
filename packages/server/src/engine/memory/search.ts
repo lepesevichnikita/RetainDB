@@ -19,6 +19,7 @@ import { getFromSemanticCache, setInSemanticCache, getFromCache, setInCache } fr
 import type { MemoryScopeTarget, MemorySearchDiagnostics, MemorySearchParams, MemorySearchResult } from "./types.js";
 import { Prisma } from "@prisma/client";
 import { decrypt } from "../../lib/encryption.js";
+import { exactDistanceOrder } from "../vector-order.js";
 
 // Early exit threshold - skip graph traversal if top result is very similar
 const EARLY_EXIT_SIMILARITY = 0.92;
@@ -244,7 +245,10 @@ export async function searchMemories(
   const cacheScope = JSON.stringify({ orgId, projectId, userId, sessionId, agentId, taskId,
     scopes: applicableScopes, includeInactive, memoryTypes: effectiveMemoryTypes, namespace, tags,
     temporalFilter: params.temporalFilter, questionDate: questionDate.toISOString().slice(0, 10), topK, fastMode });
-  const cacheKey = `search:${projectId}:${userId || ""}:${cacheScope}:${query}`;
+  // The cache layer's key prefix is part of the key (cache.ts DEFAULT_CONFIG.keyPrefix, the same
+  // spelling engine/retriever.ts writes into its context key), so a publication or a memory write
+  // can drop every answer of one project by pattern: `search:<projectId>:` clears this family.
+  const cacheKey = `whisper:context:search:${projectId}:${userId || ""}:${cacheScope}:${query}`;
   const simpleCached = await getFromCache<MemorySearchResult[]>(cacheKey);
   timings.push({ step: "simple_cache", duration: Date.now() - step0Start });
   
@@ -520,39 +524,19 @@ async function vectorSearchMemories(params: {
 
   // Embedding is a float array from our own model (not user input) — safe to inline as vector literal
   const embeddingLiteral = Prisma.raw(`'[${embedding.join(",")}]'::vector`);
-  const limitLiteral = Prisma.raw(String(Math.min(Math.max(1, Math.floor(limit)), 1000)));
+  const limitLiteral = Math.min(Math.max(1, Math.floor(limit)), 1000);
 
-  const [, results] = await db.$transaction([
-    db.$executeRaw`SET LOCAL hnsw.iterative_scan = strict_order`,
-    db.$queryRaw(Prisma.sql`
-    SELECT
-      id,
-      content,
-      "memoryType" as "memoryType",
-      "entityMentions" as "entityMentions",
-      confidence,
-      version,
-      scope,
-      scope as "scopeTarget",
-      "userId" as "userId",
-      "sessionId" as "sessionId",
-      "agentId" as "agentId",
-      "taskId" as "taskId",
-      "documentDate" as "documentDate",
-      "eventDate" as "eventDate",
-      "validFrom" as "validFrom",
-      "validUntil" as "validUntil",
-      "createdAt" as "createdAt",
-      "updatedAt" as "updatedAt",
-      "sourceChunkId" as "sourceChunkId",
-      metadata,
-      1 - (embedding <=> ${embeddingLiteral}) as similarity
-    FROM memories
-    WHERE ${whereClause}
-    ORDER BY embedding <=> ${embeddingLiteral}
-    LIMIT ${limitLiteral}
-    `),
-  ]);
+  const results = await db.$queryRaw(exactDistanceOrder({
+    table: "memories",
+    alias: "m",
+    columns: Prisma.sql`m.id, m.content, m."memoryType", m."entityMentions", m.confidence, m.version,
+      m.scope, m.scope as "scopeTarget", m."userId", m."sessionId", m."agentId", m."taskId",
+      m."documentDate", m."eventDate", m."validFrom", m."validUntil", m."createdAt", m."updatedAt",
+      m."sourceChunkId", m.metadata`,
+    scope: whereClause,
+    embedding: embeddingLiteral,
+    limit: limitLiteral,
+  }));
 
   return (results as any[]).map((r) => ({
     ...r,

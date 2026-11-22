@@ -109,6 +109,13 @@ Use pgvector 0.8 or later for filtered HNSW retrieval. Document and memory vecto
 
 Database upgrades preserve existing organization IDs, ownership and slugs. If another organization already uses the `default` slug, the ownerless default organization receives an available `default-oss-N` slug instead. Previously deployed migration files remain unchanged.
 
+To verify the packaged Prisma client and migration CLI without network access or a running database:
+
+```bash
+docker build -t retaindb-runtime-check -f packages/server/Dockerfile .
+node scripts/check-server-image.mjs retaindb-runtime-check
+```
+
 ### Node + Postgres
 
 ```bash
@@ -134,9 +141,10 @@ Batch ingestion binds source versions before submitting queued work. A failed
 batch waits for its submitted tasks to settle before returning an error, so
 connector failure handling cannot race later writes from that batch. Documents
 remain `PROCESSING` during a rebuild and become `READY` after chunk persistence.
-A required embedding or persistence failure records `ERROR`; a successful retry
-clears the previous `parseError`. Default best-effort embedding behavior is
-unchanged; callers supplying `embedTexts` require those embeddings to succeed.
+A required embedding or persistence failure records `ERROR` with the failure
+message as `parseError`; a successful retry clears the previous `parseError`.
+An empty, wrong-width or missing embedding fails that document instead of
+publishing a searchable chunk the store cannot answer.
 
 ### Coding-agent hooks with PostgreSQL
 
@@ -175,6 +183,11 @@ token budget. An unchanged context hash returns an empty delta, which CLI and
 plugin hooks preserve rather than replacing it with the previous full context. Client `cwd`
 and `files` paths are diagnosed, not read from the Server filesystem; ingest
 those files through the source APIs first.
+
+To exercise the packaged Server, migrations, vectors, hook receipts,
+authentication and restart recovery in a disposable Compose project, run
+`node scripts/check-server-compose.mjs`. The script removes only its own
+containers, image and database volume when it finishes.
 
 ## RetainDB Local
 
@@ -447,6 +460,8 @@ Server graph endpoints:
 
 In `/v1/context/query`, `include_graph: true` adds chunks linked by the entity graph and preserves the matched entities and relationships in each result's `metadata.graph`, even if vector or lexical search found the same chunk. `graph_depth` accepts 1–3. Graph queries bypass the response cache and respect project, source, chunk-type, metadata, and active-version filters.
 
+An answer produced while the embedder is unavailable is reported as partial: `meta.timing.embedding_unavailable` marks the vector half that was skipped, and `meta.timing.memory_skipped` marks memories that were asked for and never searched. Such an answer is not written to the response cache, so the next identical question is recomputed instead of being served a partial result as complete, and it comes back complete as soon as the embedder does.
+
 Entity and edge IDs are stable within the project. Extraction records claims per source chunk, so staged, failed, superseded, and deleted content does not replace the active graph. Graph search, export, and entity counts use the same visibility rule. Manually written entities and edges remain independent of source versions; extraction does not replace their annotations.
 
 Entity extraction runs only on eligible documents ingested with automatic extraction enabled and a configured inference provider. Native hook capture skips it. The migration preserves existing graph rows and backfills explicit legacy entity-to-chunk links. Old automatic edges without recorded provenance stay hidden until extraction confirms them. The migration does not extract from existing documents, and importing vector embeddings alone does not create graph edges.
@@ -517,6 +532,14 @@ The self-hosted server can index external knowledge sources into agent context:
 | HuggingFace | Model cards |
 | Plain text | Inline content |
 
+## Repository index
+
+A self-hosted server can index a Git worktree into searchable chunks: a scope per worktree, a generation of path metadata published through a fence, and ordinary document chunks materialised from one pinned commit. It has its own credential surface (scope grants, one token per holder) separate from the deployment API key.
+
+Operator and developer documentation: [`packages/server/docs/repo-index.md`](packages/server/docs/repo-index.md).
+
+The feature is unreleased. Its migration has been applied to PostgreSQL 16 with pgvector 0.8.7 and the server suite runs against a real database rather than skipping it, but it is not verified end to end and nothing is deployed; the document's operational status section lists exactly what has and has not been executed.
+
 ## Configuration
 
 | Env var | Default | Description |
@@ -569,6 +592,7 @@ Self-hosted notes:
 | `packages/sdk` | `@retaindb/sdk` | TypeScript SDK |
 | `packages/mcp` | `@retaindb/mcp` | MCP server |
 | `packages/server` | not published | Self-hostable API server |
+| `packages/repo-sync` | not published | Rust `retaindb-repo` client: hook hints and Git reconcile |
 
 ## Development
 
@@ -589,17 +613,32 @@ pnpm --filter @retaindb/server exec prisma migrate deploy
 pnpm dev:server
 ```
 
-Run the Server tests:
+Database-client regression tests use the generated Prisma client without a running database:
 
 ```bash
+pnpm --filter @retaindb/server run db:generate
 pnpm --filter @retaindb/server test
 ```
 
-Unit tests run without a database. Integration tests run when
-`RETAINDB_TEST_DATABASE_URL` points at a dedicated PostgreSQL database with
-pgvector and the migrations applied; they create and drop their own temporary
-databases, so the test role needs permission to do that. Never point them at a
-production memory store.
+To run the same suite against a dedicated PostgreSQL database with pgvector:
+
+```bash
+export DATABASE_URL=postgresql://retaindb_test@localhost:5432/retaindb_test
+pnpm --filter @retaindb/server exec prisma migrate deploy
+RETAINDB_TEST_DATABASE_URL="$DATABASE_URL" \
+  RETAINDB_TEST_LOCAL_EMBEDDINGS=true EMBEDDING_MODE=local \
+  DISABLE_AUTO_EXTRACTION=true pnpm --filter @retaindb/server test
+```
+
+The integration tests create and remove their own project data and a temporary chunk constraint for failure injection; some also create and drop their own temporary databases, so the test role needs permission to do that. Use a dedicated test database, never a production memory store. Without `RETAINDB_TEST_DATABASE_URL`, these tests are reported as skipped. Vector ingestion/retrieval, bulk local embeddings and queued-document checks additionally require `RETAINDB_TEST_LOCAL_EMBEDDINGS=true` and download the BGE model on first use. Test processes isolate their database, embedding mode and credential environment before imports, then restore it during teardown. The Node 20/22 CI jobs apply all migrations, repeat deployment, and run this real-database suite. These checks cover the ownerless `default` organization without a fabricated user, retained tenant/project foreign keys, source versions, document vectors, queued document processing, persistence-failure reporting, connector job health, and API loading; they do not establish parity for every legacy table or optional agent/storage feature.
+
+Client (`packages/repo-sync`, std-only Rust, no crates.io dependencies):
+
+```bash
+cargo fmt --manifest-path packages/repo-sync/Cargo.toml --check
+cargo clippy --manifest-path packages/repo-sync/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path packages/repo-sync/Cargo.toml
+```
 
 ## Contributing
 

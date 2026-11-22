@@ -13,11 +13,10 @@ import { homedir } from "node:os";
 import { dirname, extname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { chunkSource } from "../src/chunker.mjs";
-import { IndexQueue, drainQueue, mapLimit } from "../src/queue.mjs";
+import { IndexQueue, drainQueue } from "../src/queue.mjs";
 
 const MAX_BYTES = 1024 * 1024;
 const DEFAULT_BATCH = 200;
-const DEFAULT_CONCURRENCY = 1;
 const DEFAULT_DELAY_MS = 200;
 const RETRIES = 3;
 const MANIFEST_VERSION = 1;
@@ -47,7 +46,6 @@ Options:
   --dry-run   report what would be sent, post nothing
   --graph     also send the symbol graph to /v1/entities and /v1/relations
   --batch     chunks per request (default 200)
-  --concurrency  graph requests in flight (default 3)
   --delay     pause between batches in ms (default 200)
   --help      this text
 
@@ -181,10 +179,14 @@ function graphRows(path, chunks, text, sha) {
   ];
 }
 
-async function postGraphRow(api, key, project, row) {
-  const path = row.kind === "entity" ? "/v1/entities" : "/v1/relations";
-  await postJson(api, key, path, { project, ...row.body });
-  return row.kind;
+function graphPayload(project, rows) {
+  const entities = rows.filter((row) => row.kind === "entity").map((row) => row.body);
+  const relations = rows.filter((row) => row.kind === "relation").map((row) => row.body);
+  return { project, entities, relations };
+}
+
+function postGraphBatch(api, key, project, rows) {
+  return postJson(api, key, "/v1/graph/batch", graphPayload(project, rows));
 }
 
 async function withRetries(attempt) {
@@ -231,7 +233,6 @@ async function enqueueFiles(root, files, known, chunks, symbols, withGraph) {
 
 export async function run(options) {
   const batch = options.batch ?? DEFAULT_BATCH;
-  const concurrency = options.concurrency ?? DEFAULT_CONCURRENCY;
   const delay = options.delay ?? DEFAULT_DELAY_MS;
   const root = resolve(options.root);
   const manifest = await loadManifest();
@@ -247,21 +248,22 @@ export async function run(options) {
     (items) => withRetries(() => postBatch(options.api, options.key, options.project, items)),
     { groupSize: batch, concurrency: 1, delayMs: delay },
   );
-  const graph = options.graph ? await drainGraph(options, symbols, concurrency) : null;
+  const graph = options.graph ? await drainGraph(options, symbols, delay) : null;
   for (const entry of accepted) known[entry.path] = entry.sha;
   await saveManifest(manifest);
   return { root, files: files.length, items: sent, sent, changed: accepted.length, graph, pending };
 }
 
-async function drainGraph(options, symbols, concurrency) {
+async function drainGraph(options, symbols, delay) {
   const counts = { entities: 0, relations: 0 };
   await drainQueue(
     symbols,
     async (rows) => {
-      const kind = await withRetries(() => postGraphRow(options.api, options.key, options.project, rows[0]));
-      counts[kind === "entity" ? "entities" : "relations"] += 1;
+      const written = await withRetries(() => postGraphBatch(options.api, options.key, options.project, rows));
+      counts.entities += written.entities ?? 0;
+      counts.relations += written.relations ?? 0;
     },
-    { groupSize: 1, concurrency, delayMs: Math.max(delay, 50) },
+    { groupSize: options.batch ?? DEFAULT_BATCH, concurrency: 1, delayMs: Math.max(delay, 50) },
   );
   return counts;
 }
@@ -280,10 +282,9 @@ export function parseOptions(argv, env, config = {}) {
   const dryRun = argv.includes("--dry-run");
   const graph = argv.includes("--graph");
   const batch = Number(readFlag(argv, "batch", DEFAULT_BATCH));
-  const concurrency = Number(readFlag(argv, "concurrency", DEFAULT_CONCURRENCY));
   const delay = Number(readFlag(argv, "delay", DEFAULT_DELAY_MS));
   if (!dryRun && (!api || !key)) throw new Error("no API target: pass --api/--key, set RETAINDB_BASE_URL/RETAINDB_API_KEY, or write ~/.retaindb-mcp/config.json");
-  return { root, api, key, project, dryRun, graph, batch, concurrency, delay };
+  return { root, api, key, project, dryRun, graph, batch, delay };
 }
 
 async function main() {

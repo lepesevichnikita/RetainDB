@@ -12,7 +12,7 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { run } from "../bin/retaindb-index.mjs";
+import { loadConfig, parseOptions, run } from "../bin/retaindb-index.mjs";
 
 const HOME_BACKUP = process.env.HOME;
 let repository;
@@ -95,4 +95,16 @@ test("dry run reports what would be sent and posts nothing", async () => {
   const report = await run({ root: repository, api, key: "test-key", project: "retaindb", dryRun: true });
   assert.equal(report.sent, 0);
   assert.equal(batches.length, before);
+});
+
+test("config file supplies api, project and token, and flags still win", async () => {
+  await mkdir(join(home, ".retaindb-mcp"), { recursive: true });
+  await writeFile(join(home, ".retaindb-mcp", "config.json"), JSON.stringify({ api, project: "from-config", token: "config-key" }), "utf8");
+  const config = await loadConfig();
+  const fromFile = parseOptions([], {}, config);
+  assert.equal(fromFile.api, api);
+  assert.equal(fromFile.key, "config-key");
+  assert.equal(fromFile.project, "from-config");
+  const flagged = parseOptions(["--project", "flag"], {}, config);
+  assert.equal(flagged.project, "flag");
 });

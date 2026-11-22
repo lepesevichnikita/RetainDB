@@ -23,7 +23,7 @@ const SKIP_DIRS = new Set([
   ".git",
 ]);
 
-const HELP = `retaindb-index: index a repository where it lives and ship chunks to RetainDB
+const HELP = `retaindb-index: index a directory where it lives and ship chunks to RetainDB
 
 Usage:
   retaindb-index --root <dir> --api <url> --key <key> [--project <name>] [--dry-run]

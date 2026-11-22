@@ -386,29 +386,54 @@ const result = await streamText({
 
 RetainDB also ships adapters for LangChain and LangGraph workflows, so memory can be retrieved before a chain/graph step and written back after the agent learns something useful.
 
-## MCP
+## Installing the local tools
 
-Start the MCP server through the Local package:
+Three tools, one configuration file. Write it once:
 
-```bash
-RETAINDB_BASE_URL=http://localhost:3111 npx -y @retaindb/local mcp
+```json
+{ "api": "https://retaindb-api.example.lan", "token": "<api key>", "project": "my-agent" }
 ```
 
-Example MCP config:
+at `~/.retaindb-mcp/config.json`. Every tool below reads it; environment variables
+(`RETAINDB_BASE_URL`, `RETAINDB_API_KEY`, `RETAINDB_PROJECT`, `RETAINDB_CONFIG`) override it.
+
+**1. Indexer CLI** — reads files on this machine and ships chunks and vectors:
+
+```bash
+git clone git@github.com:lepesevichnikita/RetainDB.git && cd RetainDB
+npm i -g ./packages/local-indexer
+retaindb-index --root ~/src/my-project --graph --embed
+```
+
+**2. MCP server** — exposes recall/remember/context to the agent:
+
+```bash
+npx -y @retaindb/local mcp        # configuration comes from ~/.retaindb-mcp/config.json
+```
 
 ```json
 {
   "mcpServers": {
-    "retaindb": {
-      "command": "npx",
-      "args": ["-y", "@retaindb/local", "mcp"],
-      "env": {
-        "RETAINDB_BASE_URL": "http://localhost:3111",
-        "RETAINDB_PROJECT": "my-agent"
-      }
-    }
+    "retaindb": { "command": "npx", "args": ["-y", "@retaindb/local", "mcp"] }
   }
 }
+```
+
+**3. Coding-agent hooks** — capture prompts, tool calls and session ends:
+
+```bash
+ls packages/local/plugin/hooks/hooks.json        # Claude Code
+ls packages/local/plugin/hooks/hooks.codex.json  # Codex
+```
+
+Point the harness at the matching file; each hook script resolves the same config file, so a
+machine configured once needs no per-hook environment. `RETAINDB_AUTO_CONTEXT=false` turns off
+context injection, `RETAINDB_COMPRESS_TOOL_OUTPUT=false` turns off tool-output compression.
+
+Verify a consumer end to end:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" "$(python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.retaindb-mcp/config.json')))['api'])")/health"
 ```
 
 Core tools:
@@ -532,13 +557,57 @@ The self-hosted server can index external knowledge sources into agent context:
 | HuggingFace | Model cards |
 | Plain text | Inline content |
 
-## Repository index
+## Repository indexer and client-side vectors
 
-A self-hosted server can index a Git worktree into searchable chunks: a scope per worktree, a generation of path metadata published through a fence, and ordinary document chunks materialised from one pinned commit. It has its own credential surface (scope grants, one token per holder) separate from the deployment API key.
+`retaindb-index` walks a directory, chunks every text file, and ships the chunks to a self-hosted
+server. It is a separate package on purpose: the service stores what it is given, the machine that
+holds the files does the reading.
 
-Operator and developer documentation: [`packages/server/docs/repo-index.md`](packages/server/docs/repo-index.md).
+```bash
+git clone git@github.com:lepesevichnikita/RetainDB.git
+cd RetainDB
+npm i -g ./packages/local-indexer          # provides the `retaindb-index` command
+```
 
-The feature is unreleased. Its migration has been applied to PostgreSQL 16 with pgvector 0.8.7 and the server suite runs against a real database rather than skipping it, but it is not verified end to end and nothing is deployed; the document's operational status section lists exactly what has and has not been executed.
+Configure once, in the same file the MCP server and the hooks read:
+
+```json
+{ "api": "https://retaindb-api.example.lan", "token": "<api key>", "project": "default" }
+```
+
+`~/.retaindb-mcp/config.json`. Environment variables win over it: `RETAINDB_BASE_URL`,
+`RETAINDB_API_KEY`, `RETAINDB_PROJECT`.
+
+```bash
+retaindb-index --root . --graph           # index, and write module/reference edges
+retaindb-index --root . --embed           # compute the vectors here, not on the server
+retaindb-index --root . --embed custom/model-id   # any 1024-dimension model
+retaindb-index --reembed                  # move the stored corpus onto the current model
+retaindb-index --root . --dry-run         # show what would be sent
+```
+
+**Vectors.** `--embed` runs `@xenova/transformers` locally; the default model is
+`Xenova/multilingual-e5-large`, because a vector is a vector and the model must embed every
+language of the corpus into one space, not only English. The chunk row records the producing
+model in `metadata.embedding_model`, so which model made a vector is data, not a schema change:
+a new model needs no migration and no extra column.
+
+Existing corpora move with `--reembed`: the server hands out the text of chunks whose vector came
+from another model (`GET /v1/chunks/stale`), this machine embeds them, and posts the vectors back
+(`POST /v1/chunks/vectors`) in batches of 16, which stays under the proxy body limit. The service
+itself never loads a model in that path.
+
+**References become graph edges.** Markdown links and images, `[[wiki links]]`, HTML `href`/`src`,
+`import`/`require`/`export from`, and `#include` are extracted from each file and resolved against
+the set of indexed files (extensions, `index.*`, relative traversal). An edge is written only when
+both ends are real files; an unresolved target is dropped instead of stored as a name nobody can
+open, and a self reference never becomes an edge. That is the chain: a README points at a document,
+which points at code, and search can walk it.
+
+**One chunk in, one vector out.** An item that carries an `embedding` must be exactly one chunk.
+The server refuses anything that would split, with
+`client embedding covers one chunk, this item split into N: send one chunk per item` — a vector
+cannot honestly represent several chunks.
 
 ## Configuration
 
@@ -553,6 +622,8 @@ The feature is unreleased. Its migration has been applied to PostgreSQL 16 with 
 | `RETAINDB_API_KEY` | unset | Optional API auth key |
 | `OPENAI_API_KEY` | unset | Enables OpenAI-backed server embeddings |
 | `EMBEDDING_MODE` | `auto` | Server embedding mode |
+| `EMBEDDING_MODEL` | `Xenova/multilingual-e5-large` | Model the server loads when it embeds itself; one model per corpus |
+| `RETAINDB_CONFIG` | `~/.retaindb-mcp/config.json` | Config file the CLI, hooks and MCP server read |
 | `EXTRACTION_MODEL` | `gpt-4o-mini` | Server extraction model |
 | `DISABLE_AUTO_EXTRACTION` | `false` | Skip automatic entity extraction during document ingestion |
 | `PORT` | `3000` | Server HTTP port |

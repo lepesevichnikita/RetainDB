@@ -56,15 +56,22 @@ only part of indexing that used server CPU: with it, a push no longer keeps the 
 busy for a second per chunk.
 
 The model must emit 1024 dimensions, because that is what `chunks.embedding` and
-`entities.embedding` hold. The default is `Xenova/bge-large-en-v1.5`, the same model the
-server uses, so client and server vectors live in one space. `Xenova/multilingual-e5-large`
-is also 1024-dimensional and is the better choice for Russian text, but pick one model per
-project: mixing them makes similarities meaningless.
+`entities.embedding` hold. The default is `Xenova/multilingual-e5-large`: one model has to
+embed every language in the corpus into a single space, so an English-only encoder is the
+wrong default. Any other 1024-dimension model works and needs no migration — the chunk row
+records its producer in `metadata.embedding_model`, which is data, not a column. Pick one
+model per corpus: mixing two models makes similarities meaningless.
 
 ```
-retaindb-index --root . --graph --embed                     # default model
-retaindb-index --root . --graph --embed Xenova/multilingual-e5-large
+retaindb-index --root . --graph --embed                              # multilingual default
+retaindb-index --root . --graph --embed Xenova/custom-1024-model     # any 1024-dim model
+retaindb-index --reembed                                            # move a stored corpus over
 ```
+
+`--reembed` walks the corpus to one model without re-reading a single file on the server:
+it asks `GET /v1/chunks/stale?model=…` for the text of chunks whose vector came from another
+model, embeds them here, and posts them back through `POST /v1/chunks/vectors` sixteen at a
+time. A larger batch is rejected by the ingress with `413` before the service ever sees it.
 
 The model is an optional dependency (`@xenova/transformers`); without it `--embed` fails
 with a clear message and everything else keeps working. A device that cannot run 1024-dim

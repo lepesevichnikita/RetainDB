@@ -1501,7 +1501,7 @@ api.post(
         UPDATE chunks SET embedding = ${literal}::vector,
                metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), '{embedding_model}', to_jsonb(${body.model}::text), true),
                "updatedAt" = NOW()
-        WHERE id = ${row.id}::uuid AND "projectId" = ${project.id}
+        WHERE id = ${row.id} AND "projectId" = ${project.id}
       `;
     }
     return c.json({ success: true, model: body.model, updated });

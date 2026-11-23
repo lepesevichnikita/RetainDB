@@ -26,6 +26,7 @@ export interface NativeCaptureInput {
   agentId: string;
   hookType: string;
   data: Record<string, unknown>;
+  machine?: string;
   timestamp?: string;
   workstation?: { text: string; model: string; vector: number[] };
 }
@@ -51,6 +52,7 @@ export async function acceptNativeCapture(input: NativeCaptureInput) {
         id, sessionId: sessionKey, role: "event", content, createdAt: timestamp,
         metadata: {
           source: "native_agent_hook", external_session_id: sessionId, agent_id: agentId,
+          ...(input.machine ? { tags: [`machine:${input.machine}`] } : {}),
           hook_type: hookType, data: safeData as object, native_capture_state: "pending", capture_attempts: 0,
         },
       },

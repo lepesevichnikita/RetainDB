@@ -14,11 +14,13 @@ import { EMBEDDING_DIMENSIONS, isUsableVector } from "../engine/repo-index/recei
 export const nativeHookRoutes = new Hono<{ Variables: { auth: AuthContext } }>();
 const identity = {
   project: z.string().trim().min(1).max(4096).optional(),
+  machine: z.string().trim().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/).optional(),
   session_id: z.string().trim().min(1).max(512),
   agent_id: z.string().trim().min(1).max(512).optional().default("agent"),
 };
 const observationSchema = z.object({
   project: identity.project,
+  machine: identity.machine,
   session_id: identity.session_id.optional(), sessionId: identity.session_id.optional(),
   agent_id: z.string().trim().min(1).max(512).optional(),
   agentId: z.string().trim().min(1).max(512).optional(),
@@ -36,7 +38,7 @@ nativeHookRoutes.post("/retaindb/observe", rateLimitMiddleware(RateLimits.ingest
   const event = await acceptNativeCapture({
     orgId: auth.orgId, projectId: project.id, sessionId: (body.session_id || body.sessionId)!,
     agentId: body.agent_id || body.agentId || String(body.data.agent_id || body.data.agentId || "agent"),
-    hookType: (body.hook_type || body.hookType)!,
+    hookType: (body.hook_type || body.hookType)!, machine: body.machine,
     data: { ...body.data, ...(body.cwd ? { cwd: body.cwd } : {}) }, timestamp: body.timestamp,
   });
   return c.json({ success: true, accepted: true, event_id: event.id, status: event.status, memories_created: 0 }, 202);
@@ -54,7 +56,7 @@ nativeHookRoutes.post("/v1/agent-events", rateLimitMiddleware(RateLimits.ingest)
   const project = await ensureProject(auth.orgId, body.project, auth.isAdmin);
   const event = await acceptNativeCapture({
     orgId: auth.orgId, projectId: project.id, sessionId: body.session_id, agentId: body.agent_id,
-    hookType: body.event.kind, data: body.event, timestamp: body.event.timestamp,
+    hookType: body.event.kind, data: body.event, timestamp: body.event.timestamp, machine: body.machine,
   });
   return c.json({ success: true, accepted: true, event_id: event.id, status: event.status, memories_created: 0 }, 202);
 });
@@ -92,7 +94,7 @@ nativeHookRoutes.post("/v1/agent-events/workstation", rateLimitMiddleware(RateLi
   }
   const project = await ensureProject(auth.orgId, body.project, auth.isAdmin);
   const event = await acceptNativeCapture({ orgId: auth.orgId, projectId: project.id, sessionId: body.session_id,
-    agentId: body.agent_id, hookType: safeEvent.kind, data: safeEvent, timestamp: safeEvent.timestamp,
+    agentId: body.agent_id, hookType: safeEvent.kind, data: safeEvent, timestamp: safeEvent.timestamp, machine: body.machine,
     workstation: { text: safeEvent.summary, vector, model },
   });
   return c.json({ success: true, accepted: true, event_id: event.id, status: event.status, memories_created: 0 }, 202);

@@ -2522,7 +2522,7 @@ function installUserConfigs(target = "all") {
 }
 
 async function runHook() {
-  const { API_KEY, HOOK_EMBEDDING_MODE, resolveHookBaseUrl, resolveHookProject } = await import("../plugin/scripts/_config.mjs");
+  const { API_KEY, HOOK_EMBEDDING_MODE, HOOK_MACHINE, resolveHookBaseUrl, resolveHookProject } = await import("../plugin/scripts/_config.mjs");
   const baseUrl = resolveHookBaseUrl(`http://localhost:${DEFAULT_PORT}`);
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (API_KEY) headers.Authorization = `Bearer ${API_KEY}`;
@@ -2596,6 +2596,7 @@ async function runHook() {
       project,
       session_id: sessionId,
       agent_id: agentId,
+      machine: HOOK_MACHINE,
       event: { kind, summary, details: JSON.stringify(data).slice(0, 12000), timestamp: now() },
     }),
   }).catch(() => {});

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
-import { API_KEY, BASE_URL, HOOK_EMBEDDING_MODEL, HOOK_EMBEDDING_MODE, resolveHookProject } from "./_config.mjs";
+import { API_KEY, BASE_URL, HOOK_EMBEDDING_MODEL, HOOK_EMBEDDING_MODE, HOOK_MACHINE, resolveHookProject } from "./_config.mjs";
 import { redactCapture } from "./_redact.mjs";
 const AUTO_CONTEXT = process.env.RETAINDB_AUTO_CONTEXT !== "false";
 const COMPRESS_TOOL_OUTPUT = process.env.RETAINDB_COMPRESS_TOOL_OUTPUT !== "false";
@@ -126,7 +126,7 @@ export async function captureOnWorkstation({ baseUrl = BASE_URL, project, sessio
     const summary = workstationSummary(safe.kind, safe.supplied, safe.data);
     const embedding = await workstationEmbedding(summary);
     const response = await fetch(`${baseUrl}/v1/agent-events/workstation`, { method: "POST", headers: headers(), redirect: "error",
-      signal: AbortSignal.timeout(3000), body: JSON.stringify({ project, session_id: sessionId, agent_id: agentId,
+      signal: AbortSignal.timeout(3000), body: JSON.stringify({ project, machine: HOOK_MACHINE, session_id: sessionId, agent_id: agentId,
         event: { kind: safe.kind, summary, details: JSON.stringify(safe.data).slice(0, 12000), timestamp: new Date().toISOString() }, embedding }) });
     if (response.status !== 202) throw new Error(`HTTP ${response.status}`);
   } catch (error) {
@@ -147,6 +147,7 @@ export async function capture(hookType, providedData) {
     hookType,
     sessionId: meta.sessionId,
     project: meta.project,
+    machine: HOOK_MACHINE,
     cwd: meta.cwd,
     timestamp: new Date().toISOString(),
     data: {

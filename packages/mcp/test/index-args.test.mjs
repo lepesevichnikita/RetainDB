@@ -31,11 +31,13 @@ test("MCP search shares knowledge by default, labels hits, and reports a missing
     }
   });
   const requests = [];
+  let supportsTags = false;
   t.mock.method(globalThis, "fetch", async (url, options) => {
     assert.equal(String(url), `${api}/v1/context/query`);
     const body = JSON.parse(options.body);
     requests.push(body);
     if (body.project === "missing") return Response.json({ error: "Project not found", code: "PROJECT_NOT_FOUND" }, { status: 404 });
+    if (body.tags && supportsTags) return Response.json({ results: [{ id: "project-two", content: "Tagged hit", project: "project-two", metadata: { tags: body.tags } }], context: "Tagged hit", meta: { applied_tags: body.tags } });
     const results = (body.project ? [body.project] : ["project-one", "project-two"])
       .map(project => ({ id: project, content: `Found in ${project}`, project }));
     return Response.json({ results, context: "Shared query", meta: {} });
@@ -57,5 +59,16 @@ test("MCP search shares knowledge by default, labels hits, and reports a missing
   }
   const missing = await client.callTool({ name: "search", arguments: { query: "f8b3f57e-remote-search-fixture", project: "missing" } });
   assert.equal(missing.isError, true);
-  assert.deepEqual(requests.map(body => body.project), [undefined, "project-two", "missing"]);
+  // Tool validation must pass the exact tag filter to the server, not filter the returned top hits.
+  const tags = ["project:project-two", "machine:mac-mini"];
+  const args = { query: "f8b3f57e-remote-search-fixture", tags };
+  const unsupported = await client.callTool({ name: "search", arguments: args });
+  assert.equal(unsupported.isError, true);
+  assert.match(unsupported.content[0].text, /TAG_FILTER_UNSUPPORTED/);
+  supportsTags = true;
+  const tagged = await client.callTool({ name: "search", arguments: args });
+  assert.equal(tagged.isError, undefined);
+  assert.deepEqual(JSON.parse(tagged.content[0].text).results.map(hit => hit.project), ["project-two"]);
+  assert.deepEqual(requests.at(-1).tags, tags);
+  assert.deepEqual(requests.map(body => body.project), [undefined, "project-two", "missing", undefined, undefined]);
 });

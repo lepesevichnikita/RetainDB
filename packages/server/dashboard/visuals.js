@@ -132,8 +132,9 @@ export function graphView({ nodes, edges }, query) {
   const neighbours = neighboursById(edges, nodes);
   const positions = graphPositions(nodes, neighbours);
   return visual({ items: nodes, positions, background: edgesLayer(edges, positions), labelled: true,
-    title: 'Inspect entities', caption: `${nodes.length} entities · ${edges.length} relations shown. Search to focus on another neighbourhood.`,
-    details: ({ id, type, project }) => [type ?? 'Unclassified', `Project: ${project}`, ...(neighbours.get(id).length ? neighbours.get(id) : ['No displayed relations'])],
+    title: 'Inspect graph nodes', caption: `${nodes.length} nodes · ${edges.length} relations shown. Search to focus on another neighbourhood.`,
+    details: ({ id, type, project, tag }) => [type ?? 'Unclassified', tag ? `Search tag: ${tag}` : `Project: ${project}`,
+      ...(neighbours.get(id).length ? neighbours.get(id) : ['No displayed relations'])],
   });
 }
 

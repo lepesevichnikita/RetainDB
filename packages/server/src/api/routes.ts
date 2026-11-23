@@ -30,7 +30,7 @@ import { ingestDocument } from "../engine/ingest.js";
 import { fireWebhookEvent } from "../engine/webhooks.js";
 import { embedSingle, embedSingleWithModel } from "../engine/embeddings.js";
 import { ensureGraphEntityId, entityRelationType, saveGraphBatch, saveGraphEntity, saveGraphRelation } from "../engine/entity-graph-write.js";
-import { countGraphEntities, searchEntityGraph } from "../engine/entity-graph.js";
+import { countGraphEntities, KNOWLEDGE_TAG_SELECTOR, searchEntityGraph } from "../engine/entity-graph.js";
 import { ingestSession as ingestMemorySession, searchMemories } from "../engine/memory/index.js";
 import { writeMemoryCanonical } from "../engine/memory/write.js";
 import { nanoid } from "nanoid";
@@ -1080,6 +1080,7 @@ api.post(
       threshold: z.number().min(0).max(1).optional().default(0.3),
       chunk_types: z.array(z.string()).optional(),
       source_ids: z.array(z.string()).optional(),
+      tags: z.array(z.string().trim().min(1).max(512)).max(32).optional(),
       metadata_filter: z.record(z.any()).optional(),
       // Oracle prefilter (structure-aware scope selection)
       oracle_mode: z.enum(["off", "auto", "force"]).optional(),
@@ -1125,11 +1126,14 @@ api.post(
     if ((body.project !== undefined || body.include_memories) && !projectRef) {
       return c.json({ error: "A project is required for an explicit filter or personal memory retrieval", code: "PROJECT_REQUIRED" }, 400);
     }
+    if (body.tags?.length && body.include_memories) {
+      return c.json({ error: "Knowledge tags do not filter personal memories", code: "TAGS_WITH_PERSONAL_MEMORIES" }, 400);
+    }
     const project = projectRef ? await resolveProjectReference(auth.orgId, projectRef) : null;
     if (projectRef && !project) return c.json({ error: "Project not found", code: "PROJECT_NOT_FOUND" }, 404);
 
     const result = await retrieve({
-      scope: { orgId: auth.orgId, projectId: project?.id },
+      scope: { orgId: auth.orgId, projectId: project?.id, tags: body.tags },
       query: body.query,
       topK: body.top_k,
       threshold: body.threshold,
@@ -1185,6 +1189,7 @@ api.post(
       meta: {
         query: body.query,
         project_scope: project ? "project" : "organization",
+        applied_tags: body.tags?.length ? body.tags : undefined,
         total: result.meta.totalResults,
         latency_ms: result.meta.latencyMs,
         cache_hit: result.meta.cacheHit,
@@ -3348,7 +3353,8 @@ api.post(
     const body = c.req.valid("json");
     const project = body.project ? await resolveProjectReference(auth.orgId, body.project) : null;
     if (body.project && !project) return c.json({ error: "Project not found", code: "PROJECT_NOT_FOUND" }, 404);
-    const { vector, model } = await embedSingleWithModel(body.query);
+    const tagLookup = body.entity_types?.length && body.entity_types.every(type => type === KNOWLEDGE_TAG_SELECTOR);
+    const { vector, model } = tagLookup ? { vector: [], model: null } : await embedSingleWithModel(body.query);
     const { entities, relations } = await searchEntityGraph({
       scope: { orgId: auth.orgId, projectId: project?.id }, query: body.query, embedding: vector, embeddingModel: model,
       depth: body.depth, topK: body.top_k, entityTypes: body.entity_types,

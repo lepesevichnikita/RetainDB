@@ -11,7 +11,7 @@ import { rerankWithInferenceService } from "./inference-client.js";
 import { selectOracleCandidateChunkIds } from "./oracle-select.js";
 import { searchGraphChunks } from "./entity-graph.js";
 import { compatibleEmbeddingModel, exactDistanceOrder } from "./vector-order.js";
-import { projectScopeSql, type ProjectSearchScope, visibleSourceSql } from "./oracle-visibility.js";
+import { knowledgeTagFilterSql, knowledgeTagsSql, projectScopeSql, publishedDocumentSql, type ProjectSearchScope, visibleSourceSql } from "./oracle-visibility.js";
 
 let openaiClient: OpenAI | null = null;
 
@@ -224,13 +224,14 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
 
   const projectId = typeof scope === "string" ? scope : scope.projectId;
   const orgId = typeof scope === "string" ? undefined : scope.orgId;
+  const hasTags = typeof scope !== "string" && Boolean(scope.tags?.length);
 
   const startTime = Date.now();
   const timing: NonNullable<ContextResponse["meta"]["timing"]> = {};
-  // Shared cache entries cannot recheck memory identity, expiry, or revocation.
-  const cacheResults = useCache && !includeGraph && !includeMemories;
+  // Cached answers cannot recheck personal identity or changes to tag membership.
+  const cacheResults = useCache && !includeGraph && !includeMemories && !hasTags;
   const cacheParams = {
-    retrievalScopeVersion: 2,
+    retrievalScopeVersion: 3,
     orgId,
     query,
     topK,
@@ -259,8 +260,8 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
   };
   const precisionV1Enabled = retrievalProfile === "precision_v1";
   const explicitSourceIds = uniqueStrings(sourceIds || []);
-  const hasExplicitScope = explicitSourceIds.length > 0 || Boolean(metadataFilter && Object.keys(metadataFilter).length > 0);
-  const sourceIntent = explicitSourceIds.length === 0 ? detectQuerySourceIntent(query) : null;
+  const hasExplicitScope = hasTags || explicitSourceIds.length > 0 || Boolean(metadataFilter && Object.keys(metadataFilter).length > 0);
+  const sourceIntent = !hasTags && explicitSourceIds.length === 0 ? detectQuerySourceIntent(query) : null;
   const autoSourceIds = sourceIntent && projectId ? await resolveAutoSourceIds(projectId, sourceIntent) : [];
   const scopedSourceIds = explicitSourceIds.length > 0 ? explicitSourceIds : autoSourceIds;
   const sourceScope: NonNullable<ContextResponse["meta"]["sourceScope"]> = explicitSourceIds.length > 0
@@ -352,7 +353,8 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
 
   // ─── Embed Query ─────────────────────────────────────────
   const tEmbed = Date.now();
-  const oracleActive = shouldEnableOracle({ query, oracleMode, chunkTypes, metadataFilter });
+  // Do not preselect unfiltered Oracle candidates before applying explicit tags.
+  const oracleActive = !hasTags && shouldEnableOracle({ query, oracleMode, chunkTypes, metadataFilter });
   const needsEmbedding = useVector || includeMemories || includeGraph || oracleActive;
   // The route declares use_vector defaulting to true, so a client that says nothing about vectors is
   // asking for them. If the embedder is unavailable that must not become a 500 - it becomes a lexical
@@ -425,7 +427,7 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
   // "do you remember me", "what did I tell you") skip all document search entirely
   // and route straight to memories. This avoids polluting memory-only results with
   // irrelevant document chunks and cuts latency significantly.
-  const personalQuery = isPersonalQuery(query);
+  const personalQuery = !hasTags && isPersonalQuery(query);
 
   // ─── Query Expansion (parallel, zero critical-path latency) ──────────────
   // Fire off paraphrase generation concurrently with the first vector search.
@@ -1012,6 +1014,7 @@ function scoreSourceIntentMatch(
 function searchableChunkFilter(scope: ProjectSearchScope, sourceIds?: string[], chunkTypes?: string[], metadataFilter?: Record<string, unknown>, chunkIds?: string[]) {
   const orgId = typeof scope === "string" ? undefined : scope.orgId;
   return Prisma.sql`${projectScopeSql(Prisma.sql`c."projectId"`, scope)}
+    ${knowledgeTagFilterSql(scope)}
     ${chunkTypes?.length ? Prisma.sql`AND c."chunkType" = ANY(${chunkTypes}::text[])` : Prisma.empty}
     ${metadataFilter ? Prisma.sql`AND c.metadata @> ${JSON.stringify(metadataFilter)}::jsonb` : Prisma.empty}
     ${chunkIds?.length ? Prisma.sql`AND c.id = ANY(${chunkIds}::text[])` : Prisma.empty}
@@ -1023,7 +1026,8 @@ function searchableChunkFilter(scope: ProjectSearchScope, sourceIds?: string[], 
         AND d."deletedAt" IS NULL AND s."deletedAt" IS NULL
         ${orgId === undefined ? Prisma.empty : Prisma.sql`AND s."orgId" = ${orgId}`}
         ${visibleSourceSql(sourceIds, orgId)}
-        AND (s."activeVersionId" IS NULL OR d."sourceVersionId" = s."activeVersionId")
+        AND ${typeof scope !== "string" && scope.tags?.length ? publishedDocumentSql()
+          : Prisma.sql`(s."activeVersionId" IS NULL OR d."sourceVersionId" = s."activeVersionId")`}
     )`;
 }
 
@@ -1458,7 +1462,8 @@ async function enrichResults(results: RetrievalResult[]): Promise<RetrievalResul
 
   const chunkDocs = await prisma.$queryRaw`
     SELECT
-      c.id as "chunkId", d.title as "docTitle", d."webUrl" as "webUrl", d.path as "docPath", s.id as "sourceId", s.name as "sourceName", p.name as project
+      c.id as "chunkId", d.title as "docTitle", d."webUrl" as "webUrl", d.path as "docPath", s.id as "sourceId", s.name as "sourceName", p.name as project,
+      ${knowledgeTagsSql()} AS tags
     FROM chunks c
     INNER JOIN documents d ON c."documentId" = d.id
     INNER JOIN sources s ON d."sourceId" = s.id
@@ -1478,6 +1483,7 @@ async function enrichResults(results: RetrievalResult[]): Promise<RetrievalResul
         project: enrichment.project,
         metadata: {
           ...r.metadata,
+          tags: enrichment.tags,
           source_id: enrichment.sourceId || r.metadata?.source_id,
           web_url: enrichment.webUrl || r.metadata?.web_url,
           path: enrichment.docPath || r.metadata?.path,

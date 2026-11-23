@@ -25,7 +25,29 @@ import { READABLE_SCOPE_STATES } from "./repo-index/store.js";
  */
 const SCOPE_SOURCE_PREFIX = scopeSourceName("");
 
-export type ProjectSearchScope = string | { orgId: string; projectId?: string };
+export type ProjectSearchScope = string | { orgId: string; projectId?: string; tags?: string[] };
+
+export function publishedDocumentSql() {
+  return Prisma.sql`d.status IN ('READY', 'INDEXED') AND d."sourceVersionId" IS NOT DISTINCT FROM s."activeVersionId"`;
+}
+
+/** Project provenance is derived from ownership, not client metadata. */
+export function knowledgeTagsSql() {
+  return Prisma.sql`ARRAY(
+    SELECT 'project:' || p.slug FROM projects p WHERE p.id = c."projectId"
+    UNION
+    SELECT label FROM jsonb_array_elements(CASE WHEN jsonb_typeof(c.metadata->'tags') = 'array'
+      THEN c.metadata->'tags' ELSE '[]'::jsonb END) AS tags(tag)
+    CROSS JOIN LATERAL (SELECT regexp_replace(tag #>> '{}', '^[[:space:]]+|[[:space:]]+$', '', 'g') AS label) normalized
+    WHERE jsonb_typeof(tag) = 'string' AND length(label) BETWEEN 1 AND 512 AND label NOT LIKE 'project:%'
+    ORDER BY 1
+  )`;
+}
+
+export function knowledgeTagFilterSql(scope: ProjectSearchScope) {
+  return typeof scope !== "string" && scope.tags?.length
+    ? Prisma.sql`AND ${knowledgeTagsSql()} @> ${scope.tags}::text[]` : Prisma.empty;
+}
 
 export function projectScopeSql(column: Prisma.Sql, scope: ProjectSearchScope) {
   if (typeof scope === "string") return Prisma.sql`${column} = ${scope}`;

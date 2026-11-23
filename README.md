@@ -519,7 +519,11 @@ Graph search and graph-assisted context do not compare vectors labelled with ano
 
 Omit `project` on `/v1/context/query` or `/v1/graph/search` to search visible knowledge across the authenticated organization. Document hits and graph entities include their source project as `project`; context responses also report `meta.project_scope`. Pass a project name, slug, or ID to narrow the query. An unknown or inaccessible project returns `404` without creating a project or widening the search. Context queries with `include_memories: true` still require a project: shared knowledge search does not search personal memories in other projects.
 
-Requests with `include_memories: true` bypass the shared response cache even when `use_cache` is set. This keeps cached answers from bypassing memory scope, expiration, or revocation checks; document-only caching is unchanged.
+Use `tags: ["project:mp", "machine:mac-mini"]` on `/v1/context/query` or the workspace MCP `search` to require every listed tag before ranking. Omit both `tags` and `project` for organization-wide search. Hits return the effective tags in `metadata.tags`. RetainDB derives `project:<slug>` from the owning project, so a caller-supplied project tag cannot mislabel a record. Other tags come from indexed metadata. On a workstation, set `RETAINDB_MACHINE` or `machine` in the shared hook config to add `machine:<label>` to future captures in either embedding mode. Machine labels are optional; older records are not guessed or rewritten.
+
+Requests with `include_memories: true` or nonempty `tags` bypass the shared response cache even when `use_cache` is set. `tags` filters indexed knowledge, not personal memories; do not combine it with `include_memories: true`.
+
+The API echoes accepted filters in `meta.applied_tags`. The workspace MCP rejects tagged searches against older backends that do not confirm the filter, rather than presenting unfiltered results as matches.
 
 The TypeScript SDK uses an explicit project or a project configured on the client, if present. The in-repository `@retaindb/mcp` tool `search` uses shared knowledge unless its call supplies `project`; the write-project setting does not narrow it. Project labels are retained in its results. An API failure is an MCP error, not an empty successful search. The separately published `@retaindb/mcp-server` is a different package and is not updated by building this workspace.
 
@@ -664,6 +668,12 @@ cannot honestly represent several chunks.
 The dashboard opens on **All projects**. Overview, graph and vector map can
 browse shared knowledge in the configured organization; use the project selector
 to filter. Graph and vector inspectors and queue rows show the original project.
+The graph also shows tag nodes linked to the visible documents carrying each
+tag. Select a node to see its exact search tag and displayed links. The graph
+shows a bounded neighborhood, not all matches; use tag-filtered search for retrieval.
+For API navigation, query the exact tag with `entity_types: ["knowledge_tag"]` at
+`/v1/graph/search`. Tag nodes are derived from live records, with no rebuild or
+separate tag index required.
 This view does not move data or change machine API search scope.
 The dashboard identifies members of Authelia's `admins` group as administrators.
 It checks this group in Authelia's authorization response for the actual route

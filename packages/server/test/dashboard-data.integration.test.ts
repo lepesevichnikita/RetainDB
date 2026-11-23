@@ -709,6 +709,13 @@ runBrowser("a browser can inspect knowledge, switch projects and refresh activit
       await db.$executeRaw`UPDATE chunks SET embedding = ${vector(x, y)}::vector WHERE id = ${chunk.id}`;
     }
   }
+  // The default graph exposes source tags as selectable nodes even without extracted entities for the documents.
+  await nav.getByRole("link", { name: "Knowledge graph" }).click();
+  await page.getByRole("button", { name: `project:${project.slug}`, exact: true }).click();
+  const tagDetails = page.getByRole("status", { name: "Selected item" });
+  await tagDetails.getByText(`Search tag: project:${project.slug}`, { exact: true }).waitFor({ timeout: 2500 });
+  await tagDetails.getByText("tags → Blueprint", { exact: true }).waitFor({ timeout: 2500 });
+  await nav.getByRole("link", { name: "Vector map" }).click();
   await page.getByRole("button", { name: "Refresh" }).click();
   const chunks = page.getByRole("complementary").getByRole("button", { name: /^Blueprint/ });
   await chunks.nth(1).waitFor();

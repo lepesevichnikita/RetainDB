@@ -246,6 +246,7 @@ test("the plugin session-start hook captures the event when the Local session AP
   const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith("RETAINDB_")));
   Object.assign(env, {
     RETAINDB_BASE_URL: baseUrl, RETAINDB_API_KEY: key, RETAINDB_AUTO_CONTEXT: "false",
+    RETAINDB_MACHINE: "fixture-workstation",
     RETAINDB_CONFIG: join(tmpdir(), `retaindb-absent-${randomUUID()}.json`),
   });
   await new Promise((resolve, reject) => {
@@ -257,6 +258,7 @@ test("the plugin session-start hook captures the event when the Local session AP
   // PostgreSQL Server accepts native observations, not Local session-start requests.
   const observation = requests.find((request) => request.path === "/retaindb/observe");
   assert.equal(observation?.authorization, "accepted");
+  assert.equal(observation.body.machine, "fixture-workstation");
   assert.deepEqual([observation.body.hookType, observation.body.sessionId, observation.body.project],
     ["session_start", "start-session", "named-project"]);
 });

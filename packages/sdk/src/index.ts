@@ -28,6 +28,7 @@ export interface QueryParams {
   threshold?: number;
   chunk_types?: string[];
   source_ids?: string[];
+  tags?: string[];
   metadata_filter?: Record<string, any>;
   hybrid?: boolean;
   vector_weight?: number;
@@ -65,6 +66,7 @@ export interface QueryResult {
   meta: {
     query: string;
     project_scope?: "project" | "organization";
+    applied_tags?: string[];
     degraded?: { reranked: boolean; reasons: string[] };
     total: number;
     latency_ms: number;

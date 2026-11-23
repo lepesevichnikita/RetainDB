@@ -25,6 +25,9 @@ export function resolveHookBaseUrl(fallback = "http://localhost:3111") {
 
 export const BASE_URL = resolveHookBaseUrl();
 export const API_KEY = process.env.RETAINDB_API_KEY || config.token || "";
+const machine = process.env.RETAINDB_MACHINE ?? config.machine;
+export const HOOK_MACHINE = typeof machine === "string" && /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(machine.trim())
+  ? machine.trim() : undefined;
 function resolveHookEmbeddingMode(mode) {
   if (mode === "local" || mode === "workstation") return "workstation";
   if (mode === "server") return "server";

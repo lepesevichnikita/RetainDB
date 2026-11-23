@@ -177,6 +177,64 @@ run("graph search without a project returns the organization's labeled graph", {
   assert.equal(await db.project.count({ where: { name: foreign, orgId: "default" } }), 0);
 });
 
+run("shared tag search and graph navigation use the same visible records", { timeout: 25_000 }, async (t) => {
+  const graph = await fixture(t);
+  const { db, project, post } = graph;
+  const sibling = await db.project.create({ data: { name: `${project.name}-sibling`, slug: `${project.slug}-sibling`, orgId: project.orgId } });
+  t.after(() => db.project.delete({ where: { id: sibling.id } }).then(() => undefined));
+  const firstSource = await seedSource(graph, "first");
+  const other = { ...graph, project: sibling };
+  const secondSource = await seedSource(other, "second");
+  const first = await seedChunk(graph, firstSource.id, "Zeolite desiccant guide", undefined, vector);
+  const second = await seedChunk(other, secondSource.id, "Zeolite desiccant checklist", undefined, vector);
+  const retired = await seedSource(other, "retired");
+  const stale = await seedChunk(other, retired.id, "Zeolite desiccant retired", undefined, vector);
+  const tag = `machine:${project.slug}`;
+  await db.chunk.updateMany({ where: { id: { in: [first.id, second.id, stale.id] } }, data: { metadata: { tags: [`  ${tag}\t`] } } });
+  await db.source.update({ where: { id: retired.id }, data: { deletedAt: new Date() } });
+
+  // Matching the same machine and project must select the right candidate before top_k.
+  const common = { project: undefined, query: "zeolite desiccant", top_k: 1, rerank: false, use_cache: false, threshold: 0 };
+  for (const ranking of [{ use_vector: false }, { hybrid: false }]) {
+    const hit = await post("/v1/context/query", { ...common, ...ranking, tags: [tag, `project:${sibling.slug}`] });
+    assert.deepEqual(hit.results.map((result: { id: string }) => result.id), [second.id]);
+    assert.deepEqual(new Set(hit.results[0].metadata.tags), new Set([tag, `project:${sibling.slug}`]));
+    const absent = await post("/v1/context/query", { ...common, ...ranking, tags: [tag, "machine:unknown"] });
+    assert.deepEqual(absent.results, []);
+  }
+
+  const view = await post("/v1/graph/search", { project: undefined, query: tag, entity_types: ["knowledge_tag"] });
+  const node = view.entities.find((entity: { name: string; entityType: string }) => entity.name === tag && entity.entityType === "tag");
+  assert.ok(node);
+  assert.deepEqual(new Set(view.relations.filter((edge: { fromEntityId: string }) => edge.fromEntityId === node.id)
+    .map((edge: { toEntityId: string }) => edge.toEntityId)), new Set([`document:${first.documentId}`, `document:${second.documentId}`]));
+  // Existing manually written entities of type tag still use ordinary entity traversal.
+  const manual = await post("/v1/entities", { name: tag, entity_type: "tag" }, 201);
+  const legacy = await post("/v1/graph/search", { query: tag, entity_types: ["tag"] });
+  assert.deepEqual(legacy.entities.map((item: { id: string }) => item.id), [manual.id]);
+});
+
+run("tag search and graph expose a version only after it becomes active", async t => {
+  const graph = await fixture(t);
+  const { db, project, post } = graph;
+  const source = await seedSource(graph, "publication fixture");
+  const version = await db.sourceVersion.create({ data: { sourceId: source.id, orgId: project.orgId, versionNumber: 1 } });
+  const chunk = await seedChunk(graph, source.id, "Bentonite publication guide", version.id);
+  const tag = `project:${project.slug}`;
+  const search = { query: "bentonite", tags: [tag], threshold: 0, use_vector: false, rerank: false };
+  const lookup = { query: tag, entity_types: ["knowledge_tag"] };
+  // Materialized rows are not published just because they have searchable text.
+  for (const state of ["READY", "ERROR"] as const) {
+    await db.document.update({ where: { id: chunk.documentId }, data: { status: state } });
+    assert.deepEqual((await post("/v1/context/query", search)).results, [], state);
+    assert.deepEqual((await post("/v1/graph/search", lookup)).entities, [], state);
+  }
+  await db.document.update({ where: { id: chunk.documentId }, data: { status: "READY" } });
+  await db.source.update({ where: { id: source.id }, data: { activeVersionId: version.id } });
+  assert.equal((await post("/v1/context/query", search)).results[0]?.id, chunk.id);
+  assert.ok((await post("/v1/graph/search", lookup)).entities.some((node: { id: string }) => node.id === `document:${chunk.documentId}`));
+});
+
 run("context search ranks documents across projects and retains their provenance", { timeout: 25_000 }, async (t) => {
   const graph = await fixture(t);
   const { db, project, post } = graph;
@@ -235,6 +293,13 @@ run("SDK query without a configured project returns shared knowledge", { timeout
   const params = { query, rerank: false, use_cache: false, use_vector: false };
   assert.equal((await client.query(params)).results[0]?.id, chunk.id);
   assert.equal((await client.withProject(project.slug).query(params)).results[0]?.id, chunk.id);
+  const { RetainDBClient } = await import("../../sdk/src/whisper.js");
+  const configured = new RetainDBClient({ apiKey: credential, baseUrl: "https://sdk-fixture.invalid", project: project.slug });
+  const tagged = { ...params, tags: [`project:${project.slug}`] };
+  assert.equal((await configured.query(tagged)).results[0]?.id, chunk.id);
+  await assert.rejects(configured.query({ ...tagged, include_memories: true }), {
+    status: 400, details: { code: "TAGS_WITH_PERSONAL_MEMORIES", error: "Knowledge tags do not filter personal memories" },
+  });
   const invalid = await post("/v1/context/query", { ...params, include_memories: true, project: undefined }, 400);
   assert.equal(invalid.code, "PROJECT_REQUIRED");
 });

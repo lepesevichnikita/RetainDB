@@ -1,6 +1,6 @@
 import { prisma, Prisma } from "../db/index.js";
 import { vectorLiteral } from "./entity-graph-write.js";
-import { projectScopeSql as graphProject, type ProjectSearchScope as GraphScope, visibleSourceSql } from "./oracle-visibility.js";
+import { knowledgeTagFilterSql, knowledgeTagsSql, projectScopeSql as graphProject, type ProjectSearchScope as GraphScope, publishedDocumentSql, visibleSourceSql } from "./oracle-visibility.js";
 import { compatibleEmbeddingModel } from "./vector-order.js";
 
 interface ChunkScope {
@@ -47,9 +47,9 @@ function activeGraphChunks(project: GraphScope, scope: ChunkScope = {}) {
     WHERE c."projectId" = s."projectId" AND ${graphProject(Prisma.sql`c."projectId"`, project)}
       AND (d."projectId" IS NULL OR d."projectId" = c."projectId")
       AND d."deletedAt" IS NULL AND s."deletedAt" IS NULL
-      AND d.status IN ('READY', 'INDEXED')
-      AND d."sourceVersionId" IS NOT DISTINCT FROM s."activeVersionId"
+      AND ${publishedDocumentSql()}
       AND COALESCE(c.metadata->>'content_kind', '') <> 'parent_context'
+      ${knowledgeTagFilterSql(project)}
       ${sourceIds?.length ? Prisma.sql`AND s.id = ANY(${sourceIds}::text[])` : Prisma.empty}
       ${chunkTypes?.length ? Prisma.sql`AND c."chunkType" = ANY(${chunkTypes}::text[])` : Prisma.empty}
       ${metadataFilter ? Prisma.sql`AND c.metadata @> ${JSON.stringify(metadataFilter)}::jsonb` : Prisma.empty}`;
@@ -186,12 +186,20 @@ async function readGraphEntities(db: GraphReader, scope: GraphScope, chunks: Pri
   `;
 }
 
+export const KNOWLEDGE_TAG_SELECTOR = "knowledge_tag";
+
 export function searchEntityGraph(options: GraphSearch & { scope: { orgId: string; projectId?: string } }) {
   return graphSnapshot(async (db) => {
     const chunks = visibleKnowledgeChunks(options.scope.projectId, options.scope.orgId);
-    const traversal = await traverseGraph(db, options, chunks);
+    const entityTypes = options.entityTypes?.filter(type => type !== KNOWLEDGE_TAG_SELECTOR);
+    const tagGraph = options.query && options.entityTypes?.includes(KNOWLEDGE_TAG_SELECTOR)
+      ? await exactTagGraph(db, options.scope, options.query, options.topK) : { nodes: [], edges: [] };
+    const tags = tagGraph.nodes.map(toTagSearchResult);
+    if (options.entityTypes?.length && !entityTypes?.length) return { entities: tags, relations: tagGraph.edges };
+    const traversal = await traverseGraph(db, { ...options, entityTypes }, chunks);
     const nodes = await readGraphEntities(db, options.scope, chunks, traversal.ids);
-    return { entities: nodes.map((node) => ({ ...node, similarity: traversal.seeds.get(node.id) ?? 0 })), relations: traversal.relations };
+    return { entities: [...tags, ...nodes.map(node => ({ ...node, similarity: traversal.seeds.get(node.id) ?? 0 }))],
+      relations: [...tagGraph.edges, ...traversal.relations] };
   });
 }
 
@@ -227,7 +235,52 @@ export function exportProjectGraph(projectId: string, limits: { entities: number
 }
 
 const DASHBOARD_GRAPH_SEEDS = 24;
-export interface BrowserNode { id: string; label: string; type: string | null; project: string }
+const DASHBOARD_TAG_CHUNK_SAMPLE = 384;
+export interface BrowserNode { id: string; label: string; type: string | null; project: string | null; tag?: string }
+interface TaggedDocument { tag: string; documentId: string; title: string; project: string }
+
+function toTagSearchResult({ label, type, tag, ...node }: BrowserNode) {
+  return { ...node, name: label, entityType: type, metadata: tag === undefined ? {} : { tag }, description: null, similarity: tag ? 1 : 0 };
+}
+
+async function exactTagGraph(db: GraphReader, scope: { orgId: string; projectId?: string }, tag: string, limit: number) {
+  const chunks = visibleGraphChunks({ ...scope, tags: [tag] });
+  const rows = await db.$queryRaw<TaggedDocument[]>`
+    SELECT ${tag}::text AS tag, m.id AS "documentId", left(m.title, 240) AS title, p.name AS project
+    FROM (SELECT DISTINCT d.id, d.title, c."projectId" ${chunks} ORDER BY d.id LIMIT ${limit}) m
+    JOIN projects p ON p.id = m."projectId" ORDER BY m.id`;
+  return buildTagGraph(rows);
+}
+
+function visibleTaggedDocuments(db: GraphReader, chunks: Prisma.Sql, query: string, limit: number) {
+  const sample = query ? Prisma.empty : Prisma.sql`ORDER BY c.id DESC LIMIT ${DASHBOARD_TAG_CHUNK_SAMPLE}`;
+  return db.$queryRaw<TaggedDocument[]>`
+    WITH visible AS (
+      SELECT d.id, d.title, c."projectId", ${knowledgeTagsSql()} AS tags ${chunks} ${sample}
+    ), matches AS (
+      SELECT DISTINCT tag, id, title, "projectId" FROM visible CROSS JOIN LATERAL unnest(tags) AS labels(tag)
+      WHERE strpos(lower(tag), lower(${query})) > 0 OR ${query} = ''
+    ), selected AS (
+      SELECT tag FROM matches GROUP BY tag ORDER BY count(*) DESC, tag LIMIT 8
+    )
+    SELECT m.tag, m.id AS "documentId", left(m.title, 240) AS title, p.name AS project
+    FROM selected s CROSS JOIN LATERAL (
+      SELECT * FROM matches WHERE tag = s.tag ORDER BY id LIMIT ${limit}
+    ) m JOIN projects p ON p.id = m."projectId" ORDER BY m.tag, m.id`;
+}
+
+function buildTagGraph(rows: TaggedDocument[]) {
+  const nodes = new Map<string, BrowserNode>();
+  const edges: GraphRelation[] = [];
+  for (const { tag, documentId, title, project } of rows) {
+    const tagId = `tag:${tag}`;
+    const recordId = `document:${documentId}`;
+    nodes.set(tagId, { id: tagId, label: tag, type: "tag", project: null, tag });
+    nodes.set(recordId, { id: recordId, label: title, type: "document", project });
+    edges.push({ id: `${recordId}:${tagId}`, fromEntityId: tagId, toEntityId: recordId, relationType: "tags", weight: 1 });
+  }
+  return { nodes: [...nodes.values()], edges };
+}
 
 export function visibleKnowledgeChunks(projectId: string | undefined, orgId: string) {
   return visibleGraphChunks({ projectId, orgId });
@@ -258,10 +311,11 @@ export function browseProjectGraph(projectId: string | undefined, orgId: string,
     const project = { projectId, orgId };
     const scope = projectEntities(project, chunks);
     const seeds = new Set((await browseSeeds(db, scope, query)).map(({ id }) => id));
-    if (seeds.size === 0) return { nodes: [], edges: [] };
+    const tags = buildTagGraph(await visibleTaggedDocuments(db, chunks, query, query ? 12 : 3));
+    if (seeds.size === 0) return tags;
     const edges = await findGraphRelations(db, projectRelations(project, chunks), [...seeds], []);
     const nodes = await browseNodes(db, scope, [...seeds, ...nextFrontier(edges, seeds)]);
-    return { nodes, edges };
+    return { nodes: [...tags.nodes, ...nodes], edges: [...tags.edges, ...edges] };
   });
 }
 

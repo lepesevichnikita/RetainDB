@@ -60,7 +60,7 @@ run("the workstation receipt persists exactly the supplied searchable vector", a
   const summary = "Workstation inference keeps event indexing off the server.";
   const model = "fixture/workstation";
   const vector = [0.25, -0.5, ...Array<number>(1022).fill(0)];
-  const payload = { project: `${projectName}-isolated`, session_id: randomUUID(), event: { kind: "prompt", summary },
+  const payload = { project: `${projectName}-isolated`, machine: "fixture-workstation", session_id: randomUUID(), event: { kind: "prompt", summary },
     embedding: { model, vector, content_sha256: createHash("sha256").update(summary).digest("hex") } };
   const receipt = await request("/v1/agent-events/workstation", payload);
   await drainNativeCaptures();
@@ -69,13 +69,14 @@ run("the workstation receipt persists exactly the supplied searchable vector", a
   assert.equal((await request("/v1/agent-events/workstation", payload)).event_id, receipt.event_id);
 
   // Search the saved vector independently of the product's text inference path.
-  const rows = await db.$queryRaw<{ content: string; model: string; distance: number }[]>`
-    SELECT content, metadata->>'embedding_model' AS model, embedding <=> ${`[${vector.join(",")}]`}::vector AS distance
+  const rows = await db.$queryRaw<{ content: string; model: string; distance: number; tags: string[] }[]>`
+    SELECT content, metadata->>'embedding_model' AS model, metadata->'tags' AS tags, embedding <=> ${`[${vector.join(",")}]`}::vector AS distance
     FROM chunks WHERE "documentId" = ${indexed.document_id} AND embedding IS NOT NULL
     ORDER BY distance ASC`;
   assert.equal(rows.length, 1);
   assert.equal(rows[0].content, summary);
   assert.equal(rows[0].model, model);
+  assert.deepEqual(rows[0].tags, ["machine:fixture-workstation"]);
   assert.ok(Math.abs(rows[0].distance) < 1e-7);
 });
 

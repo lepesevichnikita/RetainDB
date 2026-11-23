@@ -873,17 +873,22 @@ server.tool(
 // 6. SEARCH — semantic search over indexed sources + local codebase
 server.tool(
   "search",
-  "Search indexed knowledge across the authenticated organization. An explicit project filters remote results. Local code matches are listed separately.",
+  "Search indexed knowledge across the organization. Supply tags to require all exact labels, such as project:mp or machine:mac-mini. An explicit project also narrows the search.",
   {
     query: z.string().describe("What to search for"),
     top_k: z.number().optional().default(10),
     session_id: z.string().optional(),
     project: z.string().trim().min(1).optional().describe("Filter by project name, slug, or ID; omit for shared knowledge"),
+    tags: z.array(z.string().trim().min(1).max(512)).max(32).optional().describe("Require all these exact tags; omit to search all knowledge"),
   },
-  async ({ query, top_k, session_id, project }) => {
+  async ({ query, top_k, session_id, project, tags }) => {
     try {
-      const response = await knowledgeClient.query({ project, query, top_k, include_memories: false, session_id });
-      const localResults = searchLocalFiles(query, process.cwd(), top_k ?? 10);
+      const response = await knowledgeClient.query({ project, query, top_k, include_memories: false, session_id, tags });
+      const applied = response.meta?.applied_tags;
+      if (tags?.length && (!Array.isArray(applied) || applied.length !== tags.length || tags.some((tag, i) => tag !== applied[i]))) {
+        return { ...err("TAG_FILTER_UNSUPPORTED: the RetainDB backend did not apply the requested tags."), isError: true };
+      }
+      const localResults = tags?.length ? [] : searchLocalFiles(query, process.cwd(), top_k ?? 10);
       const payload = buildMcpSearchPayload({
         mode: "semantic",
         query,

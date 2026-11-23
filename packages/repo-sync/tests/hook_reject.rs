@@ -200,3 +200,17 @@ fn rejected_event_leaves_no_partial_state() {
     let after = std::fs::read(harness.state_file("queue.json")).ok();
     assert_eq!(before, after, "queue file untouched by a rejected event");
 }
+
+/// The event Hermes actually sends carries status "ok"; the adapter must accept it, and must
+/// still refuse anything that is not a completed call.
+#[test]
+fn hermes_status_ok_is_a_successful_read() {
+    use std::path::Path;
+    let cases = [("ok", true), ("success", true), ("OK", true), ("error", false), ("failed", false)];
+    for (status, accepted) in cases {
+        let body = support::hermes_read_event_with_status(Path::new("/repo"), "README.md", status);
+        let event = retaindb_repo::json::parse(&body).expect("event parses");
+        let adapted = retaindb_repo::adapters::adapt(retaindb_repo::hint::Client::Hermes, &event, &[Path::new("/repo")]);
+        assert_eq!(adapted.is_ok(), accepted, "status {status} must be accepted={accepted}");
+    }
+}

@@ -139,6 +139,12 @@ fn claude(event: &Json, roots: &[&Path]) -> Result<Adapted, Reject> {
     })
 }
 
+/// A client reports a completed call as `ok` (Hermes) or `success`; both mean the read happened,
+/// and anything else is a failure this adapter refuses.
+fn status_reports_success(status: &str) -> bool {
+    status.eq_ignore_ascii_case("ok") || status.eq_ignore_ascii_case("success")
+}
+
 /// Hermes `post_tool_call` / `read_file`, success only.
 fn hermes(event: &Json, roots: &[&Path]) -> Result<Adapted, Reject> {
     let tool = event
@@ -148,13 +154,12 @@ fn hermes(event: &Json, roots: &[&Path]) -> Result<Adapted, Reject> {
     if !tool.eq_ignore_ascii_case("read_file") {
         return Err(Reject::UnsupportedTool);
     }
-    let status_ok = event
+    let status = event
         .get("extra")
         .and_then(|extra| extra.get("status"))
         .and_then(Json::as_str)
-        .map(|status| status == "success")
         .ok_or(Reject::MissingField("extra.status"))?;
-    if !status_ok {
+    if !status_reports_success(status) {
         return Err(Reject::FailedStatus);
     }
     let raw = event

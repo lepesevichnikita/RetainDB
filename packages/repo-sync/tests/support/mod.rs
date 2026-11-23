@@ -266,7 +266,15 @@ pub fn claude_read_event(cwd: &Path, file_path: &str, tool_use_id: &str) -> Stri
 /// encoded `extra.result`).
 pub fn hermes_read_event(cwd: &Path, path: &str) -> String {
     format!(
-        r#"{{"schema_version":1,"tool_name":"read_file","tool_input":{{"path":"{path}"}},"cwd":"{}","extra":{{"status":"success","result":{{"body":"BASE64-ENCODED-BODY"}}}}}}"#,
+        r#"{{"schema_version":1,"tool_name":"read_file","tool_input":{{"path":"{path}"}},"cwd":"{}","extra":{{"status":"ok","result":{{"body":"BASE64-ENCODED-BODY"}}}}}}"#,
+        cwd.display()
+    )
+}
+
+/// Hermes reports a completed call as `ok`; the other spellings a client may use.
+pub fn hermes_read_event_with_status(cwd: &Path, path: &str, status: &str) -> String {
+    format!(
+        r#"{{"schema_version":1,"tool_name":"read_file","tool_input":{{"path":"{path}"}},"cwd":"{}","extra":{{"status":"{status}","result":null}}}}"#,
         cwd.display()
     )
 }

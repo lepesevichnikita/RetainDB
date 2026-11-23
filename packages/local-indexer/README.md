@@ -19,6 +19,9 @@ this checkout — a linked install breaks the moment the repository moves:
 npm i -g --install-links ./packages/local-indexer
 ```
 
+A real copy means the global command does not follow your edits: reinstall the same way after
+changing the package, or the command keeps running the previous build.
+
 
 ```bash
 npm i -g ./packages/local-indexer    # puts `retaindb-index` on PATH

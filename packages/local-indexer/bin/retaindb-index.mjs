@@ -92,7 +92,12 @@ async function readTextFile(absolutePath) {
     return null;
   }
   if (info.size > MAX_BYTES) return null;
-  const bytes = await readFile(absolutePath);
+  let bytes;
+  try {
+    bytes = await readFile(absolutePath);
+  } catch {
+    return null;
+  }
   if (bytes.includes(0)) return null;
   return bytes.toString("utf8");
 }

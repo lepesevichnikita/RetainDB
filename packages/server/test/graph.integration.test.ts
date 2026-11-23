@@ -96,12 +96,14 @@ async function seedSource({ db, project }: GraphFixture, name: string) {
   return db.source.create({ data: { projectId: project.id, name, type: "text", status: "READY" } });
 }
 
-async function seedChunk({ db, project }: GraphFixture, sourceId: string, title: string, sourceVersionId?: string) {
+async function seedChunk({ db, project }: GraphFixture, sourceId: string, title: string, sourceVersionId?: string, embedding?: readonly number[]) {
   const document = await db.document.create({ data: { sourceId, projectId: project.id, title, sourceVersionId, status: "READY" } });
-  return db.chunk.create({ data: { documentId: document.id, projectId: project.id, chunkType: "text", content: title } });
+  const chunk = await db.chunk.create({ data: { documentId: document.id, projectId: project.id, chunkType: "text", content: title } });
+  if (embedding) await db.$executeRaw`UPDATE chunks SET embedding = ${`[${embedding.join(",")}]`}::vector WHERE id = ${chunk.id}`;
+  return chunk;
 }
 
-run("graph writes reuse entity IDs and persist an embedded relation endpoint", { timeout: 25_000 }, async (t) => {
+run("graph writes reuse entity IDs and keep a structural endpoint searchable by name", { timeout: 25_000 }, async (t) => {
   const { db, post } = await fixture(t);
   const request = { name: "Snapshot", entity_type: "concept", description: "First snapshot" };
   const created = await post("/v1/entities", request, 201);
@@ -120,11 +122,14 @@ run("graph writes reuse entity IDs and persist an embedded relation endpoint", {
   assert.equal(repeated.fromEntityId, created.id);
   assert.equal(repeated.weight, 0.6);
 
-  // Check the real stored vector, not the provider fixture's return value.
-  const [target] = await db.$queryRaw<{ type: string; dimensions: number }[]>`
+  // With no source chunk, the endpoint is structural and has no separate vector.
+  const [target] = await db.$queryRaw<{ type: string; dimensions: number | null }[]>`
     SELECT type, vector_dims(embedding) AS dimensions FROM entities WHERE id = ${repeated.toEntityId}
   `;
-  assert.deepEqual(target, { type: "concept", dimensions: 1024 });
+  assert.deepEqual(target, { type: "concept", dimensions: null });
+  const found: GraphResponse = await post("/v1/graph/search", { query: "checksum", top_k: 1 });
+  assert.equal(found.entities[0]?.id, repeated.toEntityId);
+  assert.deepEqual(found.relations.map(({ id }) => id), [repeated.id]);
 });
 
 run("graph search honors depth and returns both endpoints of project-local edges", { timeout: 25_000 }, async (t) => {
@@ -250,7 +255,7 @@ run("staging and promotion select chunk claims without replacing active graph id
   const source = await seedSource(graph, "restore-guide");
   const active = await versions.ensureActiveSourceVersion(source.id);
   assert.ok(active);
-  const before = await seedChunk(graph, source.id, "Original restore guide", active.id);
+  const before = await seedChunk(graph, source.id, "Original restore guide", active.id, vector);
   await extractEntities(project.id, before.id, before.content.repeat(8), "text");
   const queryGraph = (): Promise<GraphResponse> => post("/v1/graph/search", { query: "snapshot" });
   const queryContext = () => post("/v1/context/query", {
@@ -260,10 +265,10 @@ run("staging and promotion select chunk claims without replacing active graph id
   const seed = initialGraph.entities.find((entity) => entity.name === "Snapshot");
   assert.ok(seed);
   assert.equal(initialGraph.relations.length, 1);
-  assert.equal((await queryContext()).results[0].id, before.id);
+  assert.deepEqual((await queryContext()).results.map((hit: { id: string }) => hit.id), [before.id]);
 
   const staged = await versions.createStagedSourceVersion(source.id);
-  const next = await seedChunk(graph, source.id, "Replacement restore guide", staged.id);
+  const next = await seedChunk(graph, source.id, "Replacement restore guide", staged.id, vector);
   claims = { entities: [
     { ...extraction.entities[0], description: "Replacement snapshot instructions" },
     extraction.entities[1],
@@ -275,7 +280,7 @@ run("staging and promotion select chunk claims without replacing active graph id
   const whileFailed = await queryContext();
 
   const replacement = await versions.createStagedSourceVersion(source.id);
-  const current = await seedChunk(graph, source.id, "Current restore guide", replacement.id);
+  const current = await seedChunk(graph, source.id, "Current restore guide", replacement.id, vector);
   await extractEntities(project.id, current.id, current.content.repeat(8), "text");
   await versions.promoteSourceVersion({ sourceId: source.id, sourceVersionId: replacement.id });
   const afterPromotion = { graph: await queryGraph(), context: await queryContext() };
@@ -298,7 +303,7 @@ run("standalone graph excludes deleted source facts without hiding manual entiti
   const { softDeleteSource } = await import("../src/engine/source-versions.js");
   const source = await seedSource(graph, "deleted-guide");
   const chunk = await seedChunk(graph, source.id, "Guide about the snapshot and its checksum");
-  const manual = await post("/v1/entities", { name: "Retention", entity_type: "concept" }, 201);
+  const manual = await post("/v1/entities", { name: "Snapshot retention", entity_type: "concept" }, 201);
   await extractEntities(project.id, chunk.id, chunk.content.repeat(8), "text");
   const before: GraphResponse = await post("/v1/graph/search", { query: "snapshot" });
   assert.equal(before.relations.length, 1);
@@ -307,7 +312,8 @@ run("standalone graph excludes deleted source facts without hiding manual entiti
   assert.equal(beforeExport.bundle.contents.entities.find((entity: { name: string }) => entity.name === "Snapshot")?.description,
     "A database snapshot");
   await softDeleteSource({ sourceId: source.id, retentionDays: 1 });
-  const result: GraphResponse = await post("/v1/graph/search", { query: "snapshot" });
+  // The shorter, deleted name would take the only seed slot if filtered after ranking.
+  const result: GraphResponse = await post("/v1/graph/search", { query: "snapshot", top_k: 1 });
   assert.deepEqual(result.entities.map(({ id }) => id), [manual.id]);
   assert.deepEqual(result.relations, []);
   const exported = await exportGraph();
@@ -419,11 +425,13 @@ run("text ingestion creates searchable entity relations with their source chunk"
   const ids = new Map(result.entities.map(({ name, id }) => [name, id]));
   assert.deepEqual(result.relations.map(({ fromEntityId, toEntityId, relationType }) => [fromEntityId, toEntityId, relationType]),
     [[ids.get("Snapshot"), ids.get("Checksum"), "references"]]);
+  // Search with words that do not match an entity label; inference returns the ingested chunk's vector.
   const context = await post("/v1/context/query", {
-    query: "snapshot", include_graph: true, hybrid: false, use_vector: false, rerank: false,
+    query: "database recovery", include_graph: true, hybrid: false, use_vector: false, rerank: false,
   });
   assert.ok(context.results.some((hit: { content: string; retrieval_source: string }) =>
-    hit.retrieval_source === "graph" && hit.content.includes("snapshot checksum")));
+    hit.retrieval_source === "graph" && hit.content.includes("snapshot checksum")),
+  "graph-only context should find the ingested chunk using its stored vector");
 });
 
 after(async () => {

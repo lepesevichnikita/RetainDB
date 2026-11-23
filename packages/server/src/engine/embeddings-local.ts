@@ -32,14 +32,8 @@ async function ensureTransformersLoaded() {
 let embedder: any = null;
 let crossEncoder: any = null;
 
-/**
- * Initialize BGE-large embedding model
- * Model: BAAI/bge-large-en-v1.5
- * Dimensions: 1024
- * MTEB Score: 63.98 (beats OpenAI text-embedding-3-small!)
- */
 /** One multilingual model is the default: it embeds every language into the same space. */
-export const DEFAULT_LOCAL_MODEL = process.env.EMBEDDING_MODEL || 'Xenova/multilingual-e5-large';
+export const LOCAL_EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'Xenova/multilingual-e5-large';
 
 async function initEmbedder() {
   await ensureTransformersLoaded();
@@ -48,13 +42,12 @@ async function initEmbedder() {
   }
 
   if (!embedder) {
-    const model = process.env.EMBEDDING_MODEL || DEFAULT_LOCAL_MODEL;
-    console.log(`[LocalEmbeddings] Loading ${model} (first time may take 1-2 min)...`);
+    console.log(`[LocalEmbeddings] Loading ${LOCAL_EMBEDDING_MODEL} (first time may take 1-2 min)...`);
     const startTime = Date.now();
 
     embedder = await pipeline(
       'feature-extraction',
-      model,
+      LOCAL_EMBEDDING_MODEL,
       { quantized: true } // Use quantized version for faster inference
     );
 

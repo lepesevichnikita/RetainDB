@@ -153,7 +153,8 @@ export function vectorView({ anchors, points, model, limit }) {
   const halfX = (WIDTH - 2 * INSET) / 2;
   const halfY = (HEIGHT - 2 * INSET) / 2;
   const position = ({ x, y }) => ({ x: WIDTH / 2 + x * halfX, y: HEIGHT / 2 - y * halfY });
-  return visual({ items: points, positions: new Map(points.map((point) => [point.id, position(point)])), background: axisGrid(),
+  const chunks = points.map((point) => ({ ...point, label: `${point.label} · chunk ${point.chunkIndex + 1}` }));
+  return visual({ items: chunks, positions: new Map(points.map((point) => [point.id, position(point)])), background: axisGrid(),
     title: 'Inspect chunks', caption: `${points.length} plotted · up to ${limit} recent vectors. A: ${anchors[0]}. B: ${anchors[1]}. Distances on this map are not full-vector distances.`,
     details: ({ type, x, y }) => [type ?? 'Chunk', `Similarity to A: ${x.toFixed(3)}`, `Similarity to B: ${y.toFixed(3)}`],
   });

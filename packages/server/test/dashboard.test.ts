@@ -24,6 +24,7 @@ async function fixture(t: TestContext) {
   });
   const { createNodeApp } = await import("../src/api/app.js");
   const api = new Hono();
+  api.get("/v1/fixtures/resolve", (c) => c.json({ resolved: true }));
   api.get("/v1/fixtures/:id", (c) => c.json({ ok: true }));
   return createNodeApp({ routeApp: api });
 }
@@ -86,6 +87,8 @@ test("logs reflect real API outcomes without paths, headers, cookies or dashboar
   const headers = { cookie, authorization: `Bearer ${token}`, "x-request-id": token };
   const request = await app.request(`${origin}/v1/fixtures/${token}?secret=${token}`, { headers });
   assert.equal(request.status, 200);
+  // Both templates match; only the exact handler actually runs.
+  assert.deepEqual(await (await app.request(`${origin}/v1/fixtures/resolve`)).json(), { resolved: true });
   await app.request(`${origin}/v1/missing/${token}`);
 
   const read = () => app.request(`${origin}/dashboard/data/logs`, { headers });
@@ -96,8 +99,8 @@ test("logs reflect real API outcomes without paths, headers, cookies or dashboar
   assert.ok(!body.includes("fixture-session"));
   const { rows } = JSON.parse(body);
   assert.deepEqual(rows.map(({ method, route, status }: { method: string; route: string; status: number }) => [method, route, status]), [
-    ["GET", "Unmatched API route", 404], ["GET", "/v1/fixtures/:id", 200],
+    ["GET", "Unmatched API route", 404], ["GET", "/v1/fixtures/resolve", 200], ["GET", "/v1/fixtures/:id", 200],
   ]);
   assert.ok(rows.every((entry: { at: string; durationMs: number }) => Number.isFinite(Date.parse(entry.at)) && entry.durationMs >= 0));
-  assert.equal((await (await read()).json()).rows.length, 2);
+  assert.equal((await (await read()).json()).rows.length, 3);
 });

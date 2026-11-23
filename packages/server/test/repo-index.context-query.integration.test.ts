@@ -46,8 +46,9 @@ process.env.ENCRYPTION_KEY = credential;
 // No extraction and no alert mail: this file measures retrieval, and both would be outbound work.
 process.env.DISABLE_AUTO_EXTRACTION = "true";
 process.env.ALERT_EMAIL_ENABLED = "false";
-// Empty on purpose: the retriever only expands a query when this is set, and an expansion would be
-// a second, unmetered answer path this file is not asking about.
+// Force an unavailable embedder for the partial-answer tests, even when CI enables local inference.
+// The missing key also keeps query expansion from issuing any external requests.
+process.env.EMBEDDING_MODE = "openai";
 process.env.OPENAI_API_KEY = "";
 
 /** Every scope and project this file created, removed and counted in `after`. */

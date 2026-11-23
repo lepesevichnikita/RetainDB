@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { after, test, type TestContext } from "node:test";
 import { once } from "node:events";
 import { serve } from "@hono/node-server";
@@ -10,13 +10,28 @@ const run = databaseUrl ? test : test.skip;
 const runBrowser = databaseUrl && process.env.RETAINDB_TEST_CHROME_CHANNEL ? test : test.skip;
 const origin = "https://retained.example.test";
 const authUrl = "https://identity.example.test/api/authz/forward-auth";
+const inferenceUrl = "https://embeddings.example.test";
+const apiKey = randomUUID();
 const cookie = "authelia_session=fixture-session";
 const hidden = "not-visible-in-the-dashboard";
-const vector = (x: number, y: number) => `[${[x, y, ...Array<number>(1022).fill(0)].join(",")}]`;
+const coordinates = (x: number, y: number) => [x, y, ...Array<number>(1022).fill(0)];
+const vector = (x: number, y: number) => `[${coordinates(x, y).join(",")}]`;
 
-async function fixture(t: TestContext) {
-  Object.assign(process.env, { DATABASE_URL: databaseUrl, RETAINDB_DASHBOARD_ORIGIN: origin, RETAINDB_DASHBOARD_AUTH_URL: authUrl });
-  t.mock.method(globalThis, "fetch", async () => new Response(null, { headers: { "Remote-User": "operator" } }));
+if (databaseUrl) Object.assign(process.env, {
+  DATABASE_URL: databaseUrl, RETAINDB_API_KEY: apiKey, ENCRYPTION_KEY: randomUUID(), EMBEDDING_MODE: "remote",
+  EMBEDDING_INFERENCE_BASE_URL: inferenceUrl, REMOTE_INFERENCE_REQUIRED: "true",
+  DISABLE_AUTO_EXTRACTION: "true", ALERT_EMAIL_ENABLED: "false",
+});
+
+async function fixture(t: TestContext, modelForText?: (text: string) => string | undefined) {
+  Object.assign(process.env, { RETAINDB_DASHBOARD_ORIGIN: origin, RETAINDB_DASHBOARD_AUTH_URL: authUrl });
+  t.mock.method(globalThis, "fetch", async (url: string | URL, init?: RequestInit) => {
+    if (String(url) === authUrl) return new Response(null, { headers: { "Remote-User": "operator" } });
+    assert.equal(String(url), `${inferenceUrl}/v1/inference/embeddings`);
+    assert.ok(modelForText, "Only the embedding provenance scenarios call inference");
+    const { inputs } = JSON.parse(String(init?.body)) as { inputs: string[] };
+    return Response.json({ embeddings: inputs.map(() => coordinates(1, 0)), model: modelForText(inputs[0]) });
+  });
   const { db } = await import("../src/db/index.js");
   const { createNodeApp } = await import("../src/api/app.js");
   const slug = `dashboard-${randomUUID()}`;
@@ -56,11 +71,22 @@ run("the project views read live graph provenance and separate recorded vector m
 
   // Real documents and vectors: orthogonal A/B, another model, an unlabelled vector, and a parent chunk.
   const source = await db.source.create({ data: { name: "Knowledge", type: "text", status: "READY", projectId: project.id } });
+  // Imported records can refer to the right project ID while still belonging to another organization.
+  const foreignSource = await db.source.create({ data: { name: hidden, type: "text", status: "READY", projectId: project.id, orgId: other.orgId } });
+  await db.memory.createMany({ data: [
+    { projectId: project.id, orgId: project.orgId, content: "Project memory" },
+    { projectId: project.id, orgId: other.orgId, content: hidden },
+  ] });
   const scope = await db.repoIndexScope.create({ data: {
     projectId: project.id, repoHost: "example.test", repoExternalId: project.id, worktreePath: "/fixture",
     deviceId: "fixture", ref: "main", headCommit: "fixture", policyVersion: "1", pipelineVersion: "1", state: "withdrawn",
   } });
   const withdrawn = await db.source.create({ data: { name: `repo-index:${scope.id}`, type: "repo_index", status: "READY", projectId: project.id } });
+  const foreignScope = await db.repoIndexScope.create({ data: {
+    orgId: other.orgId, projectId: project.id, repoHost: "example.test", repoExternalId: project.id, worktreePath: "/fixture",
+    deviceId: "fixture", ref: "main", headCommit: "fixture", policyVersion: "1", pipelineVersion: "1",
+  } });
+  const foreignMirror = await db.source.create({ data: { name: `repo-index:${foreignScope.id}`, type: "repo_index", status: "READY", projectId: project.id } });
   const input = [
     { title: "Anchor A", x: 1, y: 0, model: "e5", sourceId: source.id },
     { title: "Anchor B", x: 0, y: 1, model: "e5", sourceId: source.id },
@@ -68,6 +94,8 @@ run("the project views read live graph provenance and separate recorded vector m
     { title: "Unlabelled", x: 0, y: -1, model: null, sourceId: source.id },
     { title: "Missing embedding", x: 0, y: 0, model: null, sourceId: source.id },
     { title: hidden, x: -1, y: 1, model: "e5", sourceId: withdrawn.id },
+    { title: hidden, x: -1, y: 1, model: "e5", sourceId: foreignSource.id },
+    { title: hidden, x: -1, y: 1, model: "e5", sourceId: foreignMirror.id },
   ];
   const chunkIds: string[] = [];
   for (const [index, row] of input.entries()) {
@@ -90,6 +118,7 @@ run("the project views read live graph provenance and separate recorded vector m
   const retired = await node(hidden, project.id, false);
   const foreign = await node(hidden, other.id, true);
   await db.entityMention.create({ data: { entityId: retired.id, chunkId: chunkIds[5] } });
+  await db.entityMention.createMany({ data: chunkIds.slice(6).map((chunkId) => ({ entityId: retired.id, chunkId })) });
   const edge = await db.entityRelation.create({
     data: { projectId: project.id, fromEntityId: reader.id, toEntityId: index.id, relationType: "references", isManual: true },
     select: { id: true },
@@ -100,7 +129,7 @@ run("the project views read live graph provenance and separate recorded vector m
   });
 
   const overview = await (await read("overview")).json();
-  assert.deepEqual(overview, { documents: 5, chunks: 5, sources: 1, embedded: 4, memories: 0, entities: 2, models: [
+  assert.deepEqual(overview, { documents: 5, chunks: 5, sources: 1, embedded: 4, memories: 1, entities: 2, models: [
     { model: "e5", count: 2 }, { model: "different", count: 1 }, { model: null, count: 1 },
   ] });
 
@@ -108,6 +137,7 @@ run("the project views read live graph provenance and separate recorded vector m
   assert.deepEqual(new Set(graph.nodes.map(({ label }: { label: string }) => label)), new Set(["Reader", "Index"]));
   assert.deepEqual(graph.edges.map((item: { id: string; fromEntityId: string; toEntityId: string }) => [item.id, item.fromEntityId, item.toEntityId]), [[edge.id, reader.id, index.id]]);
   assert.ok(!JSON.stringify(graph).includes(hidden));
+  assert.deepEqual((await (await read("graph", { project: project.id, q: hidden })).json()).nodes, []);
   assert.deepEqual((await (await read("graph", { project: project.id, q: "nonexistent" })).json()).nodes, []);
 
   const vectors = await (await read("vectors")).json();
@@ -121,6 +151,71 @@ run("the project views read live graph provenance and separate recorded vector m
   assert.equal((await read("vectors", { project: project.id, model: "not-stored" })).status, 404);
 });
 
+run("normal learn plots vectors under the inference model, not the document metadata", async (t) => {
+  const { project, read } = await fixture(t, (text) => text.includes("recorded") ? "fixture/document-model" : undefined);
+  const { api } = await import("../src/api/routes.js");
+  // Exercise the production ingest route; only the upstream inference and sign-in responses are fixtures.
+  for (const [title, content] of [["Runbook", "A recorded procedure for restoring a snapshot."], ["Unlabelled note", "Review snapshots before restoring them."]]) {
+    const response = await api.request("/v1/learn", {
+      method: "POST", headers: { Authorization: ["Bearer", apiKey].join(" "), "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "text", project: project.id, title, content, metadata: { embedding_model: "not-the-model" }, options: { async: false, ingestion_profile: "plain_text", strategy_override: "fixed" } }),
+    });
+    assert.equal(response.status, 200, await response.clone().text());
+    assert.equal((await response.json()).status, "completed");
+  }
+  const overview = await (await read("overview")).json();
+  assert.equal(overview.embedded, 2);
+  assert.deepEqual(overview.models, [{ model: "fixture/document-model", count: 1 }, { model: null, count: 1 }]);
+  const vectors = await (await read("vectors")).json();
+  assert.deepEqual(vectors.points.map(({ label }: { label: string }) => label), ["Runbook"]);
+});
+
+run("client-supplied embeddings retain their model in the dashboard after batch learning", async (t) => {
+  const { project, read } = await fixture(t);
+  const { api } = await import("../src/api/routes.js");
+  // Use the actual batch route and a model that differs from the inference service and document metadata.
+  const response = await api.request("/v1/learn/batch", {
+    method: "POST", headers: { Authorization: ["Bearer", apiKey].join(" "), "Content-Type": "application/json" },
+    body: JSON.stringify({ project: project.id, items: [{
+      type: "text", title: "Local runbook", content: "A short runbook for recovering a checkpoint.",
+      embedding: coordinates(1, 0), embedding_model: "fixture/client-model", metadata: { embedding_model: "not-the-model" },
+    }] }),
+  });
+  assert.equal(response.status, 202, await response.clone().text());
+  const batch = await response.json();
+  assert.equal(batch.failed, 0, JSON.stringify(batch.items));
+  assert.equal(batch.items[0]?.status, "completed");
+  const overview = await (await read("overview")).json();
+  assert.equal(overview.embedded, 1);
+  assert.deepEqual(overview.models, [{ model: "fixture/client-model", count: 1 }]);
+  const vectors = await (await read("vectors")).json();
+  assert.deepEqual(vectors.points.map(({ label }: { label: string }) => label), ["Local runbook"]);
+});
+
+run("repository publication makes its materialised vectors visible under their inference model", async (t) => {
+  const { db, project, read } = await fixture(t, () => "fixture/repository-model");
+  const { openAttempt, putPart, finalizeAttempt } = await import("../src/engine/repo-index/store.js");
+  const { id: scopeId } = await db.repoIndexScope.create({ data: {
+    projectId: project.id, repoHost: "example.test", repoExternalId: project.id, worktreePath: "/fixture",
+    deviceId: "fixture", ref: "main", headCommit: "fixture", policyVersion: "1", pipelineVersion: "1",
+  } });
+  const attemptId = randomUUID();
+  const path = "runbook.md";
+  const content = "# Recovery\nVerify the snapshot before restoring service.";
+  const digest = createHash("sha256").update(content).digest("hex");
+  // Publish through the normal store rather than seeding the chunk or its metadata by hand.
+  const opened = await openAttempt({ scopeId, attemptId, baseGeneration: 0, revision: 1, manifestDigest: digest, partCount: 1 });
+  assert.equal(opened.code, "ATTEMPT_OPEN");
+  assert.equal((await putPart({ scopeId, attemptId, partNo: 1, part: { upserts: [path], tombstones: [] } })).code, "PART_ACCEPTED");
+  const published = await finalizeAttempt({ scopeId, attemptId, requiredPaths: [path], readContent: async () => content,
+    manifest: { digest, dimensions: 1024, entries: [{ path, digest, vector: coordinates(0, 1) }] },
+  });
+  assert.equal(published.code, "PUBLISHED");
+  const vectors = await (await read("vectors")).json();
+  assert.equal(vectors.model, "fixture/repository-model");
+  assert.deepEqual(vectors.points.map(({ label }: { label: string }) => label), [path]);
+});
+
 run("the queue reflects persisted server jobs and capture retries without exposing their payloads", async (t) => {
   const { db, project, other, read } = await fixture(t);
   const empty = await (await read("queue")).json();
@@ -129,9 +224,12 @@ run("the queue reflects persisted server jobs and capture retries without exposi
   const job = randomUUID();
   await db.$executeRaw`INSERT INTO ingestion_jobs (id, org_id, project_id, user_id, status, total_documents, processed_documents, error)
     VALUES (${job}, 'default', ${project.id}, ${hidden}, 'PROCESSING', 4, 2, ${hidden}),
-           (${randomUUID()}, 'default', ${other.id}, ${hidden}, 'FAILED', 99, 0, ${hidden})`;
+           (${randomUUID()}, 'default', ${other.id}, ${hidden}, 'FAILED', 99, 0, ${hidden}),
+           (${randomUUID()}, ${other.orgId}, ${project.id}, ${hidden}, 'FAILED', 99, 0, ${hidden})`;
   const source = await db.source.create({ data: { name: "Sync", type: "text", projectId: project.id } });
   await db.syncJob.create({ data: { sourceId: source.id, status: "PENDING", errorMessage: hidden, logs: [hidden] } });
+  const foreignSource = await db.source.create({ data: { name: hidden, type: "text", projectId: project.id, orgId: other.orgId } });
+  await db.syncJob.create({ data: { sourceId: foreignSource.id, status: "FAILED", documentsTotal: 99 } });
   const scope = await db.repoIndexScope.create({ data: {
     projectId: project.id, repoHost: "example.test", repoExternalId: project.id, worktreePath: hidden,
     deviceId: "fixture", ref: "main", headCommit: "fixture", policyVersion: "1", pipelineVersion: "1",
@@ -141,6 +239,14 @@ run("the queue reflects persisted server jobs and capture retries without exposi
     status: "open", partCount: 3,
   } });
   await db.repoIndexPart.create({ data: { generationId: generation.id, partNo: 0, requestHash: hidden } });
+  const foreignScope = await db.repoIndexScope.create({ data: {
+    orgId: other.orgId, projectId: project.id, repoHost: "example.test", repoExternalId: project.id, worktreePath: hidden,
+    deviceId: "fixture", ref: "main", headCommit: "fixture", policyVersion: "1", pipelineVersion: "1",
+  } });
+  await db.repoIndexGeneration.create({ data: {
+    scopeId: foreignScope.id, attemptId: "fixture", baseGeneration: 0, generation: 1, revision: "fixture", manifestDigest: hidden,
+    status: "failed", partCount: 99,
+  } });
 
   // Native hooks persist queue state in a message. Ordinary chat and other projects are not jobs here.
   const session = await db.session.create({ data: { projectId: project.id, orgId: project.orgId, sessionId: randomUUID() } });
@@ -185,6 +291,42 @@ run("the queue reflects persisted server jobs and capture retries without exposi
   });
 });
 
+run("queue prioritizes runnable attempts and labels paused, withdrawn, and superseded work", async (t) => {
+  const { db, project, read } = await fixture(t);
+  const open = await db.repoIndexScope.create({ data: {
+    projectId: project.id, repoHost: "example.test", repoExternalId: project.id, worktreePath: "/active",
+    deviceId: "fixture", ref: "main", headCommit: "fixture", policyVersion: "1", pipelineVersion: "1", activeGeneration: 3,
+  } });
+  const paused = await db.repoIndexScope.create({ data: {
+    projectId: project.id, repoHost: "example.test", repoExternalId: project.id, worktreePath: "/paused",
+    deviceId: "fixture", ref: "main", headCommit: "fixture", policyVersion: "1", pipelineVersion: "1", state: "paused",
+  } });
+  const withdrawn = await db.repoIndexScope.create({ data: {
+    projectId: project.id, repoHost: "example.test", repoExternalId: project.id, worktreePath: "/withdrawn",
+    deviceId: "fixture", ref: "main", headCommit: "fixture", policyVersion: "1", pipelineVersion: "1", state: "withdrawn",
+  } });
+  const active = await db.repoIndexGeneration.create({ data: {
+    scopeId: open.id, attemptId: "next", baseGeneration: 3, generation: 4, status: "open",
+    revision: "fixture", manifestDigest: hidden, partCount: 1, createdAt: new Date("2026-01-01T00:00:00Z"),
+  } });
+  const ids = Array.from({ length: 50 }, () => randomUUID());
+  await db.repoIndexGeneration.createMany({ data: ids.map((id, index) => ({
+    id, scopeId: [open.id, paused.id, withdrawn.id][index % 3], attemptId: id,
+    baseGeneration: 0, generation: 5 + index, status: index % 2 ? "open" : "sealed",
+    revision: "fixture", manifestDigest: hidden, partCount: 1, createdAt: new Date("2026-02-01T00:00:00Z"),
+  })) });
+
+  // Newer blocked rows must not hide the project’s only runnable attempt at the table limit.
+  const queue = await (await read("queue")).json();
+  assert.equal(queue.jobs.length, 50);
+  assert.equal(queue.jobs[0].id, active.id);
+  assert.deepEqual(queue.totals, [
+    { kind: "Repository index", status: "blocked", count: 33 },
+    { kind: "Repository index", status: "open", count: 1 },
+    { kind: "Repository index", status: "superseded", count: 17 },
+  ]);
+});
+
 runBrowser("a browser can inspect knowledge, switch projects and refresh activity", { timeout: 30_000 }, async (t) => {
   const { db, project } = await fixture(t);
   const { createNodeApp } = await import("../src/api/app.js");
@@ -220,24 +362,30 @@ runBrowser("a browser can inspect knowledge, switch projects and refresh activit
   await nav.getByRole("link", { name: "Vector map" }).click();
   await page.getByText("No labelled embeddings in this project.").waitFor();
   const source = await db.source.create({ data: { name: "Browser knowledge", type: "text", projectId: project.id } });
-  for (const [label, model, coords] of [["Blueprint", "e5", [1, 0]], ["Checklist", "other", [0, 1]]] as const) {
+  for (const [label, model, coords] of [["Blueprint", "e5", [[1, 0], [0, 1]]], ["Checklist", "other", [[0, 1]]]] as const) {
     const document = await db.document.create({ data: { title: label, sourceId: source.id, projectId: project.id, status: "READY" } });
-    const chunk = await db.chunk.create({ data: { documentId: document.id, projectId: project.id, content: hidden, metadata: { embedding_model: model } } });
-    await db.$executeRaw`UPDATE chunks SET embedding = ${vector(coords[0], coords[1])}::vector WHERE id = ${chunk.id}`;
+    for (const [chunkIndex, [x, y]] of coords.entries()) {
+      const chunk = await db.chunk.create({ data: { documentId: document.id, projectId: project.id, chunkIndex, content: hidden, metadata: { embedding_model: model } } });
+      await db.$executeRaw`UPDATE chunks SET embedding = ${vector(x, y)}::vector WHERE id = ${chunk.id}`;
+    }
   }
   await page.getByRole("button", { name: "Refresh" }).click();
-  await page.getByRole("button", { name: "Blueprint", exact: true }).focus();
+  const chunks = page.getByRole("complementary").getByRole("button", { name: /^Blueprint/ });
+  await chunks.nth(1).waitFor();
+  assert.deepEqual((await chunks.allTextContents()).sort(), ["Blueprint · chunk 1", "Blueprint · chunk 2"]);
+  await page.getByRole("button", { name: "Blueprint · chunk 2", exact: true }).focus();
   await page.keyboard.press("Enter");
-  await page.getByText("Similarity to A: 1.000").waitFor();
+  await page.getByRole("status", { name: "Selected item" }).filter({ hasText: "Blueprint · chunk 2" }).waitFor();
+  await page.getByText(/^Similarity to A: [01]\.000$/).waitFor();
   await page.getByLabel("Embedding model").selectOption("other");
-  await page.getByRole("button", { name: "Checklist", exact: true }).waitFor();
-  assert.equal(await page.getByRole("button", { name: "Blueprint", exact: true }).count(), 0);
+  await page.getByRole("button", { name: "Checklist · chunk 1", exact: true }).waitFor();
+  assert.equal(await chunks.count(), 0);
 
   // An old bookmark should still let you switch models after reindexing.
   await db.$executeRaw`UPDATE chunks SET metadata = '{}'::jsonb WHERE "projectId" = ${project.id} AND metadata->>'embedding_model' = 'other'`;
   await page.getByRole("button", { name: "Refresh" }).click();
   await page.getByRole("button", { name: "Show available models" }).click({ timeout: 2500 });
-  await page.getByRole("button", { name: "Blueprint", exact: true }).waitFor();
+  await page.getByRole("button", { name: "Blueprint · chunk 1", exact: true }).waitFor();
 
   await nav.getByRole("link", { name: "Queue" }).click();
   await page.getByText("No jobs for this project.").waitFor();

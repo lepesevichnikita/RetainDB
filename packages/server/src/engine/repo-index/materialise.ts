@@ -47,7 +47,7 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { chunkText, type Chunk } from "../chunker.js";
-import { embed as embedDocuments } from "../embeddings.js";
+import { embedBatch, type Embedder } from "../embeddings.js";
 import { EMBEDDING_DIMENSIONS, isUsableVector } from "./receipt.js";
 
 /** Everything these queries run on: the publish transaction, narrowed like the store narrows it. */
@@ -56,8 +56,7 @@ type Database = any;
 /** Reads the content of one manifest path. The caller owns where that content comes from. */
 export type ContentReader = (path: string) => Promise<string>;
 
-/** Turns texts into vectors; `embed` from engine/embeddings.ts is the production one. */
-export type Embedder = (texts: string[]) => Promise<number[][]>;
+export type { Embedder } from "../embeddings.js";
 
 /** One path of the manifest being materialised. */
 export interface SourcePath {
@@ -82,6 +81,7 @@ export interface ReusedPath {
 export interface PreparedChunk {
   chunk: Chunk;
   vector: number[];
+  model: string | null;
 }
 
 /** One path that has to be embedded for this generation. */
@@ -380,7 +380,7 @@ export async function prepareMaterialisation(input: PrepareInput): Promise<Prepa
     source: ceilingSource(input.maxChunks),
   };
   const prepared = await chunkPaths(pending, input.readContent, budget);
-  await embedChunks(prepared, input.embed ?? embedDocuments);
+  await embedChunks(prepared, input.embed);
   return { reuse, pending: prepared };
 }
 
@@ -424,7 +424,7 @@ async function chunkPaths(paths: readonly SourcePath[], readContent: ContentRead
     // Checked per file, not after the last one: an over-sized tree stops reading here, before a
     // single embedding request, instead of spending the whole transaction budget first.
     refuseAboveCeiling(budget, planned, entry.path);
-    prepared.push({ path: entry.path, digest: entry.digest, content, chunks: chunks.map((chunk) => ({ chunk, vector: [] })) });
+    prepared.push({ path: entry.path, digest: entry.digest, content, chunks: chunks.map((chunk) => ({ chunk, vector: [], model: null })) });
   }
   return prepared;
 }
@@ -461,13 +461,14 @@ function chunkFile(path: string, content: string): Chunk[] {
   return chunkText(content, { filePath: path }).chunks.filter((chunk) => chunk.searchable);
 }
 
-async function embedChunks(prepared: PreparedPath[], embed: Embedder): Promise<void> {
+async function embedChunks(prepared: PreparedPath[], embed?: Embedder): Promise<void> {
   const units = prepared.flatMap((entry) => entry.chunks.map((chunk) => ({ path: entry.path, chunk })));
   for (let start = 0; start < units.length; start += EMBED_BATCH) {
     const batch = units.slice(start, start + EMBED_BATCH);
-    const vectors = await embed(batch.map((unit) => unit.chunk.chunk.content));
+    const { vectors, model } = await embedBatch(batch.map((unit) => unit.chunk.chunk.content), embed);
     batch.forEach((unit, index) => {
       unit.chunk.vector = usableVector(vectors[index], unit.path);
+      unit.chunk.model = model;
     });
   }
 }
@@ -802,6 +803,7 @@ async function insertChunks(handle: Database, input: StageBatchInput, chunks: re
 function stagedChunkMetadata(input: StageBatchInput, chunk: StagedChunk): string {
   return JSON.stringify({
     ...chunk.prepared.chunk.metadata,
+    embedding_model: chunk.prepared.model,
     repo_scope_id: input.scopeId,
     repo_path: chunk.path,
     repo_digest: chunk.digest,

@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "crypto";
 import PQueue from "p-queue";
 import { prisma } from "../db/index.js";
 import { chunkText, type Chunk } from "./chunker.js";
-import { embed } from "./embeddings.js";
+import { embedBatch, type Embedder } from "./embeddings.js";
 import { extractEntities } from "./extractor.js";
 import type { IngestionProfile, ProfileConfig, StrategyOverride } from "./ingestion-profiles.js";
 // EMBEDDING_DIMENSIONS is the width of chunks.embedding (vector(1024)); a narrower vector cannot be stored.
@@ -62,12 +62,13 @@ export interface IngestDocumentInput {
   sourceVersionId?: string | null;
   skipSourceCountUpdate?: boolean;
   embeddingModel?: string;
-  embedTexts?: (texts: string[]) => Promise<number[][]>;
+  embedTexts?: Embedder;
 }
 
 type EmbeddedChunk = {
   tempId: string;
   vector: number[];
+  model: string | null;
 };
 
 export async function ingestDocument(input: IngestDocumentInput) {
@@ -187,7 +188,7 @@ export async function ingestDocument(input: IngestDocumentInput) {
     await prisma.chunk.deleteMany({ where: { documentId: doc.id } });
 
     const embeddings = await embedSearchableChunks(chunking.chunks, input.embedTexts);
-    const embeddedByTempId = new Map(embeddings.map((entry) => [entry.tempId, entry.vector]));
+    const embeddedByTempId = new Map(embeddings.map((entry) => [entry.tempId, entry]));
 
     // Pre-assign UUIDs so parent IDs are known before any insert runs.
     const chunkDbIds = new Map<string, string>();
@@ -199,7 +200,7 @@ export async function ingestDocument(input: IngestDocumentInput) {
       documentId: doc.id,
       projectId,
       title,
-      vectors: embeddedByTempId,
+      embeddings: embeddedByTempId,
       ids: chunkDbIds,
       embeddingModel: input.embeddingModel,
     });
@@ -266,8 +267,8 @@ interface ChunkInsertTarget {
   documentId: string;
   projectId: string;
   title: string;
-  /** The validated vector of each searchable chunk, by tempId. */
-  vectors: ReadonlyMap<string, number[]>;
+  /** The validated embedding of each searchable chunk, by tempId. */
+  embeddings: ReadonlyMap<string, EmbeddedChunk>;
   /** The row id pre-assigned to each chunk, so a parent's id is known before its children insert. */
   ids: ReadonlyMap<string, string>;
   /** Model that produced the vectors, recorded so a mixed corpus is detectable. */
@@ -314,16 +315,16 @@ async function insertOneChunk(chunk: Chunk, target: ChunkInsertTarget, progress:
 async function writeChunkRow(chunk: Chunk, target: ChunkInsertTarget): Promise<void> {
   const id = target.ids.get(chunk.tempId)!;
   const parentDbId = chunk.parentTempId ? target.ids.get(chunk.parentTempId) || null : null;
+  const embedded = target.embeddings.get(chunk.tempId);
   const metadataJson = JSON.stringify({
     ...chunk.metadata,
+    embedding_model: embedded ? embedded.model ?? target.embeddingModel ?? null : null,
     section_path: chunk.sectionPath || chunk.metadata.section_path || null,
     heading_path: chunk.headingPath || chunk.metadata.heading_path || null,
     parent_chunk_id: chunk.parentTempId || null,
-    ...(chunk.searchable && target.embeddingModel ? { embedding_model: target.embeddingModel } : {}),
     content_kind: chunk.metadata.content_kind || (chunk.role === "parent" ? "parent_context" : chunk.role),
   });
-  const vector = chunk.searchable ? target.vectors.get(chunk.tempId) : undefined;
-  const embedding = vector && vector.length > 0 ? `[${vector.join(",")}]` : null;
+  const embedding = embedded ? `[${embedded.vector.join(",")}]` : null;
   const tokens = Math.ceil(chunk.content.length / 4);
   const searchContent = buildSearchContent(target.title, chunk.headingPath, chunk.sectionPath, chunk.content);
   const contentHash = createHash("sha256").update(chunk.content).digest("hex");
@@ -342,7 +343,7 @@ async function writeChunkRow(chunk: Chunk, target: ChunkInsertTarget): Promise<v
   `;
 }
 
-async function embedSearchableChunks(chunks: ReturnType<typeof chunkText>["chunks"], embedTexts = embed): Promise<EmbeddedChunk[]> {
+async function embedSearchableChunks(chunks: ReturnType<typeof chunkText>["chunks"], embedTexts?: Embedder): Promise<EmbeddedChunk[]> {
   const searchable = chunks.filter((chunk) => chunk.searchable);
   const embedded: EmbeddedChunk[] = [];
 
@@ -350,7 +351,7 @@ async function embedSearchableChunks(chunks: ReturnType<typeof chunkText>["chunk
     const batch = searchable.slice(i, i + EMBED_BATCH_SIZE);
     // A chunk without a vector is invisible to semantic search, so an embedding
     // failure fails the batch instead of quietly deleting recall.
-    const vectors = await embedTexts(batch.map((chunk) => chunk.content));
+    const { vectors, model } = await embedBatch(batch.map((chunk) => chunk.content), embedTexts);
 
     for (let j = 0; j < batch.length; j++) {
       const vector = vectors[j];
@@ -359,10 +360,7 @@ async function embedSearchableChunks(chunks: ReturnType<typeof chunkText>["chunk
           `Invalid embedding for chunk ${batch[j].tempId}: expected ${EMBEDDING_DIMENSIONS} finite, non-zero dimensions`,
         );
       }
-      embedded.push({
-        tempId: batch[j].tempId,
-        vector,
-      });
+      embedded.push({ tempId: batch[j].tempId, vector, model });
     }
   }
 

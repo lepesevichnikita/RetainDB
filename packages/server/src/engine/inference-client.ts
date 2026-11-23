@@ -86,14 +86,15 @@ function parseEmbeddings(data: any): number[][] {
   return embeddings;
 }
 
-export async function embedWithInferenceService(texts: string[]): Promise<number[][]> {
-  if (!texts.length) return [];
+export async function embedWithInferenceService(texts: string[]) {
+  if (!texts.length) return { vectors: [], model: null };
   const data = await postJson("embedding", "/v1/inference/embeddings", { inputs: texts });
   const embeddings = parseEmbeddings(data);
   if (embeddings.length !== texts.length) {
     throw new Error("Embedding count mismatch from inference service");
   }
-  return embeddings;
+  const model = typeof data.model === "string" ? data.model.trim() : "";
+  return { vectors: embeddings, model: model.length > 0 && model.length <= 256 ? model : null };
 }
 
 export async function rerankWithInferenceService<T extends { content: string; score: number }>(

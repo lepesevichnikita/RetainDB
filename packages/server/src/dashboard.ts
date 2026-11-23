@@ -86,8 +86,9 @@ function recordRequests(rows: RequestLog[]): MiddlewareHandler {
   return async (c, next) => {
     const start = performance.now();
     await next();
-    const route = matchedRoutes(c).filter((match) => match.method === c.req.method && match.path.startsWith(PATH_PREFIX)).at(-1);
-    rows.unshift({ at: new Date().toISOString(), method: c.req.method, route: route?.path ?? "Unmatched API route", status: c.res.status, durationMs: Math.round(performance.now() - start) });
+    const route = matchedRoutes(c)[c.req.routeIndex];
+    const template = route?.method === c.req.method && route.path.startsWith(PATH_PREFIX) ? route.path : "Unmatched API route";
+    rows.unshift({ at: new Date().toISOString(), method: c.req.method, route: template, status: c.res.status, durationMs: Math.round(performance.now() - start) });
     if (rows.length > LOG_LIMIT) rows.pop();
   };
 }
@@ -115,8 +116,9 @@ function projectView(view: keyof typeof schemas) {
     const input = schemas[view].safeParse(queryParams(c));
     if (!input.success) return c.json({ error: "Invalid project or filter." }, 400);
     const data = await import("./engine/dashboard-data.js");
-    if (!await data.dashboardProject(input.data.project)) return c.json({ error: "Project not found." }, 404);
-    const result = await data.readDashboardView(view, input.data);
+    const project = await data.dashboardProject(input.data.project);
+    if (!project) return c.json({ error: "Project not found." }, 404);
+    const result = await data.readDashboardView(view, { ...input.data, orgId: project.orgId });
     return result === null
       ? c.json({ code: "EMBEDDING_MODEL_NOT_FOUND", error: "Embedding model not found." }, 404)
       : c.json(result);

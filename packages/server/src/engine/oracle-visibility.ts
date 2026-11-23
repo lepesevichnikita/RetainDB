@@ -32,9 +32,9 @@ const SCOPE_SOURCE_PREFIX = scopeSourceName("");
  * A row is served when its source is not a scope mirror, or when the scope that mirror names is in a
  * state a reader may see. A mirror naming no scope row is hidden too, because a missing authority is
  * not a permission. `narrowedSourceIds` is the caller's own narrowing (the request's `sourceIds`),
- * folded in ahead of the rule so one predicate carries both.
+ * folded in ahead of the rule. Dashboard reads additionally constrain mirror ownership with `orgId`.
  */
-export function visibleSourceSql(narrowedSourceIds: readonly string[] = []): Prisma.Sql {
+export function visibleSourceSql(narrowedSourceIds: readonly string[] = [], orgId?: string): Prisma.Sql {
   const narrowed = narrowedSourceIds.length > 0
     ? Prisma.sql`AND d."sourceId" = ANY(${[...narrowedSourceIds]})`
     : Prisma.empty;
@@ -44,6 +44,7 @@ export function visibleSourceSql(narrowedSourceIds: readonly string[] = []): Pri
         SELECT 1
         FROM repo_index_scopes visible_scope
         WHERE visible_scope."projectId" = s."projectId"
+          ${orgId === undefined ? Prisma.empty : Prisma.sql`AND visible_scope."orgId" = ${orgId}`}
           AND s.name = ${SCOPE_SOURCE_PREFIX} || visible_scope.id
           AND visible_scope.state = ANY(${READABLE_SCOPE_STATES})
       )

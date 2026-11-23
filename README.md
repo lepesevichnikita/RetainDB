@@ -477,9 +477,9 @@ Server graph endpoints:
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `POST` | `/v1/entities` | Create or update a project entity and store its embedding in pgvector |
+| `POST` | `/v1/entities` | Create or update a project entity without a separate inference request |
 | `POST` | `/v1/relations` | Create or update an edge between project entities |
-| `POST` | `/v1/graph/search` | Find up to `top_k` embedded seeds and follow up to 50 edges per hop in both directions, for 1–3 hops; traversal-only entities have score `0` |
+| `POST` | `/v1/graph/search` | Find up to `top_k` visible name or vector matches and follow up to 50 edges per hop in both directions, for 1–3 hops; traversal-only entities have score `0` |
 | `GET` | `/v1/memory/graph` | Return memory nodes, stored relationships, and chronological session edges |
 | `GET` | `/v1/memory/graph/conversation/:sessionId` | Read the same memory graph for one conversation |
 
@@ -488,6 +488,8 @@ In `/v1/context/query`, `include_graph: true` adds chunks linked by the entity g
 An answer produced while the embedder is unavailable is reported as partial: `meta.timing.embedding_unavailable` marks the vector half that was skipped, and `meta.timing.memory_skipped` marks memories that were asked for and never searched. Such an answer is not written to the response cache, so the next identical question is recomputed instead of being served a partial result as complete, and it comes back complete as soon as the embedder does.
 
 Entity and edge IDs are stable within the project. Extraction records claims per source chunk, so staged, failed, superseded, and deleted content does not replace the active graph. Graph search, export, and entity counts use the same visibility rule. Manually written entities and edges remain independent of source versions; extraction does not replace their annotations.
+
+Semantic graph search uses the stored vector of the visible source chunk, with a legacy mention vector as a fallback when the chunk has none. A structural entity with neither remains searchable by name on `/v1/graph/search`.
 
 Entity extraction runs only on eligible documents ingested with automatic extraction enabled and a configured inference provider. Native hook capture skips it. The migration preserves existing graph rows and backfills explicit legacy entity-to-chunk links. Old automatic edges without recorded provenance stay hidden until extraction confirms them. The migration does not extract from existing documents, and importing vector embeddings alone does not create graph edges.
 
@@ -631,15 +633,20 @@ memories, visible entities, and how many chunks have a stored embedding. Use
 for an entity by name. **Vector map** plots up to 200 recent, nonzero chunk
 embeddings from one recorded model. The axes show cosine similarity to two
 stored examples, not full-vector distance between points. Unlabelled vectors
-count toward coverage but are not plotted with known models.
-If a bookmark points to a model that is no longer present, use **Show available models**.
+count toward coverage but are not plotted with known models. Normal document
+ingestion and repository publication record the model that generated each new
+vector when the provider identifies it. Existing vectors are not relabelled.
+The inspector shows the document title and chunk number. If a bookmarked model
+is no longer present, use **Show available models**.
 
 **Queue** shows persisted ingestion jobs, source syncs, repository index
 generations, and native capture jobs for the selected project. Counts cover all
-matching jobs; the table shows up to 50 with active jobs first. It does not show
-jobs queued only on another device. **Logs** shows up to 200 recent `/v1/`
-request outcomes for this server process, with route templates, status and
-duration. It is not a container log archive, and it clears on process restart.
+matching jobs; the table shows up to 50 with active jobs first. Repository
+attempts that cannot publish are marked blocked or superseded, not active. The
+table does not show jobs queued only on another device. **Logs** shows up to 200
+recent `/v1/` request outcomes for this server process, with the handling route's
+template, status and duration. It is not a container log archive, and it clears
+on process restart.
 The **Refresh** button reads current data again without starting work.
 
 The dashboard is off by default. On the home cluster, enable it on the RetainDB

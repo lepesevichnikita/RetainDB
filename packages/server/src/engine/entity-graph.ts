@@ -90,8 +90,8 @@ async function findGraphSeeds(db: GraphReader, options: GraphSearch, chunks: Pri
   // Structural nodes carry no mention vector, so a name hit is a first-class seed.
   const nameSeeds = query
     ? Prisma.sql`, name_seeds AS (
-      SELECT e.id, 0::float8 AS distance FROM entities e
-      WHERE e."projectId" = ${projectId} AND e.name ILIKE ${`%${query}%`} ${types}
+      SELECT e.id, 0::float8 AS distance ${projectEntities(projectId, chunks)}
+      AND e.name ILIKE ${`%${query}%`} ${types}
       ORDER BY length(e.name), e.id LIMIT ${topK}
     )`
     : Prisma.empty;
@@ -106,10 +106,10 @@ async function findGraphSeeds(db: GraphReader, options: GraphSearch, chunks: Pri
     ), manual_seeds AS (
       SELECT id, distance FROM manual_distances ORDER BY distance, id LIMIT ${topK}
     ), extracted_seeds AS (
-      SELECT e.id, MIN(m.embedding <=> ${vector}::vector) AS distance
+      SELECT e.id, MIN(COALESCE(active.embedding, m.embedding) <=> ${vector}::vector) AS distance
       FROM entities e JOIN entity_mentions m ON m."entityId" = e.id
-      WHERE e."projectId" = ${projectId} AND m.embedding IS NOT NULL ${types}
-        AND ${activeMention(Prisma.sql`m."chunkId"`, chunks)}
+      JOIN LATERAL (SELECT c.embedding ${chunks} AND c.id = m."chunkId") active ON true
+      WHERE e."projectId" = ${projectId} AND COALESCE(active.embedding, m.embedding) IS NOT NULL ${types}
       GROUP BY e.id ORDER BY distance, e.id LIMIT ${topK}
     )${nameSeeds}
     SELECT id, 1 - MIN(distance) AS similarity
@@ -213,12 +213,12 @@ export function exportProjectGraph(projectId: string, limits: { entities: number
 const DASHBOARD_GRAPH_SEEDS = 24;
 export interface BrowserNode { id: string; label: string; type: string | null }
 
-export function visibleKnowledgeChunks(projectId: string) {
-  return Prisma.sql`${activeGraphChunks(projectId)} ${visibleSourceSql()}`;
+export function visibleKnowledgeChunks(projectId: string, orgId: string) {
+  return Prisma.sql`${activeGraphChunks(projectId)} AND s."orgId" = ${orgId} ${visibleSourceSql([], orgId)}`;
 }
 
-export async function countVisibleGraphEntities(db: GraphReader, projectId: string) {
-  const scope = projectEntities(projectId, visibleKnowledgeChunks(projectId));
+export async function countVisibleGraphEntities(db: GraphReader, projectId: string, orgId: string) {
+  const scope = projectEntities(projectId, visibleKnowledgeChunks(projectId, orgId));
   const [row] = await db.$queryRaw<{ count: number }[]>`SELECT count(*)::int AS count ${scope}`;
   return row.count;
 }
@@ -235,9 +235,9 @@ function browseNodes(db: GraphReader, scope: Prisma.Sql, ids: string[]) {
     AND e.id = ANY(${ids}::text[]) ORDER BY array_position(${ids}::text[], e.id)`;
 }
 
-export function browseProjectGraph(projectId: string, query: string) {
+export function browseProjectGraph(projectId: string, orgId: string, query: string) {
   return graphSnapshot(async (db) => {
-    const chunks = visibleKnowledgeChunks(projectId);
+    const chunks = visibleKnowledgeChunks(projectId, orgId);
     const scope = projectEntities(projectId, chunks);
     const seeds = new Set((await browseSeeds(db, scope, query)).map(({ id }) => id));
     if (seeds.size === 0) return { nodes: [], edges: [] };

@@ -3,7 +3,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import { serve } from "@hono/node-server";
-import { embedLocal } from "./engine/embeddings-local.js";
+import { embedLocal, LOCAL_EMBEDDING_MODEL } from "./engine/embeddings-local.js";
 
 type EmbeddingRequest = {
   inputs?: unknown;
@@ -12,7 +12,7 @@ type EmbeddingRequest = {
 
 const app = new Hono();
 const PORT = Number(process.env.PORT || 8080);
-const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || "Xenova/bge-large-en-v1.5";
+
 const INFERENCE_API_KEY = (process.env.INFERENCE_API_KEY || "").trim();
 const MAX_BATCH_SIZE = Math.max(1, Number(process.env.EMBEDDING_MAX_BATCH_SIZE || 64));
 const MAX_CONCURRENCY = Math.max(1, Number(process.env.EMBEDDING_MAX_CONCURRENCY || 2));
@@ -66,7 +66,7 @@ app.get("/health", (c) =>
   c.json({
     status: "ok",
     service: "embedding",
-    model: EMBEDDING_MODEL,
+    model: LOCAL_EMBEDDING_MODEL,
     max_batch_size: MAX_BATCH_SIZE,
     max_concurrency: MAX_CONCURRENCY,
   })
@@ -94,7 +94,7 @@ app.post("/v1/inference/embeddings", async (c) => {
     const embeddings = await withConcurrencyLimit(() => embedLocal(inputs));
     return c.json({
       embeddings,
-      model: EMBEDDING_MODEL,
+      model: LOCAL_EMBEDDING_MODEL,
       count: embeddings.length,
       latency_ms: Date.now() - started,
     });

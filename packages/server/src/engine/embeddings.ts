@@ -1,6 +1,13 @@
 import OpenAI from "openai";
-import { embedLocal, embedSingleLocal } from "./embeddings-local.js";
+import { embedLocal, LOCAL_EMBEDDING_MODEL } from "./embeddings-local.js";
 import { embedWithInferenceService } from "./inference-client.js";
+
+export interface EmbeddingBatch {
+  vectors: number[][];
+  model: string | null;
+}
+
+export type Embedder = (texts: string[]) => Promise<EmbeddingBatch | number[][]>;
 
 let openaiClient: OpenAI | null = null;
 
@@ -29,7 +36,7 @@ const REMOTE_INFERENCE_REQUIRED = /^true$/i.test(process.env.REMOTE_INFERENCE_RE
 const LARGE_BATCH_THRESHOLD = Number(process.env.LARGE_BATCH_THRESHOLD ?? 20);
 
 // ── OpenAI ──────────────────────────────────────────────────────────────────
-async function embedWithOpenAI(texts: string[]): Promise<number[][]> {
+async function embedWithOpenAI(texts: string[]): Promise<EmbeddingBatch> {
   const openai = getOpenAIClient();
   const res = await openai.embeddings.create({
     model: "text-embedding-3-small",
@@ -37,7 +44,7 @@ async function embedWithOpenAI(texts: string[]): Promise<number[][]> {
     dimensions: 1024,
   });
   console.log(`[Embeddings] Generated ${res.data.length} OpenAI embeddings`);
-  return res.data.map((d) => d.embedding);
+  return { vectors: res.data.map((d) => d.embedding), model: res.model || null };
 }
 
 // ── Gemini ───────────────────────────────────────────────────────────────────
@@ -45,8 +52,9 @@ async function embedWithOpenAI(texts: string[]): Promise<number[][]> {
 // Dimension: 768 (set outputDimensionality to override, max 768).
 // NOTE: switching to gemini requires re-indexing existing vectors (768 vs 1024 dims).
 const GEMINI_DIMENSIONS = Number(process.env.GEMINI_EMBEDDING_DIMENSIONS ?? 768);
+const GEMINI_EMBEDDING_MODEL = "text-embedding-004";
 
-async function embedWithGemini(texts: string[]): Promise<number[][]> {
+async function embedWithGemini(texts: string[]): Promise<EmbeddingBatch> {
   const apiKey = process.env.GOOGLE_API_KEY;
   if (!apiKey) throw new Error("GOOGLE_API_KEY is required when EMBEDDING_MODE=gemini");
 
@@ -57,13 +65,13 @@ async function embedWithGemini(texts: string[]): Promise<number[][]> {
   for (let i = 0; i < texts.length; i += BATCH_SIZE) {
     const batch = texts.slice(i, i + BATCH_SIZE);
     const requests = batch.map((text) => ({
-      model: "models/text-embedding-004",
+      model: `models/${GEMINI_EMBEDDING_MODEL}`,
       content: { parts: [{ text }] },
       outputDimensionality: GEMINI_DIMENSIONS,
     }));
 
     const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:batchEmbedContents?key=${apiKey}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_EMBEDDING_MODEL}:batchEmbedContents?key=${apiKey}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -81,7 +89,7 @@ async function embedWithGemini(texts: string[]): Promise<number[][]> {
   }
 
   console.log(`[Embeddings] Generated ${allEmbeddings.length} Gemini embeddings (${GEMINI_DIMENSIONS}-dim)`);
-  return allEmbeddings;
+  return { vectors: allEmbeddings, model: GEMINI_EMBEDDING_MODEL };
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -96,12 +104,12 @@ async function embedWithGemini(texts: string[]): Promise<number[][]> {
  * - 'hybrid':  local for small batches, OpenAI for large batches
  * - 'remote':  custom inference service
  */
-export async function embed(texts: string[]): Promise<number[][]> {
+async function embedWithModel(texts: string[], single = false): Promise<EmbeddingBatch> {
   if (USE_REMOTE_EMBEDDINGS) {
     try {
-      const embeddings = await embedWithInferenceService(texts);
-      console.log(`[Embeddings] Generated ${embeddings.length} remote embeddings`);
-      return embeddings;
+      const batch = await embedWithInferenceService(texts);
+      console.log(`[Embeddings] Generated ${batch.vectors.length} remote embeddings`);
+      return batch;
     } catch (error: any) {
       console.warn('[Embeddings] Remote embedding failed:', error.message);
       if (REMOTE_INFERENCE_REQUIRED) throw error;
@@ -112,7 +120,7 @@ export async function embed(texts: string[]): Promise<number[][]> {
     return embedWithGemini(texts);
   }
 
-  if (EMBEDDING_MODE === 'hybrid' && texts.length > LARGE_BATCH_THRESHOLD) {
+  if (!single && EMBEDDING_MODE === 'hybrid' && texts.length > LARGE_BATCH_THRESHOLD) {
     console.log(`[Embeddings] Batch size ${texts.length} > ${LARGE_BATCH_THRESHOLD}, using OpenAI`);
     return embedWithOpenAI(texts);
   }
@@ -121,8 +129,8 @@ export async function embed(texts: string[]): Promise<number[][]> {
   if (USE_LOCAL_EMBEDDINGS) {
     try {
       const embeddings = await embedLocal(texts);
-      console.log(`[Embeddings] Generated ${embeddings.length} local embeddings (BGE-large)`);
-      return embeddings;
+      console.log(`[Embeddings] Generated ${embeddings.length} local embeddings (${LOCAL_EMBEDDING_MODEL})`);
+      return { vectors: embeddings, model: LOCAL_EMBEDDING_MODEL };
     } catch (error: any) {
       console.warn('[Embeddings] Local embedding failed, falling back to OpenAI:', error.message);
       if (EMBEDDING_MODE === 'local') throw error;
@@ -132,34 +140,16 @@ export async function embed(texts: string[]): Promise<number[][]> {
   return embedWithOpenAI(texts);
 }
 
-/**
- * Embed a single text.
- */
+/** An injected vector-only embedder does not establish which model produced its result. */
+export async function embedBatch(texts: string[], embedder: Embedder = embedWithModel): Promise<EmbeddingBatch> {
+  const result = await embedder(texts);
+  return Array.isArray(result) ? { vectors: result, model: null } : result;
+}
+
+export async function embed(texts: string[]): Promise<number[][]> {
+  return (await embedBatch(texts)).vectors;
+}
+
 export async function embedSingle(text: string): Promise<number[]> {
-  if (USE_REMOTE_EMBEDDINGS) {
-    try {
-      const [embedding] = await embedWithInferenceService([text]);
-      return embedding;
-    } catch (error: any) {
-      console.warn('[Embeddings] Remote single embedding failed:', error.message);
-      if (REMOTE_INFERENCE_REQUIRED) throw error;
-    }
-  }
-
-  if (EMBEDDING_MODE === 'gemini') {
-    const [embedding] = await embedWithGemini([text]);
-    return embedding;
-  }
-
-  if (USE_LOCAL_EMBEDDINGS) {
-    try {
-      return await embedSingleLocal(text);
-    } catch (error: any) {
-      console.warn('[Embeddings] Local embedding failed, falling back to OpenAI:', error.message);
-      if (EMBEDDING_MODE === 'local') throw error;
-    }
-  }
-
-  const [embedding] = await embedWithOpenAI([text]);
-  return embedding;
+  return (await embedWithModel([text], true)).vectors[0];
 }

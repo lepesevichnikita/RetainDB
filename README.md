@@ -623,6 +623,50 @@ The server refuses anything that would split, with
 `client embedding covers one chunk, this item split into N: send one chunk per item` — a vector
 cannot honestly represent several chunks.
 
+## Self-hosted dashboard
+
+Use **Overview** to see indexed documents, searchable chunks, sources, active
+memories, visible entities, and how many chunks have a stored embedding. Use
+**Knowledge graph** to browse stored entities and one hop of relations, or search
+for an entity by name. **Vector map** plots up to 200 recent, nonzero chunk
+embeddings from one recorded model. The axes show cosine similarity to two
+stored examples, not full-vector distance between points. Unlabelled vectors
+count toward coverage but are not plotted with known models.
+If a bookmark points to a model that is no longer present, use **Show available models**.
+
+**Queue** shows persisted ingestion jobs, source syncs, repository index
+generations, and native capture jobs for the selected project. Counts cover all
+matching jobs; the table shows up to 50 with active jobs first. It does not show
+jobs queued only on another device. **Logs** shows up to 200 recent `/v1/`
+request outcomes for this server process, with route templates, status and
+duration. It is not a container log archive, and it clears on process restart.
+The **Refresh** button reads current data again without starting work.
+
+The dashboard is off by default. On the home cluster, enable it on the RetainDB
+server in `terraform/stack/retaindb.tf` with the existing Authelia ingress:
+
+```dotenv
+RETAINDB_DASHBOARD_ORIGIN=https://retaindb.home.lan
+RETAINDB_DASHBOARD_AUTH_URL=https://auth.home.lan/api/authz/forward-auth
+```
+
+Set `RETAINDB_DASHBOARD_SESSION_COOKIE` only if the Authelia cookie name differs
+from `authelia_session`. Keep TLS verification enabled and use the existing
+`NODE_EXTRA_CA_CERTS` bundle for the internal CA. The backend checks the browser
+session with Authelia; it does not trust incoming identity headers or give the
+browser the API key. The dashboard reads the OSS `default` organization only.
+No database migrations or host changes are required by the dashboard. The
+browser opens `/dashboard` from the root URL; the machine API and its auth
+remain unchanged.
+
+Run the dashboard end-to-end tests against a dedicated, migrated pgvector test
+database and an installed Chrome browser:
+
+```bash
+RETAINDB_TEST_DATABASE_URL="$DATABASE_URL" RETAINDB_TEST_CHROME_CHANNEL=chrome \
+  pnpm --filter @retaindb/server exec tsx --test test/dashboard.test.ts test/dashboard-data.integration.test.ts
+```
+
 ## Configuration
 
 | Env var | Default | Description |
@@ -634,6 +678,9 @@ cannot honestly represent several chunks.
 | `RETAINDB_EMBEDDING_PROVIDER` | `hash` | `hash` or `local-transformers` |
 | `DATABASE_URL` | unset | Postgres connection string for server |
 | `RETAINDB_API_KEY` | unset | Optional API auth key |
+| `RETAINDB_DASHBOARD_ORIGIN` | unset | HTTPS origin reserved for the read-only browser dashboard |
+| `RETAINDB_DASHBOARD_AUTH_URL` | unset | Trusted HTTPS Authelia forward-auth endpoint |
+| `RETAINDB_DASHBOARD_SESSION_COOKIE` | `authelia_session` | Authelia cookie validated by the dashboard |
 | `OPENAI_API_KEY` | unset | Enables OpenAI-backed server embeddings |
 | `EMBEDDING_MODE` | `auto` | Server embedding mode |
 | `EMBEDDING_MODEL` | `Xenova/multilingual-e5-large` | Model the server loads when it embeds itself; one model per corpus |

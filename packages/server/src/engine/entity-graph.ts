@@ -1,5 +1,6 @@
 import { prisma, Prisma } from "../db/index.js";
 import { vectorLiteral } from "./entity-graph-write.js";
+import { visibleSourceSql } from "./oracle-visibility.js";
 
 interface ChunkScope {
   sourceIds?: string[];
@@ -17,7 +18,7 @@ interface GraphSearch {
   chunkScope?: ChunkScope;
 }
 
-interface GraphRelation {
+export interface GraphRelation {
   id: string;
   fromEntityId: string;
   toEntityId: string;
@@ -207,6 +208,43 @@ export function exportProjectGraph(projectId: string, limits: { entities: number
     entities: await exportEntities(db, projectId, chunks, limits.entities),
     relations: await exportRelations(db, projectId, chunks, limits.relations),
   }));
+}
+
+const DASHBOARD_GRAPH_SEEDS = 24;
+export interface BrowserNode { id: string; label: string; type: string | null }
+
+export function visibleKnowledgeChunks(projectId: string) {
+  return Prisma.sql`${activeGraphChunks(projectId)} ${visibleSourceSql()}`;
+}
+
+export async function countVisibleGraphEntities(db: GraphReader, projectId: string) {
+  const scope = projectEntities(projectId, visibleKnowledgeChunks(projectId));
+  const [row] = await db.$queryRaw<{ count: number }[]>`SELECT count(*)::int AS count ${scope}`;
+  return row.count;
+}
+
+function browseSeeds(db: GraphReader, scope: Prisma.Sql, query: string) {
+  const name = query ? Prisma.sql`AND strpos(lower(e.name), lower(${query})) > 0` : Prisma.empty;
+  return db.$queryRaw<{ id: string }[]>`
+    SELECT e.id ${scope} ${name} ORDER BY e."createdAt" DESC, e.id LIMIT ${DASHBOARD_GRAPH_SEEDS}`;
+}
+
+function browseNodes(db: GraphReader, scope: Prisma.Sql, ids: string[]) {
+  return db.$queryRaw<BrowserNode[]>`
+    SELECT e.id, left(e.name, 240) AS label, e."entityType" AS type ${scope}
+    AND e.id = ANY(${ids}::text[]) ORDER BY array_position(${ids}::text[], e.id)`;
+}
+
+export function browseProjectGraph(projectId: string, query: string) {
+  return graphSnapshot(async (db) => {
+    const chunks = visibleKnowledgeChunks(projectId);
+    const scope = projectEntities(projectId, chunks);
+    const seeds = new Set((await browseSeeds(db, scope, query)).map(({ id }) => id));
+    if (seeds.size === 0) return { nodes: [], edges: [] };
+    const edges = await findGraphRelations(db, projectRelations(projectId, chunks), [...seeds], []);
+    const nodes = await browseNodes(db, scope, [...seeds, ...nextFrontier(edges, seeds)]);
+    return { nodes, edges };
+  });
 }
 
 interface GraphChunk {

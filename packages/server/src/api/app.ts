@@ -4,6 +4,7 @@ import { logger } from "hono/logger";
 import { randomUUID } from "crypto";
 import { latencyTraceMiddleware } from "../middleware/latency-trace.js";
 import { maybeSendAlertEmail } from "../engine/alert-email.js";
+import { createDashboard, DASHBOARD_PATH, isDashboardPath } from "../dashboard.js";
 
 const STACK_NAME = process.env.RETAINDB_STACK || "ec2";
 
@@ -87,9 +88,12 @@ async function maybeAlertRequestError(c: any) {
 export function createNodeApp(options: { includeApiRoutes?: boolean; routeApp?: Hono<any, any, any> } = {}) {
   const { includeApiRoutes = true, routeApp } = options;
   const app = new Hono();
+  const dashboard = createDashboard();
+  const apiCors = cors();
+  const apiLogger = logger();
 
-  app.use("*", cors());
-  app.use("*", logger());
+  app.use("*", (c, next) => isDashboardPath(c.req.path) ? next() : apiCors(c, next));
+  app.use("*", (c, next) => isDashboardPath(c.req.path) ? next() : apiLogger(c, next));
   app.use("*", async (c, next) => {
     const traceId = getTraceIdFromRequest(c);
     c.header("x-trace-id", traceId);
@@ -109,6 +113,11 @@ export function createNodeApp(options: { includeApiRoutes?: boolean; routeApp?: 
   });
 
   app.get("/", (c) => {
+    if (dashboard) c.header("Vary", "Accept, Host", { append: true });
+    if (dashboard?.wantsPage(c)) {
+      c.header("Cache-Control", "no-store");
+      return c.redirect(DASHBOARD_PATH);
+    }
     return c.json({
       name: "RetainDB - SOTA Memory & Context System",
       version: "2.1.0",
@@ -159,6 +168,10 @@ export function createNodeApp(options: { includeApiRoutes?: boolean; routeApp?: 
   });
 
   app.get("/health", (c) => c.json({ status: "ok" }));
+  if (dashboard) {
+    app.use("/v1/*", dashboard.logRequest);
+    app.route(DASHBOARD_PATH, dashboard.routes);
+  }
   if (includeApiRoutes && routeApp) {
     app.route("/", routeApp);
   }

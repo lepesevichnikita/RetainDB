@@ -27,6 +27,7 @@ COPY --from=builder /app/packages/server/node_modules ./packages/server/node_mod
 COPY --from=builder /app/packages/server/package.json ./packages/server/package.json
 COPY --from=builder /app/packages/server/dist ./packages/server/dist
 COPY --from=builder /app/packages/server/prisma ./packages/server/prisma
+COPY --from=builder /app/packages/server/dashboard ./packages/server/dashboard
 
 ENV NODE_ENV=production
 ENV PORT=3000

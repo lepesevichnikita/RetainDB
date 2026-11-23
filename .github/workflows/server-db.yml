@@ -47,6 +47,7 @@ jobs:
       DATABASE_URL: postgresql://retaindb_test@localhost:5432/retaindb_test
       RETAINDB_TEST_DATABASE_URL: postgresql://retaindb_test@localhost:5432/retaindb_test
       RETAINDB_TEST_LOCAL_EMBEDDINGS: "true"
+      RETAINDB_TEST_CHROME_CHANNEL: chrome
       EMBEDDING_MODE: local
       DISABLE_AUTO_EXTRACTION: "true"
     strategy:

@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RetainDB · Knowledge console</title>
+  <link rel="stylesheet" href="/dashboard/assets/dashboard.css">
+  <script type="module" src="/dashboard/assets/dashboard.js"></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to dashboard</a>
+  <header class="shell masthead">
+    <a class="brand" href="/dashboard">
+      <svg aria-hidden="true" width="28" height="28" viewBox="0 0 28 28" fill="none">
+        <path d="m14 4 9 5v10l-9 5-9-5V9l9-5Zm0 10 9-5m-9 5L5 9m9 5v10" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+      </svg>
+      <span>RetainDB <small>Knowledge console</small></span>
+    </a>
+    <span class="badge">Read-only</span>
+  </header>
+  <main class="shell" id="main" tabindex="-1">
+    <div class="toolbar">
+      <div class="project-control">
+        <label for="project">Project</label>
+        <select id="project" disabled><option>Loading projects</option></select>
+      </div>
+      <div class="refresh-control">
+        <span class="muted mono" id="updated"></span>
+        <button id="refresh" type="button">Refresh</button>
+      </div>
+    </div>
+    <nav aria-label="Dashboard views" class="tabs">
+      <a data-view="overview" href="/dashboard" aria-current="page">Overview</a>
+      <a data-view="graph" href="?view=graph">Knowledge graph</a>
+      <a data-view="vectors" href="?view=vectors">Vector map</a>
+      <a data-view="queue" href="?view=queue">Queue</a>
+      <a data-view="logs" href="?view=logs">Logs</a>
+    </nav>
+    <section aria-labelledby="view-title" class="view">
+      <div class="view-heading">
+        <h1 id="view-title">Overview</h1>
+        <p id="view-description" class="muted">Stored knowledge for the selected project.</p>
+      </div>
+      <form id="graph-filter" class="filter" role="search" hidden>
+        <label for="graph-query">Find an entity</label>
+        <input id="graph-query" type="search" maxlength="120" placeholder="Entity name">
+        <button type="submit">Search</button>
+      </form>
+      <p id="feedback" role="status" class="feedback">Loading…</p>
+      <div id="content" aria-busy="true"></div>
+      <noscript><p>Enable JavaScript to view the live dashboard.</p></noscript>
+    </section>
+  </main>
+</body>
+</html>

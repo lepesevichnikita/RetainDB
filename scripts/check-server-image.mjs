@@ -42,6 +42,9 @@ runCheck([
     await access("packages/server/dist/engine/workers/native-embedding-process.js");
     await access("packages/server/prisma/schema.prisma");
     await access("packages/server/prisma/migrations");
+    for (const file of ["index.html", "dashboard.css", "dashboard.js", "visuals.js"]) {
+      await access("packages/server/dashboard/" + file);
+    }
     const db = new PrismaClient();
     assert.equal(typeof db.project.findMany, "function");
     await db.$disconnect();

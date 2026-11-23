@@ -588,6 +588,10 @@ Configure once, in the same file the MCP server and the hooks read:
 `~/.retaindb-mcp/config.json`. Environment variables win over it: `RETAINDB_BASE_URL`,
 `RETAINDB_API_KEY`, `RETAINDB_PROJECT`.
 
+A machine that already runs the RetainDB MCP server needs no extra configuration: the indexer reads
+the server entry in `~/.claude.json` (or the Claude Desktop config) and takes the base URL, key and
+project from its `env`. Ask for the key once in the client, and both tools use it.
+
 ```bash
 retaindb-index --root . --graph           # index, and write module/reference edges
 retaindb-index --root . --embed           # compute the vectors here, not on the server

@@ -17,6 +17,7 @@ import { IndexQueue, drainQueue } from "../src/queue.mjs";
 import { createEmbedder, resolveModel } from "../src/embedder.mjs";
 import { referenceEdges } from "../src/references.mjs";
 import { listFiles } from "../src/files.mjs";
+import { findMcpTarget } from "../src/client-config.mjs";
 
 const MAX_BYTES = 1024 * 1024;
 const DEFAULT_BATCH = 200;
@@ -63,11 +64,11 @@ export async function loadConfig() {
   try {
     const raw = await readFile(configFile(), "utf8");
     const parsed = JSON.parse(raw);
-    if (typeof parsed !== "object" || parsed === null) return {};
-    return parsed;
+    if (typeof parsed === "object" && parsed !== null && parsed.token) return parsed;
   } catch {
-    return {};
+    // no dedicated config: fall through to the client's MCP server entry
   }
+  return findMcpTarget();
 }
 
 async function loadManifest() {
@@ -323,7 +324,7 @@ export function parseOptions(argv, env, config = {}) {
   const embedFlag = argv.includes("--embed") || reembed;
   const embedNext = embedFlag ? argv[argv.indexOf("--embed") + 1] : undefined;
   const embed = embedFlag ? resolveModel(embedNext && !embedNext.startsWith("--") ? embedNext : true) : "";
-  if (!dryRun && (!api || !key)) throw new Error("no API target: pass --api/--key, set RETAINDB_BASE_URL/RETAINDB_API_KEY, or write ~/.retaindb-mcp/config.json");
+  if (!dryRun && (!api || !key)) throw new Error("no API target: pass --api/--key, set RETAINDB_BASE_URL/RETAINDB_API_KEY, write ~/.retaindb-mcp/config.json, or keep a RetainDB entry in your MCP client config (~/.claude.json)");
   return { root, api, key, project, dryRun, graph, batch, delay, embed, reembed };
 }
 

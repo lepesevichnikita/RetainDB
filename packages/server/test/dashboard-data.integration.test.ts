@@ -567,13 +567,13 @@ run("shared graph rebuild publishes chunk-derived relations and preserves manual
   assert.deepEqual(building.edges, [], "a prepared graph batch must not affect the serving graph");
   await runDashboardRebuildBatch();
   await runDashboardRebuildBatch();
+  const queue = await (await read("queue", { scope: "shared" })).json();
+  const job = queue.jobs.find((item: { id: string }) => item.id === id);
+  assert.deepEqual([job?.status, job?.processed, job?.total], ["completed", 2, 2], job?.error);
   const graph = await (await read("graph", { scope: "shared", q: "Rebuild Alpha" })).json();
   assert.deepEqual(graph.nodes.map((node: { label: string }) => node.label).sort(), ["Rebuild Alpha", "Rebuild Beta"]);
   assert.deepEqual(graph.edges.map((edge: { relationType: string }) => edge.relationType), ["depends_on"]);
   assert.equal((await db.entity.findUniqueOrThrow({ where: { id: manual.id } })).isManual, true);
-  const queue = await (await read("queue", { scope: "shared" })).json();
-  const job = queue.jobs.find((item: { id: string }) => item.id === id);
-  assert.deepEqual([job.status, job.processed], ["completed", 2]);
 
   // A non-final response can contain valid JSON; it must not replace the serving graph.
   for (failure of ["transport", "incomplete"] as const) {

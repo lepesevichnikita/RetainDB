@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
-import { API_KEY, BASE_URL } from "./_config.mjs";
+import { createHash } from "node:crypto";
+import { API_KEY, BASE_URL, HOOK_EMBEDDING_MODEL, HOOK_EMBEDDING_MODE, resolveHookProject } from "./_config.mjs";
+import { redactCapture } from "./_redact.mjs";
 const AUTO_CONTEXT = process.env.RETAINDB_AUTO_CONTEXT !== "false";
 const COMPRESS_TOOL_OUTPUT = process.env.RETAINDB_COMPRESS_TOOL_OUTPUT !== "false";
 const TOKEN_BUDGET = Number(process.env.RETAINDB_TOKEN_BUDGET || 1200);
@@ -36,24 +38,28 @@ export async function readHookInput() {
 export function hookMeta(data = {}) {
   return {
     sessionId: data.session_id || data.sessionId || process.env.RETAINDB_SESSION_ID || "unknown",
-    project: process.env.RETAINDB_PROJECT || data.cwd || data.project || "default",
+    project: resolveHookProject(data),
     agentId: process.env.RETAINDB_AGENT_ID || data.agent_id || data.agentId || "agent",
     cwd: data.cwd || process.cwd(),
   };
 }
 
-export async function post(path, body, timeout = 2500) {
-  const res = await fetch(`${BASE_URL}${path}`, {
+export function postRequest(path, body, timeout = 2500) {
+  return fetch(`${BASE_URL}${path}`, {
     method: "POST",
     headers: headers(),
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(timeout),
   });
+}
+
+export async function post(path, body, timeout) {
+  const res = await postRequest(path, body, timeout);
   return res.ok ? res.json() : null;
 }
 
 export function shouldInjectContext() {
-  return AUTO_CONTEXT && process.env.RETAINDB_INJECT_CONTEXT !== "false";
+  return HOOK_EMBEDDING_MODE === "server" && AUTO_CONTEXT && process.env.RETAINDB_INJECT_CONTEXT !== "false";
 }
 
 export async function buildContextPack(data, hookType, query) {
@@ -99,11 +105,42 @@ async function hash(value) {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+async function workstationEmbedding(summary) {
+  const { pipeline } = await import("@xenova/transformers");
+  const model = HOOK_EMBEDDING_MODEL;
+  const extractor = await pipeline("feature-extraction", model, { quantized: true, local_files_only: true });
+  const output = await extractor(summary, { pooling: "mean", normalize: true });
+  return { model, vector: Array.from(output.data), content_sha256: createHash("sha256").update(summary).digest("hex") };
+}
+
+function workstationSummary(kind, supplied, data) {
+  const values = [supplied, data.tool_output, data.tool_response, data.tool_result, data.prompt, data.message, data.tool_name, kind];
+  const candidate = values.find(value => value != null && (typeof value !== "string" || value.trim()));
+  const text = typeof candidate === "string" ? candidate : JSON.stringify(candidate);
+  return Array.from(text.replace(/\s+/g, " ").trim()).slice(0, 200).join("").trim() || kind;
+}
+
+export async function captureOnWorkstation({ baseUrl = BASE_URL, project, sessionId, agentId, kind, data, summary: supplied = "" }) {
+  try {
+    const safe = redactCapture({ kind, supplied, data });
+    const summary = workstationSummary(safe.kind, safe.supplied, safe.data);
+    const embedding = await workstationEmbedding(summary);
+    const response = await fetch(`${baseUrl}/v1/agent-events/workstation`, { method: "POST", headers: headers(), redirect: "error",
+      signal: AbortSignal.timeout(3000), body: JSON.stringify({ project, session_id: sessionId, agent_id: agentId,
+        event: { kind: safe.kind, summary, details: JSON.stringify(safe.data).slice(0, 12000), timestamp: new Date().toISOString() }, embedding }) });
+    if (response.status !== 202) throw new Error(`HTTP ${response.status}`);
+  } catch (error) {
+    process.stderr.write(`RetainDB workstation capture not submitted: ${/^HTTP \d{3}$/.test(error?.message) ? error.message : "local model or Server endpoint unavailable"}.\n`);
+  }
+}
+
 export async function capture(hookType, providedData) {
+  if (HOOK_EMBEDDING_MODE === "invalid") return;
   const { data } = providedData ? { data: providedData } : await readHookInput();
   if (process.env.RETAINDB_SDK_CHILD === "1" || data.entrypoint === "sdk-ts") return;
 
   const meta = hookMeta(data);
+  if (HOOK_EMBEDDING_MODE === "workstation") return captureOnWorkstation({ ...meta, kind: hookType, data });
   const safeData = await compressedData(data);
 
   const payload = {

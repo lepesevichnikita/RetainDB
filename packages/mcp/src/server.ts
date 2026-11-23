@@ -24,15 +24,16 @@ const BASE_URL = process.env.RETAINDB_BASE_URL || "http://localhost:3111";
 
 // ─── Client bootstrap ──────────────────────────────────────────────────────
 
-function makeClient(): RetainDBContext {
+function makeClient(project?: string): RetainDBContext {
   return new RetainDBContext({
     apiKey: API_KEY || "anonymous",
-    project: DEFAULT_PROJECT,
+    project,
     ...(BASE_URL ? { baseUrl: BASE_URL } : {}),
   });
 }
 
-const client = makeClient();
+const client = makeClient(DEFAULT_PROJECT);
+const knowledgeClient = makeClient();
 let cachedProject: string | undefined;
 
 // ─── Server ────────────────────────────────────────────────────────────────
@@ -872,41 +873,31 @@ server.tool(
 // 6. SEARCH — semantic search over indexed sources + local codebase
 server.tool(
   "search",
-  "Search both indexed project sources (GitHub, docs, PDFs) and the local codebase. Use this to find relevant code, documentation, or context.",
+  "Search indexed knowledge across the authenticated organization. An explicit project filters remote results. Local code matches are listed separately.",
   {
     query: z.string().describe("What to search for"),
     top_k: z.number().optional().default(10),
     session_id: z.string().optional(),
+    project: z.string().trim().min(1).optional().describe("Filter by project name, slug, or ID; omit for shared knowledge"),
   },
-  async ({ query, top_k, session_id }) => {
+  async ({ query, top_k, session_id, project }) => {
     try {
-      const project = await resolveProject();
+      const response = await knowledgeClient.query({ project, query, top_k, include_memories: false, session_id });
       const localResults = searchLocalFiles(query, process.cwd(), top_k ?? 10);
-
-      let remoteContext = "";
-      let remoteResults: unknown[] = [];
-      try {
-        const response = await client.query({
-          project,
-          query,
-          top_k,
-          include_memories: false,
-          user_id: defaultUserId(),
-          session_id: session_id?.trim(),
-        });
-        remoteContext = response.context || "";
-        remoteResults = response.results || [];
-      } catch { /* return local results if API fails */ }
-
-      return { content: [{ type: "text" as const, text: JSON.stringify(buildMcpSearchPayload({
+      const payload = buildMcpSearchPayload({
         mode: "semantic",
         query,
-        context: remoteContext,
-        results: remoteResults,
+        context: response.context,
+        results: response.results,
+        degradedMode: Boolean(response.meta?.degraded?.reasons?.length || response.meta?.timing?.embedding_unavailable),
+        degradedReason: response.meta?.degraded?.reasons?.join(", ") || (response.meta?.timing?.embedding_unavailable ? "Embedding unavailable" : null),
+      });
+      return { content: [{ type: "text" as const, text: JSON.stringify({
+        ...payload,
         ...(localResults.length > 0 ? { local_results: localResults } : {}),
-      } as any), null, 2) }] };
-    } catch (error: any) {
-      return err(error.message);
+      }, null, 2) }] };
+    } catch (error) {
+      return { ...err(error instanceof Error ? error.message : "Search failed"), isError: true };
     }
   }
 );
@@ -1014,21 +1005,10 @@ server.tool(
 
 // ─── Entry point ───────────────────────────────────────────────────────────
 
-async function startupProbe() {
-  try {
-    const project = await resolveProject();
-    const userId = defaultUserId();
-    console.error(`[retaindb-mcp] ready — project: ${project}, user: ${userId}`);
-  } catch (e: any) {
-    console.error(`[retaindb-mcp] warning: could not resolve project (${e?.message ?? e})`);
-  }
-}
-
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error(`[retaindb-mcp] running on stdio (${API_KEY ? "authenticated" : "local no-key mode"}, ${BASE_URL})`);
-  startupProbe().catch(() => {});
 }
 
 if (process.argv[1] && /server\.(mjs|cjs|js|ts)$/.test(process.argv[1])) {

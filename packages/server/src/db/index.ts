@@ -47,6 +47,7 @@ function createPrismaClient() {
 
 export const db = globalForPrisma.prisma ?? createPrismaClient();
 export const prisma = db;
+export type Transaction = Parameters<Parameters<typeof prisma.$transaction>[0]>[0];
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (value === null || typeof value !== "object") return false;

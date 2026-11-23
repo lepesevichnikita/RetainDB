@@ -9,6 +9,7 @@ import { retrieve } from "../engine/retriever.js";
 import { searchMemories } from "../engine/memory/search.js";
 import { ensureProject } from "./helpers.js";
 import { prisma } from "../db/index.js";
+import { EMBEDDING_DIMENSIONS, isUsableVector } from "../engine/repo-index/receipt.js";
 
 export const nativeHookRoutes = new Hono<{ Variables: { auth: AuthContext } }>();
 const identity = {
@@ -71,6 +72,30 @@ nativeHookRoutes.get("/v1/agent-events/:eventId", rateLimitMiddleware(RateLimits
     attempts: metadata.capture_attempts, document_id: metadata.document_id || null,
     retry_at: metadata.retry_at || null, last_error: metadata.last_error || null,
   });
+});
+
+const workstationEvent = z.object({
+  ...identity,
+  event: z.object({ kind: z.string().trim().min(1).max(128), summary: z.string().trim().min(1).max(400),
+    details: z.string().max(12000).optional(), timestamp: z.string().datetime({ offset: true }).optional() }),
+  embedding: z.object({ model: z.string().trim().min(1).max(256), content_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+    vector: z.array(z.number().finite()).length(EMBEDDING_DIMENSIONS).refine(vector => isUsableVector(vector, EMBEDDING_DIMENSIONS)) }),
+});
+
+nativeHookRoutes.post("/v1/agent-events/workstation", rateLimitMiddleware(RateLimits.ingest), zValidator("json", workstationEvent), async c => {
+  const auth = c.get("auth");
+  const body = c.req.valid("json");
+  const { vector, model, content_sha256 } = body.embedding;
+  const safeEvent = redactCapture(body.event) as typeof body.event;
+  if (createHash("sha256").update(safeEvent.summary).digest("hex") !== content_sha256) {
+    return c.json({ code: "WORKSTATION_TEXT_MISMATCH", error: "The vector must describe the stored, redacted summary." }, 422);
+  }
+  const project = await ensureProject(auth.orgId, body.project, auth.isAdmin);
+  const event = await acceptNativeCapture({ orgId: auth.orgId, projectId: project.id, sessionId: body.session_id,
+    agentId: body.agent_id, hookType: safeEvent.kind, data: safeEvent, timestamp: safeEvent.timestamp,
+    workstation: { text: safeEvent.summary, vector, model },
+  });
+  return c.json({ success: true, accepted: true, event_id: event.id, status: event.status, memories_created: 0 }, 202);
 });
 
 function estimatedTokens(text: string): number {

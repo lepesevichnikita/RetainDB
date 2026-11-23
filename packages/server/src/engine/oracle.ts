@@ -6,7 +6,7 @@
 import { Prisma } from "@prisma/client";
 import { getOpenAIClient } from "./openai-client.js";
 import { prisma } from "../db/index.js";
-import { embedSingle } from "./embeddings.js";
+import { embedSingleWithModel } from "./embeddings.js";
 import { selectOracleScope } from "./oracle-select.js";
 import { visibleSourceSql } from "./oracle-visibility.js";
 
@@ -257,13 +257,14 @@ export async function oracleSearch(params: {
   console.log(`[Oracle] search: "${query}"`);
 
   // Step 1: Embed query
-  const queryEmbedding = await embedSingle(query);
+  const { vector: queryEmbedding, model: queryModel } = await embedSingleWithModel(query);
 
   // Step 2: Pick scope (docs + sections) using global vector seed hits.
   const scope = queryEmbedding.length > 0
     ? await selectOracleScope({
       projectId,
       queryEmbedding,
+      queryModel,
       sourceIds,
       chunkTypes,
       metadataFilter,

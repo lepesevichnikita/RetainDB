@@ -2522,13 +2522,11 @@ function installUserConfigs(target = "all") {
 }
 
 async function runHook() {
-  const baseUrl = process.env.RETAINDB_BASE_URL || `http://localhost:${DEFAULT_PORT}`;
+  const { API_KEY, HOOK_EMBEDDING_MODE, resolveHookBaseUrl, resolveHookProject } = await import("../plugin/scripts/_config.mjs");
+  const baseUrl = resolveHookBaseUrl(`http://localhost:${DEFAULT_PORT}`);
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-  const apiKey = process.env.RETAINDB_API_KEY;
-  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+  if (API_KEY) headers.Authorization = `Bearer ${API_KEY}`;
   const kind = arg("kind") || "tool_result";
-  const agentId = arg("agent") || process.env.RETAINDB_AGENT_ID || "agent";
-  const sessionId = arg("session") || process.env.RETAINDB_SESSION_ID || `session-${new Date().toISOString().slice(0, 10)}`;
   const summaryArg = arg("summary");
   let stdin = "";
   if (!process.stdin.isTTY) {
@@ -2536,11 +2534,19 @@ async function runHook() {
   }
   let data: any = {};
   try {
-    data = stdin.trim() ? JSON.parse(stdin) : {};
+    data = (stdin.trim() ? JSON.parse(stdin) : {}) ?? {};
   } catch {
     data = { raw: stdin.slice(0, 12000) };
   }
-  const project = process.env.RETAINDB_PROJECT || data.project || data.cwd || DEFAULT_PROJECT;
+  const project = resolveHookProject(data);
+  const agentId = arg("agent") || process.env.RETAINDB_AGENT_ID || hookIdentity(data.agent_id, data.agentId) || "agent";
+  const sessionId = arg("session") || process.env.RETAINDB_SESSION_ID || hookIdentity(data.session_id, data.sessionId)
+    || `session-${new Date().toISOString().slice(0, 10)}`;
+  if (HOOK_EMBEDDING_MODE === "invalid") return;
+  if (HOOK_EMBEDDING_MODE === "workstation") {
+    const { captureOnWorkstation } = await import("../plugin/scripts/_capture.mjs");
+    return captureOnWorkstation({ baseUrl, project, sessionId, agentId, kind, data, summary: summaryArg });
+  }
   const autoContext = process.env.RETAINDB_AUTO_CONTEXT !== "false" && ["prompt", "pre_tool_use", "pre_compact"].includes(kind);
   if (autoContext) {
     try {
@@ -2593,6 +2599,10 @@ async function runHook() {
       event: { kind, summary, details: JSON.stringify(data).slice(0, 12000), timestamp: now() },
     }),
   }).catch(() => {});
+}
+
+function hookIdentity(...values: unknown[]) {
+  return values.find((value): value is string => typeof value === "string" && value.trim().length > 0)?.trim();
 }
 
 async function runDemo() {

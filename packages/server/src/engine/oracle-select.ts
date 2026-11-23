@@ -1,6 +1,6 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "../db/index.js";
-import { exactDistanceOrder } from "./vector-order.js";
+import { compatibleEmbeddingModel, exactDistanceOrder } from "./vector-order.js";
 import { visibleSourceSql } from "./oracle-visibility.js";
 
 export type OracleSelectScope = {
@@ -39,6 +39,7 @@ function safeSectionPath(value: unknown): string {
 export async function selectOracleScope(params: {
   projectId: string;
   queryEmbedding: number[];
+  queryModel?: string | null;
   sourceIds?: string[];
   chunkTypes?: string[];
   metadataFilter?: Record<string, any>;
@@ -50,6 +51,7 @@ export async function selectOracleScope(params: {
   const {
     projectId,
     queryEmbedding,
+    queryModel = null,
     sourceIds,
     chunkTypes,
     metadataFilter,
@@ -94,6 +96,7 @@ export async function selectOracleScope(params: {
     scope: Prisma.sql`
       c."projectId" = ${projectId}
       AND c.embedding IS NOT NULL
+      AND ${compatibleEmbeddingModel(Prisma.sql`c.metadata`, queryModel)}
       AND COALESCE(c.metadata->>'content_kind', '') <> 'parent_context'
       ${chunkTypeFilterSql}
       ${metadataFilterSql}

@@ -6,6 +6,7 @@ import { startScheduler } from "./engine/scheduler.js";
 import { startEmbeddingWorker } from "./engine/workers/embedding-worker.js";
 import { recoverInterruptedJobs } from "./engine/sync-queue.js";
 import { startNativeCaptureWorker } from "./engine/native-capture.js";
+import { startDashboardRebuildWorker } from "./engine/dashboard-rebuild.js";
 
 process.on("uncaughtException", (err) => {
   console.error("[RetainDB] Uncaught Exception:", err.message);
@@ -38,6 +39,7 @@ serve({ fetch: app.fetch, port }, async () => {
 
   if (process.send) process.send("ready");
   startNativeCaptureWorker();
+  if (process.env.RETAINDB_DASHBOARD_ORIGIN) startDashboardRebuildWorker();
 
   // Start async embedding worker
   startEmbeddingWorker().catch((err) =>

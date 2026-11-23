@@ -72,8 +72,8 @@ importers:
         specifier: ^1.12.0
         version: 1.29.0(zod@3.25.76)
       '@retaindb/sdk':
-        specifier: ^5.1.1
-        version: 5.1.1
+        specifier: workspace:*
+        version: link:../sdk
       zod:
         specifier: ^3.24.0
         version: 3.25.76
@@ -498,10 +498,6 @@ packages:
 
   '@protobufjs/utf8@1.1.0':
     resolution: {integrity: sha512-Vvn3zZrhQZkkBE8LSuW3em98c0FwgO4nxzv6OdSxPKJIEKY2bGbHn+mhGIPerzI4twdxaP8/0+06HBpwf345Lw==}
-
-  '@retaindb/sdk@5.1.1':
-    resolution: {integrity: sha512-aqCp+fDoEEt6MPtHFbckaiLV8OZLJa6gMQMfcWZyz7DndWCyqrIVkdTt4vLyOWUc0wShCKZtt/1Hl1Z/pdTy1A==}
-    engines: {node: '>=18.0.0'}
 
   '@rollup/rollup-android-arm-eabi@4.60.1':
     resolution: {integrity: sha512-d6FinEBLdIiK+1uACUttJKfgZREXrF0Qc2SmLII7W2AD8FfiZ9Wjd+rD/iRuf5s5dWrr1GgwXCvPqOuDquOowA==}
@@ -2083,8 +2079,6 @@ snapshots:
   '@protobufjs/pool@1.1.0': {}
 
   '@protobufjs/utf8@1.1.0': {}
-
-  '@retaindb/sdk@5.1.1': {}
 
   '@rollup/rollup-android-arm-eabi@4.60.1':
     optional: true

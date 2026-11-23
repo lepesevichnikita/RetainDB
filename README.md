@@ -153,10 +153,36 @@ The Server accepts the native Local hooks at `POST /retaindb/observe` and
 `RETAINDB_API_KEY` for both the hook process and Server. Keep the existing
 project and session identifiers in the hook payload.
 
+The bundled plugin hooks and `retaindb hook` use the same client config for
+the API URL, credentials and project. They resolve the project from
+`RETAINDB_PROJECT`, the client config's `project`, the hook payload's project,
+then its working directory. Plugin capture and session lifecycle requests
+use that same project and send the configured API key on every request.
+
+For workstation-side capture, set `RETAINDB_HOOK_EMBEDDING_MODE=workstation`
+(or `hook_embedding_mode` in the client config). `local` also selects the
+workstation. `server` is the default when unset; invalid values stop hook
+requests rather than falling back to the server. The hook computes a vector
+for a short event summary with the cached Transformers.js model selected by
+`RETAINDB_HOOK_EMBEDDING_MODEL` / `hook_embedding_model`. Use the same
+1024-dimensional model as the Server's semantic search. Context search only
+ranks labelled chunk vectors against a query from the same model. Chunks from
+other models remain available to text search; older unlabelled chunks retain
+their existing behavior until re-embedded. The hook redacts recognized
+credentials and their echoes in event content before embedding or sending it.
+A short excerpt of tool output is searchable, rather than just the tool name.
+The Server commits the receipt and searchable summary together at
+`/v1/agent-events/workstation`.
+This mode does not download a model, request automatic context, or fall back
+to server-side inference. Missing models and rejected submissions are reported
+on the hook's stderr; the agent session continues.
+
 A successful capture returns HTTP 202 only after the event is committed to
-PostgreSQL. It is not a claim that embeddings are ready. The Server indexes
-accepted events in the background with the configured embedding provider;
-pending events resume after restart. Repeating the same event payload reuses
+PostgreSQL. In `server` mode this acknowledges the event, not the embedding.
+The Server indexes in the background with its configured provider and commits
+the searchable document and indexed status together. A failed indexing attempt
+leaves the receipt retryable without exposing a partial document. Pending events
+resume after restart. Repeating the same event payload reuses
 its receipt. `GET /v1/agent-events/:eventId` reports `pending`, `processing`
 or `indexed`, including retry diagnostics when embedding fails. Recognized
 credentials, connection-URL user information and complete private-key blocks
@@ -489,6 +515,14 @@ An answer produced while the embedder is unavailable is reported as partial: `me
 
 Entity and edge IDs are stable within the project. Extraction records claims per source chunk, so staged, failed, superseded, and deleted content does not replace the active graph. Graph search, export, and entity counts use the same visibility rule. Manually written entities and edges remain independent of source versions; extraction does not replace their annotations.
 
+Graph search and graph-assisted context do not compare vectors labelled with another embedding model. Entity name matches in graph search and traversal of visible edges do not depend on vector compatibility. Legacy unlabelled vectors remain eligible.
+
+Omit `project` on `/v1/context/query` or `/v1/graph/search` to search visible knowledge across the authenticated organization. Document hits and graph entities include their source project as `project`; context responses also report `meta.project_scope`. Pass a project name, slug, or ID to narrow the query. An unknown or inaccessible project returns `404` without creating a project or widening the search. Context queries with `include_memories: true` still require a project: shared knowledge search does not search personal memories in other projects.
+
+Requests with `include_memories: true` bypass the shared response cache even when `use_cache` is set. This keeps cached answers from bypassing memory scope, expiration, or revocation checks; document-only caching is unchanged.
+
+The TypeScript SDK uses an explicit project or a project configured on the client, if present. The in-repository `@retaindb/mcp` tool `search` uses shared knowledge unless its call supplies `project`; the write-project setting does not narrow it. Project labels are retained in its results. An API failure is an MCP error, not an empty successful search. The separately published `@retaindb/mcp-server` is a different package and is not updated by building this workspace.
+
 Semantic graph search uses the stored vector of the visible source chunk, with a legacy mention vector as a fallback when the chunk has none. A structural entity with neither remains searchable by name on `/v1/graph/search`.
 
 Entity extraction runs only on eligible documents ingested with automatic extraction enabled and a configured inference provider. Native hook capture skips it. The migration preserves existing graph rows and backfills explicit legacy entity-to-chunk links. Old automatic edges without recorded provenance stay hidden until extraction confirms them. The migration does not extract from existing documents, and importing vector embeddings alone does not create graph edges.
@@ -627,6 +661,37 @@ cannot honestly represent several chunks.
 
 ## Self-hosted dashboard
 
+The dashboard opens on **All projects**. Overview, graph and vector map can
+browse shared knowledge in the configured organization; use the project selector
+to filter. Graph and vector inspectors and queue rows show the original project.
+This view does not move data or change machine API search scope.
+The dashboard identifies members of Authelia's `admins` group as administrators.
+It checks this group in Authelia's authorization response for the actual route
+and request method, not in headers sent by the browser. Other signed-in viewers
+retain read-only access.
+
+Administrators can select one project or **All projects**, then choose **Rebuild
+knowledge** in Overview or **Rebuild graph** in Knowledge graph. Knowledge repair
+uses the configured server embedder for missing chunk vectors only; it does not
+re-embed or relabel existing vectors, including workstation-generated ones.
+Graph rebuild runs extraction on the selected scope's visible, indexed chunks
+and merges the derived mentions only when the entire job can publish. A model
+can omit facts even in a successful response, so omissions do not remove
+existing mentions. Incomplete or refused responses fail the job in **Queue**
+without changing the serving graph.
+Manual entities and relations are preserved. This action sends eligible chunk
+text to the configured extraction provider and requires `OPENAI_BASE_URL`,
+`OPENAI_API_KEY`, and `EXTRACTION_MODEL`; it does not enable automatic extraction
+during ingestion. Neither rebuild deletes source documents or memories.
+
+Each operation queues one persisted job; only one rebuild can be active in the
+organization. **Queue** shows the selected scope, chunks prepared, and failure
+details. Prepared vectors and graph claims stay private to the job across
+worker restarts. The last step rechecks the indexed inputs and publishes all
+changes in one transaction. If an input changed or publication fails, none of
+the rebuild's changes become visible. No rebuild runs just because you open or
+refresh the dashboard, or deploy an update.
+
 Use **Overview** to see indexed documents, searchable chunks, sources, active
 memories, visible entities, and how many chunks have a stored embedding. Use
 **Knowledge graph** to browse stored entities and one hop of relations, or search
@@ -640,14 +705,17 @@ The inspector shows the document title and chunk number. If a bookmarked model
 is no longer present, use **Show available models**.
 
 **Queue** shows persisted ingestion jobs, source syncs, repository index
-generations, and native capture jobs for the selected project. Counts cover all
-matching jobs; the table shows up to 50 with active jobs first. Repository
+generations, and native capture jobs across all authorized projects or for the
+selected project. Counts cover all matching jobs; the table shows up to 50 with
+active jobs first. Repository
 attempts that cannot publish are marked blocked or superseded, not active. The
 table does not show jobs queued only on another device. **Logs** shows up to 200
 recent `/v1/` request outcomes for this server process, with the handling route's
 template, status and duration. It is not a container log archive, and it clears
 on process restart.
-The **Refresh** button reads current data again without starting work.
+The **Refresh** button reads current data again without starting work. If the
+server returns an error, the dashboard can keep the last result for that same
+view and mark it as **Previous result**; changing scope or losing access clears it.
 
 The dashboard is off by default. On the home cluster, enable it on the RetainDB
 server in `terraform/stack/retaindb.tf` with the existing Authelia ingress:
@@ -662,9 +730,17 @@ from `authelia_session`. Keep TLS verification enabled and use the existing
 `NODE_EXTRA_CA_CERTS` bundle for the internal CA. The backend checks the browser
 session with Authelia; it does not trust incoming identity headers or give the
 browser the API key. The dashboard reads the OSS `default` organization only.
-No database migrations or host changes are required by the dashboard. The
+Apply the release's Prisma migrations before starting an upgraded server. The
+dashboard Queue and rebuild controls require the `dashboard_rebuilds` table.
+The Docker entrypoint applies migrations; on non-Docker installs, run
+`pnpm --filter @retaindb/server exec prisma migrate deploy` against the server's
+database before starting the new version. No host changes are required. The
 browser opens `/dashboard` from the root URL; the machine API and its auth
 remain unchanged.
+
+If embedding a Knowledge rebuild batch takes longer than 60 seconds, the
+job shows a timeout in **Queue** and releases the slot for another rebuild.
+The timed-out batch cannot publish vectors after the error.
 
 Run the dashboard end-to-end tests against a dedicated, migrated pgvector test
 database and an installed Chrome browser:
@@ -685,7 +761,7 @@ RETAINDB_TEST_DATABASE_URL="$DATABASE_URL" RETAINDB_TEST_CHROME_CHANNEL=chrome \
 | `RETAINDB_EMBEDDING_PROVIDER` | `hash` | `hash` or `local-transformers` |
 | `DATABASE_URL` | unset | Postgres connection string for server |
 | `RETAINDB_API_KEY` | unset | Optional API auth key |
-| `RETAINDB_DASHBOARD_ORIGIN` | unset | HTTPS origin reserved for the read-only browser dashboard |
+| `RETAINDB_DASHBOARD_ORIGIN` | unset | HTTPS origin reserved for the browser dashboard |
 | `RETAINDB_DASHBOARD_AUTH_URL` | unset | Trusted HTTPS Authelia forward-auth endpoint |
 | `RETAINDB_DASHBOARD_SESSION_COOKIE` | `authelia_session` | Authelia cookie validated by the dashboard |
 | `OPENAI_API_KEY` | unset | Enables OpenAI-backed server embeddings |
@@ -739,7 +815,9 @@ Self-hosted notes:
 pnpm install
 pnpm local:demo
 pnpm --filter @retaindb/local typecheck
+pnpm --filter @retaindb/sdk build
 pnpm --filter @retaindb/mcp typecheck
+pnpm --filter @retaindb/mcp test
 pnpm --filter @retaindb/sdk typecheck
 ```
 

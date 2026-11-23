@@ -28,7 +28,7 @@ import { syncHuggingFace } from "../connectors/huggingface.js";
 import { syncWeb } from "../connectors/web.js";
 import { ingestDocument } from "../engine/ingest.js";
 import { fireWebhookEvent } from "../engine/webhooks.js";
-import { embedSingle } from "../engine/embeddings.js";
+import { embedSingle, embedSingleWithModel } from "../engine/embeddings.js";
 import { ensureGraphEntityId, entityRelationType, saveGraphBatch, saveGraphEntity, saveGraphRelation } from "../engine/entity-graph-write.js";
 import { countGraphEntities, searchEntityGraph } from "../engine/entity-graph.js";
 import { ingestSession as ingestMemorySession, searchMemories } from "../engine/memory/index.js";
@@ -1121,12 +1121,15 @@ api.post(
     c.header("x-retaindb-stack", STACK_NAME);
     c.header("x-whisper-stack", STACK_NAME);
 
-    const project = await ensureProject(auth.orgId, body.project, auth.isAdmin);
-
-    console.log(`[Context] Query project: ${project.name} (${project.id})`);
+    const projectRef = body.project?.trim();
+    if ((body.project !== undefined || body.include_memories) && !projectRef) {
+      return c.json({ error: "A project is required for an explicit filter or personal memory retrieval", code: "PROJECT_REQUIRED" }, 400);
+    }
+    const project = projectRef ? await resolveProjectReference(auth.orgId, projectRef) : null;
+    if (projectRef && !project) return c.json({ error: "Project not found", code: "PROJECT_NOT_FOUND" }, 404);
 
     const result = await retrieve({
-      projectId: project.id,
+      scope: { orgId: auth.orgId, projectId: project?.id },
       query: body.query,
       topK: body.top_k,
       threshold: body.threshold,
@@ -1171,6 +1174,7 @@ api.post(
         metadata: r.metadata,
         source: r.sourceName,
         document: r.documentTitle,
+        project: r.project,
         type: r.chunkType,
         retrieval_source: r.source,
         // Absent for ordinary content: JSON drops an undefined value, so a non-repository answer
@@ -1180,6 +1184,7 @@ api.post(
       context: result.context,
       meta: {
         query: body.query,
+        project_scope: project ? "project" : "organization",
         total: result.meta.totalResults,
         latency_ms: result.meta.latencyMs,
         cache_hit: result.meta.cacheHit,
@@ -3332,7 +3337,7 @@ api.post(
 api.post(
   "/v1/graph/search",
   zValidator("json", z.object({
-    project: z.string().optional(),
+    project: z.string().trim().min(1).optional(),
     query: z.string().min(1),
     entity_types: z.array(z.string()).optional(),
     depth: z.number().int().min(1).max(3).optional().default(1),
@@ -3341,9 +3346,11 @@ api.post(
   async (c) => {
     const auth = c.get("auth");
     const body = c.req.valid("json");
-    const project = await ensureProject(auth.orgId, body.project, auth.isAdmin);
+    const project = body.project ? await resolveProjectReference(auth.orgId, body.project) : null;
+    if (body.project && !project) return c.json({ error: "Project not found", code: "PROJECT_NOT_FOUND" }, 404);
+    const { vector, model } = await embedSingleWithModel(body.query);
     const { entities, relations } = await searchEntityGraph({
-      projectId: project.id, query: body.query, embedding: await embedSingle(body.query),
+      scope: { orgId: auth.orgId, projectId: project?.id }, query: body.query, embedding: vector, embeddingModel: model,
       depth: body.depth, topK: body.top_k, entityTypes: body.entity_types,
     });
     return c.json({

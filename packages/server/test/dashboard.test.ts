@@ -18,7 +18,18 @@ async function fixture(t: TestContext) {
     assert.equal(headers.has("authorization"), false);
     if (headers.get("cookie") === "authelia_session=identity-missing") return new Response(null);
     if (headers.get("cookie") === "authelia_session=denied") return new Response(null, { status: 403 });
+    if (headers.get("cookie") === "authelia_session=get-only-admin") {
+      return headers.get("x-forwarded-method") === "GET"
+        ? new Response(null, { headers: { "Remote-User": "fixture-admin", "Remote-Groups": "admins" } })
+        : new Response(null, { status: 403 });
+    }
     if (headers.get("cookie") === "authelia_session=unavailable") throw new TypeError("fixture network error");
+    if (headers.get("cookie") === "authelia_session=admin") {
+      return new Response(null, { headers: { "Remote-User": "fixture-admin", "Remote-Groups": "other, admins" } });
+    }
+    if (headers.get("cookie") === "authelia_session=similar-group") {
+      return new Response(null, { headers: { "Remote-User": "fixture-reader", "Remote-Groups": "not-admins,admins-extra" } });
+    }
     if (headers.get("cookie") !== cookie) return Response.redirect("https://identity.example.test/");
     return new Response(null, { headers: { "Remote-User": "fixture-operator" } });
   });
@@ -69,6 +80,28 @@ test("the browser dashboard authenticates its own origin and preserves the JSON 
   assert.match(asset.headers.get("content-type") ?? "", /javascript/);
   const mutation = await app.request(`${origin}/dashboard/data/logs`, { method: "POST", headers: { cookie } });
   assert.equal(mutation.status, 404);
+});
+
+test("the dashboard displays administrator access only for the admins group verified by Authelia", async (t) => {
+  const app = await fixture(t);
+  // A browser-supplied group cannot override Authelia's decision.
+  for (const session of [cookie, "authelia_session=similar-group"]) {
+    const reader = await app.request(`${origin}/dashboard`, { headers: { cookie: session, "Remote-Groups": "admins" } });
+    assert.equal(reader.status, 200);
+    assert.match(await reader.text(), /class="badge">Read-only<\/span>/);
+  }
+  const admin = await app.request(`${origin}/dashboard`, { headers: { cookie: "authelia_session=admin" } });
+  assert.equal(admin.status, 200);
+  assert.match(await admin.text(), /class="badge">Administrator<\/span>/);
+});
+
+test("the dashboard respects a method-specific Authelia denial for an administrator", async (t) => {
+  const app = await fixture(t);
+  const headers = { cookie: "authelia_session=get-only-admin", origin, "Content-Type": "application/json" };
+  assert.equal((await app.request(`${origin}/dashboard`, { headers })).status, 200);
+  const rebuild = await app.request(`${origin}/dashboard/rebuilds`, { method: "POST", headers, body: "{}" });
+  assert.equal(rebuild.status, 403);
+  assert.deepEqual(await rebuild.json(), { error: "Dashboard access requires a valid session." });
 });
 
 test("a non-HTTPS authorization endpoint leaves the API up and the dashboard disabled", async (t) => {

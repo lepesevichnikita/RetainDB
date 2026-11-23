@@ -7,7 +7,7 @@
   <link rel="stylesheet" href="/dashboard/assets/dashboard.css">
   <script type="module" src="/dashboard/assets/dashboard.js"></script>
 </head>
-<body>
+<body data-admin="false">
   <a class="skip" href="#main">Skip to dashboard</a>
   <header class="shell masthead">
     <a class="brand" href="/dashboard">
@@ -16,7 +16,7 @@
       </svg>
       <span>RetainDB <small>Knowledge console</small></span>
     </a>
-    <span class="badge">Read-only</span>
+    <span class="badge"><!-- dashboard-role --></span>
   </header>
   <main class="shell" id="main" tabindex="-1">
     <div class="toolbar">
@@ -46,6 +46,10 @@
         <input id="graph-query" type="search" maxlength="120" placeholder="Entity name">
         <button type="submit">Search</button>
       </form>
+      <div id="rebuild-actions" class="filter" hidden>
+        <button id="rebuild-knowledge" type="button">Rebuild knowledge</button>
+        <button id="rebuild-graph" type="button">Rebuild graph</button>
+      </div>
       <p id="feedback" role="status" class="feedback">Loading…</p>
       <div id="content" aria-busy="true"></div>
       <noscript><p>Enable JavaScript to view the live dashboard.</p></noscript>

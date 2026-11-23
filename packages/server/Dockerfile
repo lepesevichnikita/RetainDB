@@ -13,6 +13,7 @@ RUN pnpm install --frozen-lockfile --filter @retaindb/server...
 # Build
 FROM deps AS builder
 COPY packages/server ./packages/server
+COPY packages/local/plugin/scripts/_redact.mjs ./packages/local/plugin/scripts/_redact.mjs
 RUN pnpm --filter @retaindb/server run build
 RUN pnpm --filter @retaindb/server exec prisma generate
 

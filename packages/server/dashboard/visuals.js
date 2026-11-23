@@ -133,7 +133,7 @@ export function graphView({ nodes, edges }, query) {
   const positions = graphPositions(nodes, neighbours);
   return visual({ items: nodes, positions, background: edgesLayer(edges, positions), labelled: true,
     title: 'Inspect entities', caption: `${nodes.length} entities · ${edges.length} relations shown. Search to focus on another neighbourhood.`,
-    details: ({ id, type }) => [type ?? 'Unclassified', ...(neighbours.get(id).length ? neighbours.get(id) : ['No displayed relations'])],
+    details: ({ id, type, project }) => [type ?? 'Unclassified', `Project: ${project}`, ...(neighbours.get(id).length ? neighbours.get(id) : ['No displayed relations'])],
   });
 }
 
@@ -156,6 +156,6 @@ export function vectorView({ anchors, points, model, limit }) {
   const chunks = points.map((point) => ({ ...point, label: `${point.label} · chunk ${point.chunkIndex + 1}` }));
   return visual({ items: chunks, positions: new Map(points.map((point) => [point.id, position(point)])), background: axisGrid(),
     title: 'Inspect chunks', caption: `${points.length} plotted · up to ${limit} recent vectors. A: ${anchors[0]}. B: ${anchors[1]}. Distances on this map are not full-vector distances.`,
-    details: ({ type, x, y }) => [type ?? 'Chunk', `Similarity to A: ${x.toFixed(3)}`, `Similarity to B: ${y.toFixed(3)}`],
+    details: ({ type, project, x, y }) => [type ?? 'Chunk', `Project: ${project}`, `Similarity to A: ${x.toFixed(3)}`, `Similarity to B: ${y.toFixed(3)}`],
   });
 }

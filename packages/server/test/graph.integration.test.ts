@@ -7,6 +7,7 @@ import OpenAI from "openai";
 const databaseUrl = process.env.RETAINDB_TEST_DATABASE_URL;
 const run = databaseUrl ? test : test.skip;
 const vector = [1, ...Array<number>(1023).fill(0)];
+const queryEmbeddingModel = "graph-fixture-model";
 const inferenceUrl = "https://graph-fixture.invalid";
 const credential = randomUUID();
 const originalEnvironment = { ...process.env };
@@ -37,12 +38,12 @@ const extraction = {
 
 function offlineInference(t: TestContext, claims: () => unknown) {
   t.mock.method(OpenAI.Chat.Completions.prototype, "create", async () => ({
-    choices: [{ message: { content: JSON.stringify(claims()) } }],
+    choices: [{ finish_reason: "stop", message: { content: JSON.stringify(claims()) } }],
   }));
   t.mock.method(globalThis, "fetch", async (url: string | URL | Request, options?: RequestInit) => {
     assert.equal(String(url), `${inferenceUrl}/v1/inference/embeddings`);
     const { inputs } = JSON.parse(String(options?.body)) as { inputs: string[] };
-    return Response.json({ embeddings: inputs.map(() => vector) });
+    return Response.json({ embeddings: inputs.map(() => vector), model: queryEmbeddingModel });
   });
 }
 
@@ -130,6 +131,112 @@ run("graph writes reuse entity IDs and keep a structural endpoint searchable by 
   const found: GraphResponse = await post("/v1/graph/search", { query: "checksum", top_k: 1 });
   assert.equal(found.entities[0]?.id, repeated.toEntityId);
   assert.deepEqual(found.relations.map(({ id }) => id), [repeated.id]);
+});
+
+run("graph search without a project returns the organization's labeled graph", { timeout: 25_000 }, async (t) => {
+  const graph = await fixture(t);
+  const { db, project, post } = graph;
+  const sibling = `${project.name}-sibling`;
+  const foreign = `${project.name}-foreign`;
+  await db.$executeRaw`INSERT INTO users (id, email, "updatedAt") VALUES (${foreign}, ${`${foreign}@example.test`}, NOW())`;
+  await db.$executeRaw`INSERT INTO organizations (id, name, slug, "ownerId", "updatedAt") VALUES (${foreign}, ${foreign}, ${foreign}, ${foreign}, NOW())`;
+  const outside = await db.project.create({ data: { name: foreign, slug: foreign, orgId: foreign } });
+  t.after(async () => {
+    await db.project.deleteMany({ where: { OR: [{ id: outside.id }, { name: sibling, orgId: "default" }] } });
+    await db.$executeRaw`DELETE FROM organizations WHERE id = ${foreign}`;
+    await db.$executeRaw`DELETE FROM users WHERE id = ${foreign}`;
+  });
+
+  // The foreign seed matches the query exactly, just like the two authorized seeds.
+  await seedEntity({ db, project: outside } as GraphFixture, project.name, undefined, true);
+  const edges: GraphResponse["relations"] = [];
+  for (const ref of [project.id, sibling]) {
+    edges.push(await post("/v1/relations", {
+      project: ref, from_entity: project.name, from_type: "concept", to_entity: `${ref}-endpoint`,
+      to_type: "concept", relation_type: "references",
+    }, 201));
+  }
+  // A mismatched stored claim must not change another project's entity description.
+  const siblingProject = await db.project.findFirstOrThrow({ where: { name: sibling, orgId: project.orgId } });
+  const siblingGraph = { ...graph, project: siblingProject };
+  const source = await seedSource(siblingGraph, "Sibling claim source");
+  const chunk = await seedChunk(siblingGraph, source.id, "Sibling claim chunk");
+  await db.$executeRaw`INSERT INTO entity_mentions ("entityId", "chunkId", description)
+    VALUES (${edges[0].fromEntityId}, ${chunk.id}, 'wrong project claim')`;
+
+  const shared = await post("/v1/graph/search", { project: undefined, query: project.name, top_k: 10 });
+  assert.equal(shared.entities.find((e: { id: string }) => e.id === edges[0].fromEntityId)?.description, null);
+  assert.deepEqual(shared.relations.map((r: { id: string }) => r.id).sort(), edges.map(r => r.id).sort());
+  assert.deepEqual(new Set(shared.entities.map((e: { project: string }) => e.project)), new Set([project.name, sibling]));
+  assert.deepEqual(new Set(shared.entities.map((e: { id: string }) => e.id)), new Set(edges.flatMap(r => [r.fromEntityId, r.toEntityId])));
+
+  const filtered = await post("/v1/graph/search", { query: project.name });
+  assert.deepEqual(filtered.relations.map((r: { id: string }) => r.id), [edges[0].id]);
+  const notFound = await post("/v1/graph/search", { project: foreign, query: project.name }, 404);
+  assert.equal(notFound.code, "PROJECT_NOT_FOUND");
+  assert.equal(await db.project.count({ where: { name: foreign, orgId: "default" } }), 0);
+});
+
+run("context search ranks documents across projects and retains their provenance", { timeout: 25_000 }, async (t) => {
+  const graph = await fixture(t);
+  const { db, project, post } = graph;
+  const sibling = await db.project.create({ data: { name: `${project.name}-sibling`, slug: `${project.slug}-sibling`, orgId: project.orgId } });
+  t.after(async () => { await db.project.delete({ where: { id: sibling.id } }); });
+  const firstSource = await seedSource(graph, "first");
+  const secondGraph = { ...graph, project: sibling };
+  const secondSource = await seedSource(secondGraph, "second");
+  const first = await seedChunk(graph, firstSource.id, "Zeolite desiccant guide", undefined, vector);
+  const second = await seedChunk(secondGraph, secondSource.id, "Zeolite desiccant checklist", undefined, vector);
+  const unrelated = await seedChunk(secondGraph, secondSource.id, "Private details from an unrelated document");
+  await db.chunk.update({ where: { id: first.id }, data: { metadata: { parent_chunk_id: unrelated.id } } });
+
+  // A stale source must stay invisible even when its chunk matches in both ranking paths.
+  const retired = await seedSource(secondGraph, "retired");
+  await db.source.update({ where: { id: retired.id }, data: { deletedAt: new Date() } });
+  await seedChunk(secondGraph, retired.id, "Zeolite desiccant retired", undefined, vector);
+
+  const common = { query: "zeolite desiccant", rerank: false, use_cache: false, threshold: 0.9 };
+  for (const search of [{ use_vector: false }, { hybrid: false }]) {
+    const response = await post("/v1/context/query", { ...common, ...search, project: undefined });
+    assert.deepEqual(new Map(response.results.map((hit: { id: string; project: string }) => [hit.id, hit.project])),
+      new Map([[first.id, project.name], [second.id, sibling.name]]));
+    const filtered = await post("/v1/context/query", { ...common, ...search, project: sibling.slug });
+    assert.deepEqual(filtered.results.map((hit: { id: string }) => hit.id), [second.id]);
+  }
+  // Parent metadata must not introduce content outside the matched document.
+  const withParent = await post("/v1/context/query", { ...common, use_vector: false, include_parent_content: true });
+  assert.equal(withParent.results[0]?.id, first.id);
+  assert.match(withParent.context, /Zeolite desiccant guide/);
+  assert.ok(!withParent.context.includes(unrelated.content));
+  assert.equal(withParent.results[0].metadata.parent_content, undefined);
+
+  const missing = `${project.name}-missing`;
+  const refused = await post("/v1/context/query", { ...common, project: missing }, 404);
+  assert.equal(refused.code, "PROJECT_NOT_FOUND");
+  assert.equal(await db.project.count({ where: { name: missing } }), 0);
+});
+
+run("SDK query without a configured project returns shared knowledge", { timeout: 25_000 }, async t => {
+  const graph = await fixture(t);
+  const { project, post } = graph;
+  const query = `zirconia ${project.name}`;
+  const source = await seedSource(graph, "SDK fixture");
+  const chunk = await seedChunk(graph, source.id, query);
+  const { api } = await import("../src/api/routes.js");
+  const { RetainDBContext } = await import("../../sdk/src/index.js");
+  const inferenceFetch = globalThis.fetch;
+  t.mock.method(globalThis, "fetch", (input: RequestInfo | URL, init?: RequestInit) => {
+    if (new URL(typeof input === "string" || input instanceof URL ? input : input.url).hostname === "sdk-fixture.invalid") {
+      return api.fetch(new Request(input, init));
+    }
+    return inferenceFetch(input, init);
+  });
+  const client = new RetainDBContext({ apiKey: credential, baseUrl: "https://sdk-fixture.invalid" });
+  const params = { query, rerank: false, use_cache: false, use_vector: false };
+  assert.equal((await client.query(params)).results[0]?.id, chunk.id);
+  assert.equal((await client.withProject(project.slug).query(params)).results[0]?.id, chunk.id);
+  const invalid = await post("/v1/context/query", { ...params, include_memories: true, project: undefined }, 400);
+  assert.equal(invalid.code, "PROJECT_REQUIRED");
 });
 
 run("graph search honors depth and returns both endpoints of project-local edges", { timeout: 25_000 }, async (t) => {
@@ -359,6 +466,30 @@ run("a repeated graph query reflects a source version change", { timeout: 25_000
   assert.deepEqual(current.results, []);
 });
 
+run("graph and context queries do not seed from a different embedding model", { timeout: 25_000 }, async (t) => {
+  const graph = await fixture(t);
+  const { db, post } = graph;
+  const source = await seedSource(graph, "model-provenance");
+  const compatible = await seedChunk(graph, source.id, "Compatible graph evidence", undefined, vector);
+  const incompatible = await seedChunk(graph, source.id, "Different model graph evidence", undefined, vector);
+  // Identical coordinates in different models do not establish a semantic match.
+  await db.chunk.update({ where: { id: compatible.id }, data: { metadata: { embedding_model: queryEmbeddingModel } } });
+  await db.chunk.update({ where: { id: incompatible.id }, data: { metadata: { embedding_model: "another-model" } } });
+  const expected = await seedEntity(graph, "Compatible concept", compatible.id, true);
+  const other = await seedEntity(graph, "Other concept", incompatible.id, true);
+
+  const direct: GraphResponse = await post("/v1/graph/search", { query: "maintenance" });
+  assert.deepEqual(direct.entities.map(({ id }) => id), [expected]);
+  const context = await post("/v1/context/query", {
+    query: "maintenance", include_graph: true, hybrid: false, use_vector: false, rerank: false,
+  });
+  assert.deepEqual(context.results.map(({ id }: { id: string }) => id), [compatible.id]);
+
+  // A name match remains available without a comparable vector.
+  const byName: GraphResponse = await post("/v1/graph/search", { query: "Other concept", top_k: 2 });
+  assert.ok(byName.entities.some(({ id }) => id === other));
+});
+
 run("incomplete extraction does not erase the graph of an already indexed chunk", { timeout: 25_000 }, async (t) => {
   let claims: unknown = extraction;
   const graph = await fixture(t, () => claims);
@@ -380,6 +511,24 @@ run("incomplete extraction does not erase the graph of an already indexed chunk"
   claims = { entities: [], relations: [] };
   await extract();
   assert.deepEqual(await search(), { entities: [], relations: [] });
+});
+
+run("personal context answers never enter the shared response cache", { timeout: 25_000 }, async (t) => {
+  const { db, project, post } = await fixture(t);
+  const userId = randomUUID();
+  const memory = await db.memory.create({ data: { projectId: project.id, userId, content: "Synthetic private fixture" } });
+  await db.$executeRaw`UPDATE memories SET embedding = ${`[${vector.join(",")}]`}::vector WHERE id = ${memory.id}`;
+  const body = {
+    query: "synthetic private fixture", user_id: userId, include_memories: true, use_cache: true,
+    hybrid: false, use_vector: false, rerank: false, oracle_mode: "off", retrieval_profile: "legacy",
+  };
+  const first = await post("/v1/context/query", body);
+  assert.deepEqual(first.results.map(({ id }: { id: string }) => id), [memory.id]);
+
+  // The second read must consult the current memory state, even with caching requested.
+  await db.memory.update({ where: { id: memory.id }, data: { isActive: false } });
+  const current = await post("/v1/context/query", body);
+  assert.deepEqual({ cached: current.meta.cache_hit, results: current.results }, { cached: false, results: [] });
 });
 
 run("memory graph keeps stored and chronological edges within the requested conversation", { timeout: 25_000 }, async (t) => {

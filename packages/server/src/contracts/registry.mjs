@@ -318,7 +318,7 @@ export const CONTRACT_REGISTRY = Object.freeze([
         root_path: "string?",
       },
     },
-    auth: { type: "api_key", scopes: ["read"], tenant_scope: "project" },
+    auth: { type: "api_key", scopes: ["read"], tenant_scope: "org" },
     privacy: { classification: "knowledge-base", input_sensitivity: "medium", output_sensitivity: "medium", logging: "redacted" },
     rate_limit_profile: "query",
     security_profile: "retrieval",

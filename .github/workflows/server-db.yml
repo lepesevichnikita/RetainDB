@@ -5,6 +5,9 @@ on:
     paths:
       - ".github/workflows/server-db.yml"
       - "packages/server/**"
+      - "packages/local/**"
+      - "packages/sdk/**"
+      - "packages/mcp/**"
       - "package.json"
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
@@ -15,6 +18,9 @@ on:
     paths:
       - ".github/workflows/server-db.yml"
       - "packages/server/**"
+      - "packages/local/**"
+      - "packages/sdk/**"
+      - "packages/mcp/**"
       - "package.json"
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
@@ -59,7 +65,10 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
       - run: corepack enable
-      - run: pnpm --filter @retaindb/server... install --frozen-lockfile --ignore-scripts
+      - run: pnpm --filter @retaindb/server... --filter @retaindb/local... --filter @retaindb/mcp... install --frozen-lockfile --ignore-scripts
+      - run: pnpm --filter @retaindb/sdk build
+      - run: pnpm --filter @retaindb/mcp typecheck
+      - run: pnpm --filter @retaindb/mcp test
       - run: pnpm --filter @retaindb/server rebuild sharp
       - run: pnpm --filter @retaindb/server run db:generate
       - run: pnpm --filter @retaindb/server exec prisma migrate deploy

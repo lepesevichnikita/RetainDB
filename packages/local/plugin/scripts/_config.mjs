@@ -19,6 +19,20 @@ function readConfig() {
 
 const config = readConfig();
 
-export const BASE_URL = (process.env.RETAINDB_BASE_URL || config.api || "http://localhost:3111").replace(/\/+$/, "");
+export function resolveHookBaseUrl(fallback = "http://localhost:3111") {
+  return (process.env.RETAINDB_BASE_URL || config.api || fallback).replace(/\/+$/, "");
+}
+
+export const BASE_URL = resolveHookBaseUrl();
 export const API_KEY = process.env.RETAINDB_API_KEY || config.token || "";
-export const PROJECT = process.env.RETAINDB_PROJECT || config.project || "default";
+function resolveHookEmbeddingMode(mode) {
+  if (mode === "local" || mode === "workstation") return "workstation";
+  if (mode === "server") return "server";
+  process.stderr.write("RetainDB: invalid hook embedding mode; expected local, workstation, or server. Hook requests skipped.\n");
+  return "invalid";
+}
+export const HOOK_EMBEDDING_MODE = resolveHookEmbeddingMode(process.env.RETAINDB_HOOK_EMBEDDING_MODE ?? config.hook_embedding_mode ?? "server");
+export const HOOK_EMBEDDING_MODEL = process.env.RETAINDB_HOOK_EMBEDDING_MODEL || config.hook_embedding_model || "Xenova/multilingual-e5-large";
+export function resolveHookProject(data = {}) {
+  return process.env.RETAINDB_PROJECT || config.project || data.project || data.cwd || "default";
+}

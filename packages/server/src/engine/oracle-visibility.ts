@@ -25,6 +25,14 @@ import { READABLE_SCOPE_STATES } from "./repo-index/store.js";
  */
 const SCOPE_SOURCE_PREFIX = scopeSourceName("");
 
+export type ProjectSearchScope = string | { orgId: string; projectId?: string };
+
+export function projectScopeSql(column: Prisma.Sql, scope: ProjectSearchScope) {
+  if (typeof scope === "string") return Prisma.sql`${column} = ${scope}`;
+  return Prisma.sql`EXISTS (SELECT 1 FROM projects p WHERE p.id = ${column} AND p."orgId" = ${scope.orgId}
+    ${scope.projectId ? Prisma.sql`AND p.id = ${scope.projectId}` : Prisma.empty})`;
+}
+
 /**
  * The `sources`-side scope of a repository query, over the `d` (documents) and `s` (sources) aliases
  * every caller joins.

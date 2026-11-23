@@ -66,15 +66,22 @@ Respond with JSON only:
 }
 
 export async function extractEntities(projectId: string, chunkId: string, content: string, chunkType: string) {
+  return saveChunkGraph(projectId, chunkId, await readEntityClaims(content, chunkType));
+}
+
+export async function readEntityClaims(content: string, chunkType: string, options?: { timeout: number; maxRetries: number }) {
   const result = await getOpenAIClient().chat.completions.create({
     model: process.env.EXTRACTION_MODEL || "gpt-4o-mini",
     messages: [{ role: "user", content: entityPrompt(content, chunkType) }],
     temperature: 0,
     max_tokens: 1000,
     response_format: { type: "json_object" },
-  });
-  const claims = parseGraphClaims(JSON.parse(result.choices[0]?.message?.content ?? "{}"));
-  return saveChunkGraph(projectId, chunkId, claims);
+  }, options);
+  const choice = result.choices[0];
+  if (choice?.finish_reason !== "stop" || choice.message.refusal || !choice.message.content) {
+    throw new Error("Graph extraction did not return a complete response.");
+  }
+  return parseGraphClaims(JSON.parse(choice.message.content));
 }
 
 // ═══════════════════════════════════════════════════════════════

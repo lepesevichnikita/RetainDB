@@ -166,28 +166,33 @@ async function putRelationMention(tx: GraphWriter, projectId: string, chunkId: s
   return row.id;
 }
 
-async function writeChunkClaims(tx: GraphWriter, projectId: string, chunkId: string, entities: ChunkGraph["entities"], graph: ChunkGraph) {
+type ChunkGraphWriteMode = "replace" | "merge";
+
+async function writeChunkClaims(tx: GraphWriter, projectId: string, chunkId: string, graph: ChunkGraph, mode: ChunkGraphWriteMode) {
   const entityIds = new Map<string, string>();
-  for (const entity of entities) {
+  for (const entity of uniqueClaims(graph)) {
     entityIds.set(entityKey(entity), await putEntityMention(tx, projectId, chunkId, entity));
   }
   const relationIds: string[] = [];
   for (const edge of resolveEdges(graph.relations, entityIds)) {
     relationIds.push(await putRelationMention(tx, projectId, chunkId, edge));
   }
-  await tx.$executeRaw`DELETE FROM entity_relation_mentions WHERE "chunkId" = ${chunkId} AND NOT ("relationId" = ANY(${relationIds}::text[]))`;
-  await tx.$executeRaw`DELETE FROM entity_mentions WHERE "chunkId" = ${chunkId} AND NOT ("entityId" = ANY(${[...entityIds.values()]}::text[]))`;
+  if (mode === "replace") await pruneOmittedMentions(tx, chunkId, relationIds, [...entityIds.values()]);
   await refreshEntityVectors(tx, [...entityIds.values()]);
   return { entities: entityIds.size, relations: relationIds.length };
 }
 
-export async function saveChunkGraph(projectId: string, chunkId: string, graph: ChunkGraph) {
-  const entities = uniqueClaims(graph);
-  return prisma.$transaction(async (tx) => {
+async function pruneOmittedMentions(tx: GraphWriter, chunkId: string, relationIds: string[], entityIds: string[]) {
+  await tx.$executeRaw`DELETE FROM entity_relation_mentions WHERE "chunkId" = ${chunkId} AND NOT ("relationId" = ANY(${relationIds}::text[]))`;
+  await tx.$executeRaw`DELETE FROM entity_mentions WHERE "chunkId" = ${chunkId} AND NOT ("entityId" = ANY(${entityIds}::text[]))`;
+}
+
+export async function saveChunkGraph(projectId: string, chunkId: string, graph: ChunkGraph, transaction?: GraphWriter, mode: ChunkGraphWriteMode = "replace") {
+  const save = async (tx: GraphWriter) => {
     if (!await claimChunk(tx, projectId, chunkId)) return { entities: 0, relations: 0 };
-    const written = await writeChunkClaims(tx, projectId, chunkId, entities, graph);
-    return written;
-  });
+    return writeChunkClaims(tx, projectId, chunkId, graph, mode);
+  };
+  return transaction ? save(transaction) : prisma.$transaction(save);
 }
 
 export interface BatchGraphInput {

@@ -284,6 +284,7 @@ const REVIEWED_ROUTES: Record<RouteAuthMode, readonly string[]> = {
     "GET /v1/webhooks",
     "POST /retaindb/observe",
     "POST /v1/agent-events",
+    "POST /v1/agent-events/workstation",
     "POST /v1/agent/browse",
     "POST /v1/agent/credentials",
     "POST /v1/agent/research",

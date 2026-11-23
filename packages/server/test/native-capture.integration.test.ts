@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
-import { randomBytes, randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { once } from "node:events";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { after, test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 
 const databaseUrl = process.env.RETAINDB_TEST_DATABASE_URL;
 const run = databaseUrl ? test : test.skip;
@@ -28,6 +33,140 @@ async function request(path: string, body?: unknown) {
   assert.ok(response.ok, `${path}: ${response.status} ${await response.clone().text()}`);
   return response.json();
 }
+
+run("workstation capture refuses missing, unusable or text-mismatched vectors before queuing", async () => {
+  const { api } = await import(routesPath);
+  const { db } = await import("../src/db/index.js");
+  const project = `${projectName}-isolated`;
+  const text = "Keep workstation inference local for a verified semantic capture.";
+  const digest = createHash("sha256").update(text).digest("hex");
+  const valid = { model: "fixture/model", vector: [1, ...Array(1023).fill(0)], content_sha256: digest };
+  const payload = { project, session_id: randomUUID(), event: { kind: "prompt", summary: text } };
+  for (const [embedding, status] of [[undefined, 400], [{ ...valid, vector: [1] }, 400],
+    [{ ...valid, vector: Array(1024).fill(0) }, 400], [{ ...valid, content_sha256: "0".repeat(64) }, 422]] as const) {
+    const response = await api.request("/v1/agent-events/workstation", {
+      method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.RETAINDB_API_KEY}` },
+      body: JSON.stringify({ ...payload, embedding }),
+    });
+    assert.equal(response.status, status);
+  }
+  // No invalid capture may create even a pending server-side event.
+  assert.equal(await db.session.count({ where: { sessionId: payload.session_id } }), 0);
+});
+
+run("the workstation receipt persists exactly the supplied searchable vector", async () => {
+  const { db } = await import("../src/db/index.js");
+  const { drainNativeCaptures } = await import(capturePath);
+  const summary = "Workstation inference keeps event indexing off the server.";
+  const model = "fixture/workstation";
+  const vector = [0.25, -0.5, ...Array<number>(1022).fill(0)];
+  const payload = { project: `${projectName}-isolated`, session_id: randomUUID(), event: { kind: "prompt", summary },
+    embedding: { model, vector, content_sha256: createHash("sha256").update(summary).digest("hex") } };
+  const receipt = await request("/v1/agent-events/workstation", payload);
+  await drainNativeCaptures();
+  const indexed = await request(`/v1/agent-events/${receipt.event_id}`);
+  assert.equal(indexed.status, "indexed", JSON.stringify(indexed));
+  assert.equal((await request("/v1/agent-events/workstation", payload)).event_id, receipt.event_id);
+
+  // Search the saved vector independently of the product's text inference path.
+  const rows = await db.$queryRaw<{ content: string; model: string; distance: number }[]>`
+    SELECT content, metadata->>'embedding_model' AS model, embedding <=> ${`[${vector.join(",")}]`}::vector AS distance
+    FROM chunks WHERE "documentId" = ${indexed.document_id} AND embedding IS NOT NULL
+    ORDER BY distance ASC`;
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].content, summary);
+  assert.equal(rows[0].model, model);
+  assert.ok(Math.abs(rows[0].distance) < 1e-7);
+});
+
+const runWithLocalModel = process.env.RETAINDB_TEST_LOCAL_EMBEDDINGS === "true" ? run : test.skip;
+
+runWithLocalModel("workstation tool hooks index safe output, not credential echoes", { timeout: 120000 }, async t => {
+  const { api } = await import(routesPath);
+  const { db } = await import("../src/db/index.js");
+  const { serve } = await import("@hono/node-server");
+  const { embedLocal, LOCAL_EMBEDDING_MODEL } = await import("../src/engine/embeddings-local.js");
+  const project = `${projectName}-tools`;
+  const expected = "Found zeolite desiccant [REDACTED]";
+  // Warm the shared model cache before running the offline hooks.
+  await embedLocal([expected]);
+  const secret = `fixture-echo-${randomUUID()}`;
+  const wire: { path: string; containsSecret: boolean; status: number }[] = [];
+  const server = serve({ hostname: "127.0.0.1", port: 0, fetch: async req => {
+    const containsSecret = (await req.clone().text()).includes(secret);
+    const response = await api.fetch(req);
+    wire.push({ path: new URL(req.url).pathname, containsSecret, status: response.status });
+    return response;
+  } });
+  t.after(() => new Promise<void>((resolve, reject) => {
+    server.close(error => error ? reject(error) : resolve());
+    if ("closeAllConnections" in server) server.closeAllConnections();
+  }));
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const local = fileURLToPath(new URL("../../local/", import.meta.url));
+  const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith("RETAINDB_")));
+  Object.assign(env, {
+    RETAINDB_BASE_URL: `http://127.0.0.1:${address.port}`, RETAINDB_API_KEY: process.env.RETAINDB_API_KEY,
+    RETAINDB_CONFIG: join(tmpdir(), `retaindb-absent-${randomUUID()}.json`), RETAINDB_PROJECT: project,
+    RETAINDB_HOOK_EMBEDDING_MODE: "local", RETAINDB_HOOK_EMBEDDING_MODEL: LOCAL_EMBEDDING_MODEL, TSX_DISABLE_CACHE: "1",
+  });
+
+  // Both hooks run the same tool; only their outputs distinguish the facts in search.
+  const invocations = [
+    { args: [join(local, "plugin/scripts/post-tool-use.mjs")], field: "tool_response", fact: "zeolite desiccant" },
+    { args: ["--import", "tsx/esm", join(local, "src/cli.ts"), "hook", "--kind=tool_result"], field: "tool_output", fact: "zirconia bushing" },
+  ];
+  for (const { args, field, fact } of invocations) {
+    const sessionId = randomUUID();
+    await new Promise<void>((resolve, reject) => {
+      const child = execFile(process.execPath, args, { cwd: local, env, timeout: 12000 }, error => error ? reject(error) : resolve());
+      child.stdin!.end(JSON.stringify({ session_id: sessionId, tool_name: "Read", tool_input: { password: secret }, [field]: `Found ${fact} ${secret}` }));
+    });
+    assert.deepEqual(wire.shift(), { path: "/v1/agent-events/workstation", containsSecret: false, status: 202 });
+    const stored = await db.message.findFirstOrThrow({ where: { session: { sessionId } } });
+    assert.equal(stored.content, `Found ${fact} [REDACTED]`);
+    assert.ok(!JSON.stringify(stored).includes(secret));
+  }
+  assert.deepEqual(wire, [], "workstation hooks must not issue recall or server capture requests");
+  const result = await request("/v1/context/query", {
+    project, query: "zeolite desiccant", use_vector: false, oracle_mode: "off", rerank: false, use_cache: false,
+  });
+  assert.deepEqual(result.results.map((hit: { content: string }) => hit.content), [expected]);
+  // A vector for different text must not pass an exact-summary cosine threshold.
+  const semantic = await request("/v1/context/query", {
+    project, query: expected, hybrid: false, threshold: 0.99, oracle_mode: "off", rerank: false, use_cache: false,
+  });
+  assert.deepEqual(semantic.results.map((hit: { content: string }) => hit.content), [expected]);
+});
+
+runWithLocalModel("context search only compares workstation vectors from its query model", async () => {
+  const { drainNativeCaptures } = await import(capturePath);
+  const { embedSingle } = await import("../src/engine/embeddings.js");
+  const { LOCAL_EMBEDDING_MODEL } = await import("../src/engine/embeddings-local.js");
+  const project = `${projectName}-models`;
+  const query = "A cobalt diaphragm controls the pneumatic actuator.";
+  const vector = await embedSingle(query);
+  const compatible = "The actuator diaphragm is made of cobalt.";
+  const incompatible = "A saffron compass identifies the calibration fixture.";
+  // Equal vector coordinates in different model spaces are not comparable.
+  for (const [summary, model] of [[compatible, LOCAL_EMBEDDING_MODEL], [incompatible, "fixture/incompatible"]]) {
+    const receipt = await request("/v1/agent-events/workstation", {
+      project, session_id: randomUUID(), event: { kind: "prompt", summary },
+      embedding: { model, vector, content_sha256: createHash("sha256").update(summary).digest("hex") },
+    });
+    await drainNativeCaptures();
+    assert.equal((await request(`/v1/agent-events/${receipt.event_id}`)).status, "indexed");
+  }
+  const search = { project, oracle_mode: "off", rerank: false, threshold: 0, use_cache: false };
+  const semantic = await request("/v1/context/query", { ...search, query, hybrid: false });
+  const hits = semantic.results.map((row: { content: string }) => row.content);
+  assert.ok(hits.includes(compatible));
+  assert.ok(!hits.includes(incompatible), "same-width vectors from a different model must not rank");
+  const lexical = await request("/v1/context/query", { ...search, query: "saffron compass", use_vector: false });
+  assert.ok(lexical.results.some((row: { content: string }) => row.content === incompatible));
+});
 
 run("native hook events persist, replay once, recover pending work and retrieve real local vectors", async () => {
   const { db } = await import("../src/db/index.js");
@@ -158,6 +297,8 @@ run("native hook events persist, replay once, recover pending work and retrieve 
       assert.ok(failed.last_error);
       assert.ok(failed.retry_at);
       assert.equal(await db.message.count({ where: { id: failedId } }), 1);
+      // The receipt remains pending without a partially visible document.
+      assert.equal(await db.document.count({ where: { externalId: failedId } }), 0);
     } finally {
       await db.$executeRawUnsafe(`ALTER TABLE chunks DROP CONSTRAINT "${constraint}"`);
     }
@@ -187,7 +328,7 @@ after(async () => {
     await stopNativeEmbeddingProcess();
     await delay(100);
     const { db } = await import("../src/db/index.js");
-    await db.project.deleteMany({ where: { name: { in: [projectName, `${projectName}-isolated`] } } });
+    await db.project.deleteMany({ where: { name: { in: [projectName, `${projectName}-isolated`, `${projectName}-models`, `${projectName}-tools`] } } });
     await db.$disconnect();
     for (const key of ["DATABASE_URL", "ENCRYPTION_KEY", "RETAINDB_API_KEY", "EMBEDDING_MODE", "DISABLE_AUTO_EXTRACTION", "OPENAI_API_KEY"]) {
       if (savedEnvironment[key] === undefined) delete process.env[key];

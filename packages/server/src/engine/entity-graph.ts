@@ -1,6 +1,7 @@
 import { prisma, Prisma } from "../db/index.js";
 import { vectorLiteral } from "./entity-graph-write.js";
-import { visibleSourceSql } from "./oracle-visibility.js";
+import { projectScopeSql as graphProject, type ProjectSearchScope as GraphScope, visibleSourceSql } from "./oracle-visibility.js";
+import { compatibleEmbeddingModel } from "./vector-order.js";
 
 interface ChunkScope {
   sourceIds?: string[];
@@ -9,9 +10,10 @@ interface ChunkScope {
 }
 
 interface GraphSearch {
-  projectId: string;
+  scope: GraphScope;
   query?: string;
   embedding: readonly number[];
+  embeddingModel: string | null;
   depth: number;
   topK: number;
   entityTypes?: string[];
@@ -37,12 +39,13 @@ interface GraphEntity {
 type GraphReader = Pick<Prisma.TransactionClient, "$queryRaw" | "$executeRaw">;
 const MAX_RELATIONS_PER_HOP = 50;
 
-function activeGraphChunks(projectId: string, scope: ChunkScope = {}) {
+function activeGraphChunks(project: GraphScope, scope: ChunkScope = {}) {
   const { sourceIds, chunkTypes, metadataFilter } = scope;
   return Prisma.sql`FROM chunks c
     JOIN documents d ON d.id = c."documentId"
     JOIN sources s ON s.id = d."sourceId"
-    WHERE c."projectId" = ${projectId} AND s."projectId" = ${projectId}
+    WHERE c."projectId" = s."projectId" AND ${graphProject(Prisma.sql`c."projectId"`, project)}
+      AND (d."projectId" IS NULL OR d."projectId" = c."projectId")
       AND d."deletedAt" IS NULL AND s."deletedAt" IS NULL
       AND d.status IN ('READY', 'INDEXED')
       AND d."sourceVersionId" IS NOT DISTINCT FROM s."activeVersionId"
@@ -50,6 +53,12 @@ function activeGraphChunks(projectId: string, scope: ChunkScope = {}) {
       ${sourceIds?.length ? Prisma.sql`AND s.id = ANY(${sourceIds}::text[])` : Prisma.empty}
       ${chunkTypes?.length ? Prisma.sql`AND c."chunkType" = ANY(${chunkTypes}::text[])` : Prisma.empty}
       ${metadataFilter ? Prisma.sql`AND c.metadata @> ${JSON.stringify(metadataFilter)}::jsonb` : Prisma.empty}`;
+}
+
+function visibleGraphChunks(project: GraphScope, scope?: ChunkScope) {
+  const orgId = typeof project === "string" ? undefined : project.orgId;
+  return Prisma.sql`${activeGraphChunks(project, scope)} ${visibleSourceSql([], orgId)}
+    ${orgId === undefined ? Prisma.empty : Prisma.sql`AND s."orgId" = ${orgId}`}`;
 }
 
 function activeMention(chunkId: Prisma.Sql, chunks: Prisma.Sql) {
@@ -60,22 +69,26 @@ function activeClaims(mentions: Prisma.Sql, id: Prisma.Sql, chunks: Prisma.Sql) 
   return Prisma.sql`${mentions} = ${id} AND ${activeMention(Prisma.sql`m."chunkId"`, chunks)}`;
 }
 
+function ownedGraphChunks(chunks: Prisma.Sql, alias: Prisma.Sql) {
+  return Prisma.sql`${chunks} AND c."projectId" = ${alias}."projectId"`;
+}
+
 function visibleGraphRecord(alias: Prisma.Sql, mentions: Prisma.Sql, chunks: Prisma.Sql) {
-  return Prisma.sql`(${alias}."isManual" OR EXISTS (SELECT 1 ${activeClaims(mentions, Prisma.sql`${alias}.id`, chunks)}))`;
+  return Prisma.sql`(${alias}."isManual" OR EXISTS (SELECT 1 ${activeClaims(mentions, Prisma.sql`${alias}.id`, ownedGraphChunks(chunks, alias))}))`;
 }
 
 const entityMentions = Prisma.sql`FROM entity_mentions m WHERE m."entityId"`;
 const relationMentions = Prisma.sql`FROM entity_relation_mentions m WHERE m."relationId"`;
 
-function projectEntities(projectId: string, chunks: Prisma.Sql) {
-  return Prisma.sql`FROM entities e WHERE e."projectId" = ${projectId} AND ${visibleGraphRecord(Prisma.sql`e`, entityMentions, chunks)}`;
+function projectEntities(project: GraphScope, chunks: Prisma.Sql) {
+  return Prisma.sql`FROM entities e WHERE ${graphProject(Prisma.sql`e."projectId"`, project)} AND ${visibleGraphRecord(Prisma.sql`e`, entityMentions, chunks)}`;
 }
 
-function projectRelations(projectId: string, chunks: Prisma.Sql) {
+function projectRelations(project: GraphScope, chunks: Prisma.Sql) {
   return Prisma.sql`FROM entity_relations r
-    JOIN entities origin ON origin.id = r."fromEntityId" AND origin."projectId" = ${projectId}
-    JOIN entities target ON target.id = r."toEntityId" AND target."projectId" = ${projectId}
-    WHERE r."projectId" = ${projectId}
+    JOIN entities origin ON origin.id = r."fromEntityId" AND ${graphProject(Prisma.sql`origin."projectId"`, project)}
+    JOIN entities target ON target.id = r."toEntityId" AND ${graphProject(Prisma.sql`target."projectId"`, project)}
+    WHERE ${graphProject(Prisma.sql`r."projectId"`, project)}
       AND ${visibleGraphRecord(Prisma.sql`origin`, entityMentions, chunks)}
       AND ${visibleGraphRecord(Prisma.sql`target`, entityMentions, chunks)}
       AND ${visibleGraphRecord(Prisma.sql`r`, relationMentions, chunks)}`;
@@ -84,13 +97,13 @@ function projectRelations(projectId: string, chunks: Prisma.Sql) {
 const relationColumns = Prisma.sql`r.id, r."fromEntityId", r."toEntityId", r."relationType", COALESCE(r.weight, 1) AS weight`;
 
 async function findGraphSeeds(db: GraphReader, options: GraphSearch, chunks: Prisma.Sql) {
-  const { projectId, query, embedding, topK, entityTypes } = options;
+  const { scope, query, embedding, embeddingModel, topK, entityTypes } = options;
   const vector = vectorLiteral(embedding);
   const types = entityTypes?.length ? Prisma.sql`AND e."entityType" = ANY(${entityTypes}::text[])` : Prisma.empty;
   // Structural nodes carry no mention vector, so a name hit is a first-class seed.
   const nameSeeds = query
     ? Prisma.sql`, name_seeds AS (
-      SELECT e.id, 0::float8 AS distance ${projectEntities(projectId, chunks)}
+      SELECT e.id, 0::float8 AS distance ${projectEntities(scope, chunks)}
       AND e.name ILIKE ${`%${query}%`} ${types}
       ORDER BY length(e.name), e.id LIMIT ${topK}
     )`
@@ -102,14 +115,17 @@ async function findGraphSeeds(db: GraphReader, options: GraphSearch, chunks: Pri
   return db.$queryRaw<{ id: string; similarity: number }[]>`
     WITH manual_distances AS MATERIALIZED (
       SELECT e.id, (e.embedding <=> ${vector}::vector) AS distance
-      FROM entities e WHERE e."projectId" = ${projectId} AND e."isManual" AND e.embedding IS NOT NULL ${types}
+      FROM entities e WHERE ${graphProject(Prisma.sql`e."projectId"`, scope)} AND e."isManual" AND e.embedding IS NOT NULL ${types}
+        AND ${compatibleEmbeddingModel(Prisma.sql`e.metadata`, embeddingModel)}
+        AND NOT EXISTS (SELECT 1 FROM entity_mentions m WHERE m."entityId" = e.id)
     ), manual_seeds AS (
       SELECT id, distance FROM manual_distances ORDER BY distance, id LIMIT ${topK}
     ), extracted_seeds AS (
       SELECT e.id, MIN(COALESCE(active.embedding, m.embedding) <=> ${vector}::vector) AS distance
       FROM entities e JOIN entity_mentions m ON m."entityId" = e.id
-      JOIN LATERAL (SELECT c.embedding ${chunks} AND c.id = m."chunkId") active ON true
-      WHERE e."projectId" = ${projectId} AND COALESCE(active.embedding, m.embedding) IS NOT NULL ${types}
+      JOIN LATERAL (SELECT c.embedding ${ownedGraphChunks(chunks, Prisma.sql`e`)} AND c.id = m."chunkId"
+        AND ${compatibleEmbeddingModel(Prisma.sql`c.metadata`, embeddingModel)}) active ON true
+      WHERE ${graphProject(Prisma.sql`e."projectId"`, scope)} AND COALESCE(active.embedding, m.embedding) IS NOT NULL ${types}
       GROUP BY e.id ORDER BY distance, e.id LIMIT ${topK}
     )${nameSeeds}
     SELECT id, 1 - MIN(distance) AS similarity
@@ -135,7 +151,7 @@ async function traverseGraph(db: GraphReader, options: GraphSearch, chunks: Pris
   const seeds = new Map((await findGraphSeeds(db, options, chunks)).map(({ id, similarity }) => [id, similarity]));
   const visited = new Set(seeds.keys());
   const relations: GraphRelation[] = [];
-  const scope = projectRelations(options.projectId, chunks);
+  const scope = projectRelations(options.scope, chunks);
   let frontier = [...visited];
   for (let hop = 0; hop < options.depth && frontier.length; hop++) {
     const edges = await findGraphRelations(db, scope, frontier, relations.map(({ id }) => id));
@@ -155,26 +171,26 @@ function graphSnapshot<T>(read: (db: GraphReader) => Promise<T>) {
 function entityColumns(chunks: Prisma.Sql) {
   return Prisma.sql`e.id, e.name, e."entityType",
     COALESCE(CASE WHEN e."isManual" THEN e.description END, (
-      SELECT m.description ${activeClaims(entityMentions, Prisma.sql`e.id`, chunks)} AND m.description IS NOT NULL
+      SELECT m.description ${activeClaims(entityMentions, Prisma.sql`e.id`, ownedGraphChunks(chunks, Prisma.sql`e`))} AND m.description IS NOT NULL
       ORDER BY m."chunkId" LIMIT 1
     )) AS description,
     CASE WHEN e."isManual" THEN e.metadata ELSE '{}'::jsonb END AS metadata`;
 }
 
-async function readGraphEntities(db: GraphReader, projectId: string, chunks: Prisma.Sql, ids: string[]) {
+async function readGraphEntities(db: GraphReader, scope: GraphScope, chunks: Prisma.Sql, ids: string[]) {
   if (!ids.length) return [];
-  return db.$queryRaw<GraphEntity[]>`
-    SELECT ${entityColumns(chunks)} FROM entities e
-    WHERE e."projectId" = ${projectId} AND e.id = ANY(${ids}::text[])
+  return db.$queryRaw<(GraphEntity & { project: string })[]>`
+    SELECT ${entityColumns(chunks)}, (SELECT p.name FROM projects p WHERE p.id = e."projectId") AS project
+    ${projectEntities(scope, chunks)} AND e.id = ANY(${ids}::text[])
     ORDER BY array_position(${ids}::text[], e.id)
   `;
 }
 
-export function searchEntityGraph(options: GraphSearch) {
+export function searchEntityGraph(options: GraphSearch & { scope: { orgId: string; projectId?: string } }) {
   return graphSnapshot(async (db) => {
-    const chunks = activeGraphChunks(options.projectId, options.chunkScope);
+    const chunks = visibleKnowledgeChunks(options.scope.projectId, options.scope.orgId);
     const traversal = await traverseGraph(db, options, chunks);
-    const nodes = await readGraphEntities(db, options.projectId, chunks, traversal.ids);
+    const nodes = await readGraphEntities(db, options.scope, chunks, traversal.ids);
     return { entities: nodes.map((node) => ({ ...node, similarity: traversal.seeds.get(node.id) ?? 0 })), relations: traversal.relations };
   });
 }
@@ -211,14 +227,14 @@ export function exportProjectGraph(projectId: string, limits: { entities: number
 }
 
 const DASHBOARD_GRAPH_SEEDS = 24;
-export interface BrowserNode { id: string; label: string; type: string | null }
+export interface BrowserNode { id: string; label: string; type: string | null; project: string }
 
-export function visibleKnowledgeChunks(projectId: string, orgId: string) {
-  return Prisma.sql`${activeGraphChunks(projectId)} AND s."orgId" = ${orgId} ${visibleSourceSql([], orgId)}`;
+export function visibleKnowledgeChunks(projectId: string | undefined, orgId: string) {
+  return visibleGraphChunks({ projectId, orgId });
 }
 
-export async function countVisibleGraphEntities(db: GraphReader, projectId: string, orgId: string) {
-  const scope = projectEntities(projectId, visibleKnowledgeChunks(projectId, orgId));
+export async function countVisibleGraphEntities(db: GraphReader, projectId: string | undefined, orgId: string) {
+  const scope = projectEntities({ projectId, orgId }, visibleKnowledgeChunks(projectId, orgId));
   const [row] = await db.$queryRaw<{ count: number }[]>`SELECT count(*)::int AS count ${scope}`;
   return row.count;
 }
@@ -231,17 +247,19 @@ function browseSeeds(db: GraphReader, scope: Prisma.Sql, query: string) {
 
 function browseNodes(db: GraphReader, scope: Prisma.Sql, ids: string[]) {
   return db.$queryRaw<BrowserNode[]>`
-    SELECT e.id, left(e.name, 240) AS label, e."entityType" AS type ${scope}
+    SELECT e.id, left(e.name, 240) AS label, e."entityType" AS type,
+      (SELECT p.name FROM projects p WHERE p.id = e."projectId") AS project ${scope}
     AND e.id = ANY(${ids}::text[]) ORDER BY array_position(${ids}::text[], e.id)`;
 }
 
-export function browseProjectGraph(projectId: string, orgId: string, query: string) {
+export function browseProjectGraph(projectId: string | undefined, orgId: string, query: string) {
   return graphSnapshot(async (db) => {
     const chunks = visibleKnowledgeChunks(projectId, orgId);
-    const scope = projectEntities(projectId, chunks);
+    const project = { projectId, orgId };
+    const scope = projectEntities(project, chunks);
     const seeds = new Set((await browseSeeds(db, scope, query)).map(({ id }) => id));
     if (seeds.size === 0) return { nodes: [], edges: [] };
-    const edges = await findGraphRelations(db, projectRelations(projectId, chunks), [...seeds], []);
+    const edges = await findGraphRelations(db, projectRelations(project, chunks), [...seeds], []);
     const nodes = await browseNodes(db, scope, [...seeds, ...nextFrontier(edges, seeds)]);
     return { nodes, edges };
   });
@@ -265,7 +283,7 @@ function findGraphChunks(db: GraphReader, chunks: Prisma.Sql, traversal: Travers
         JSONB_AGG(jsonb_build_object('id', e.id, 'name', e.name, 'type', e."entityType")
           ORDER BY array_position(${ids}::text[], e.id)) AS entities
       FROM entity_mentions m JOIN entities e ON e.id = m."entityId"
-      WHERE m."entityId" = ANY(${ids}::text[]) AND ${activeMention(Prisma.sql`m."chunkId"`, chunks)}
+      WHERE m."entityId" = ANY(${ids}::text[]) AND ${activeMention(Prisma.sql`m."chunkId"`, ownedGraphChunks(chunks, Prisma.sql`e`))}
       GROUP BY m."chunkId"
     ), ordered AS (
       SELECT *, "chunkId" = ANY(${primaryIds}::text[]) AS primary_match,
@@ -309,7 +327,7 @@ function toGraphResult(chunk: GraphChunk, seeds: Traversal["seeds"]) {
 
 export function searchGraphChunks(options: GraphSearch & { primaryChunkIds: string[] }) {
   return graphSnapshot(async (db) => {
-    const scope = activeGraphChunks(options.projectId, options.chunkScope);
+    const scope = visibleGraphChunks(options.scope, options.chunkScope);
     const traversal = await traverseGraph(db, options, scope);
     const chunks = traversal.ids.length ? await findGraphChunks(db, scope, traversal, options.primaryChunkIds, options.topK) : [];
     const evidence = new Map(chunks.map(({ id, entities }) => [id, graphEvidence(entities, traversal.relations)]));

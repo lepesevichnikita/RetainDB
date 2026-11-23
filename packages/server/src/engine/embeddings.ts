@@ -36,13 +36,13 @@ const REMOTE_INFERENCE_REQUIRED = /^true$/i.test(process.env.REMOTE_INFERENCE_RE
 const LARGE_BATCH_THRESHOLD = Number(process.env.LARGE_BATCH_THRESHOLD ?? 20);
 
 // ── OpenAI ──────────────────────────────────────────────────────────────────
-async function embedWithOpenAI(texts: string[]): Promise<EmbeddingBatch> {
+async function embedWithOpenAI(texts: string[], signal?: AbortSignal): Promise<EmbeddingBatch> {
   const openai = getOpenAIClient();
   const res = await openai.embeddings.create({
     model: "text-embedding-3-small",
     input: texts,
     dimensions: 1024,
-  });
+  }, signal ? { signal, maxRetries: 0 } : undefined);
   console.log(`[Embeddings] Generated ${res.data.length} OpenAI embeddings`);
   return { vectors: res.data.map((d) => d.embedding), model: res.model || null };
 }
@@ -54,7 +54,7 @@ async function embedWithOpenAI(texts: string[]): Promise<EmbeddingBatch> {
 const GEMINI_DIMENSIONS = Number(process.env.GEMINI_EMBEDDING_DIMENSIONS ?? 768);
 const GEMINI_EMBEDDING_MODEL = "text-embedding-004";
 
-async function embedWithGemini(texts: string[]): Promise<EmbeddingBatch> {
+async function embedWithGemini(texts: string[], signal?: AbortSignal): Promise<EmbeddingBatch> {
   const apiKey = process.env.GOOGLE_API_KEY;
   if (!apiKey) throw new Error("GOOGLE_API_KEY is required when EMBEDDING_MODE=gemini");
 
@@ -76,6 +76,7 @@ async function embedWithGemini(texts: string[]): Promise<EmbeddingBatch> {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ requests }),
+        signal,
       }
     );
 
@@ -104,25 +105,25 @@ async function embedWithGemini(texts: string[]): Promise<EmbeddingBatch> {
  * - 'hybrid':  local for small batches, OpenAI for large batches
  * - 'remote':  custom inference service
  */
-async function embedWithModel(texts: string[], single = false): Promise<EmbeddingBatch> {
+async function embedWithModel(texts: string[], single = false, signal?: AbortSignal): Promise<EmbeddingBatch> {
   if (USE_REMOTE_EMBEDDINGS) {
     try {
-      const batch = await embedWithInferenceService(texts);
+      const batch = await embedWithInferenceService(texts, signal);
       console.log(`[Embeddings] Generated ${batch.vectors.length} remote embeddings`);
       return batch;
     } catch (error: any) {
       console.warn('[Embeddings] Remote embedding failed:', error.message);
-      if (REMOTE_INFERENCE_REQUIRED) throw error;
+      if (REMOTE_INFERENCE_REQUIRED || signal?.aborted) throw error;
     }
   }
 
   if (EMBEDDING_MODE === 'gemini') {
-    return embedWithGemini(texts);
+    return embedWithGemini(texts, signal);
   }
 
   if (!single && EMBEDDING_MODE === 'hybrid' && texts.length > LARGE_BATCH_THRESHOLD) {
     console.log(`[Embeddings] Batch size ${texts.length} > ${LARGE_BATCH_THRESHOLD}, using OpenAI`);
-    return embedWithOpenAI(texts);
+    return embedWithOpenAI(texts, signal);
   }
 
   // Explicit local mode keeps every batch local.
@@ -133,16 +134,16 @@ async function embedWithModel(texts: string[], single = false): Promise<Embeddin
       return { vectors: embeddings, model: LOCAL_EMBEDDING_MODEL };
     } catch (error: any) {
       console.warn('[Embeddings] Local embedding failed, falling back to OpenAI:', error.message);
-      if (EMBEDDING_MODE === 'local') throw error;
+      if (EMBEDDING_MODE === 'local' || signal?.aborted) throw error;
     }
   }
 
-  return embedWithOpenAI(texts);
+  return embedWithOpenAI(texts, signal);
 }
 
 /** An injected vector-only embedder does not establish which model produced its result. */
-export async function embedBatch(texts: string[], embedder: Embedder = embedWithModel): Promise<EmbeddingBatch> {
-  const result = await embedder(texts);
+export async function embedBatch(texts: string[], embedder?: Embedder, signal?: AbortSignal): Promise<EmbeddingBatch> {
+  const result = await (embedder ? embedder(texts) : embedWithModel(texts, false, signal));
   return Array.isArray(result) ? { vectors: result, model: null } : result;
 }
 
@@ -150,6 +151,11 @@ export async function embed(texts: string[]): Promise<number[][]> {
   return (await embedBatch(texts)).vectors;
 }
 
+export async function embedSingleWithModel(text: string) {
+  const { vectors, model } = await embedWithModel([text], true);
+  return { vector: vectors[0], model };
+}
+
 export async function embedSingle(text: string): Promise<number[]> {
-  return (await embedWithModel([text], true)).vectors[0];
+  return (await embedSingleWithModel(text)).vector;
 }

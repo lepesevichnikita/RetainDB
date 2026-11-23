@@ -9,21 +9,29 @@ const content = byId('content');
 const feedback = byId('feedback');
 const tabs = [...document.querySelectorAll('[data-view]')];
 const views = {
-  overview: ['Overview', 'Indexed knowledge and embedding coverage for this project.', overview],
+  overview: ['Overview', 'Indexed knowledge and embedding coverage for the selected scope.', overview],
   graph: ['Knowledge graph', 'Stored entities and their direct relations.', (data) => graphView(data, state.q)],
   vectors: ['Vector map', 'A view of stored chunk embeddings, one model at a time.', vectors],
-  queue: ['Queue', 'Persisted ingestion, repository indexing, source sync, and native capture jobs.', queue],
+  queue: ['Queue', 'Rebuilds, ingestion, repository indexing, source sync, and native capture jobs.', queue],
   logs: ['Logs', 'Recent API requests across RetainDB. This log resets when the server restarts.', logs],
 };
 let projects;
 let state;
 let pending;
+let displayed;
+
+class ViewReadError extends Error {
+  constructor(status) {
+    super('RetainDB could not load this view. Try Refresh.');
+    this.status = status;
+  }
+}
 
 function describeState(url) {
   const view = url.searchParams.get('view');
   return {
     view: Object.hasOwn(views, view) ? view : 'overview',
-    project: url.searchParams.get('project') ?? projects?.[0]?.id ?? '',
+    project: url.searchParams.get('project') ?? '',
     q: url.searchParams.get('q')?.trim().slice(0, 120) ?? '',
     model: url.searchParams.get('model') ?? '',
   };
@@ -47,8 +55,9 @@ function syncControls() {
   byId('view-title').textContent = title;
   byId('view-description').textContent = description;
   projectSelect.closest('.project-control').hidden = state.view === 'logs';
-  byId('graph-filter').hidden = state.view !== 'graph' || !projectSelect.value;
+  byId('graph-filter').hidden = state.view !== 'graph' || projectSelect.selectedIndex < 0;
   byId('graph-query').value = state.q;
+  syncRebuildActions();
   for (const link of tabs) {
     const view = link.dataset.view;
     link.href = urlFor({ ...state, view });
@@ -57,10 +66,39 @@ function syncControls() {
   }
 }
 
+function syncRebuildActions() {
+  const available = document.body.dataset.admin === 'true' && projects && projectSelect.selectedIndex >= 0;
+  byId('rebuild-actions').hidden = !available || !['overview', 'graph'].includes(state.view);
+  byId('rebuild-knowledge').hidden = state.view !== 'overview';
+  byId('rebuild-graph').hidden = state.view !== 'graph';
+}
+
+async function requestRebuild(kind, project) {
+  const scope = project ? { project } : { scope: 'shared' };
+  const response = await fetch('/dashboard/rebuilds', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin',
+    redirect: 'manual', signal: AbortSignal.timeout(10_000), body: JSON.stringify({ kind, ...scope }),
+  });
+  if (response.status === 202) return;
+  const result = await response.json().catch(() => null);
+  throw new Error(result?.error || 'Could not confirm the rebuild request. Check Queue before retrying.');
+}
+
+async function rebuild(kind, button) {
+  const project = state.project;
+  const label = projectSelect.selectedOptions[0]?.label;
+  const effect = kind === 'graph' ? 'Send eligible chunks to the configured graph extraction provider.' : 'Generate only missing chunk vectors with the configured server embedder.';
+  if (!label || !window.confirm(`Rebuild ${kind} for ${label}? ${effect}`)) return;
+  button.disabled = true;
+  try { await requestRebuild(kind, project); await change({ view: 'queue', project }); }
+  catch (error) { status(error.message || 'Could not confirm the rebuild request. Check Queue before retrying.', true); }
+  finally { button.disabled = false; }
+}
+
 function setProjects() {
-  projectSelect.replaceChildren(...projects.map(({ id, name, slug }) => new Option(name === slug ? name : `${name} (${slug})`, id)));
-  if (!projects.some(({ id }) => id === state.project)) projectSelect.prepend(new Option('Select a project', ''));
-  projectSelect.value = projects.some(({ id }) => id === state.project) ? state.project : '';
+  const all = new Option('All projects', '');
+  projectSelect.replaceChildren(all, ...projects.map(({ id, name, slug }) => new Option(name === slug ? name : `${name} (${slug})`, id)));
+  projectSelect.value = state.project;
   projectSelect.disabled = projects.length === 0;
 }
 
@@ -76,7 +114,7 @@ async function read(view, params, signal) {
   if (response.type === 'opaqueredirect' || response.status === 401) throw new Error('Your session expired. Reload the page to sign in again.');
   if (response.status === 403) throw new Error('Your account cannot open this dashboard.');
   if (view === 'vectors' && response.status === 404 && (await response.json()).code === 'EMBEDDING_MODEL_NOT_FOUND') return null;
-  if (!response.ok) throw new Error('RetainDB could not load this view. Try Refresh.');
+  if (!response.ok) throw new ViewReadError(response.status);
   return response.json();
 }
 
@@ -89,30 +127,43 @@ async function loadView(signal) {
   }
   if (projects) setProjects();
   syncControls();
-  if (state.view !== 'logs' && !projectSelect.value) return empty(projects.length ? 'Select a project to see its data.' : 'No projects in RetainDB yet.');
   const { view, project, q, model } = state;
-  const params = view === 'logs' ? {} : { project, ...(view === 'graph' ? { q } : {}), ...(view === 'vectors' ? { model } : {}) };
+  if (view !== 'logs' && projectSelect.selectedIndex < 0) return empty('This project is unavailable. Select another project or All projects.');
+
+  const scope = project ? { project } : { scope: 'shared' };
+  const params = view === 'logs' ? {} : { ...scope, ...(view === 'graph' ? { q } : {}), ...(view === 'vectors' ? { model } : {}) };
   const result = await read(view, params, signal);
   if (!signal.aborted) return views[view][2](result);
 }
 
-async function load() {
+function clearView() {
+  displayed = undefined;
+  content.replaceChildren();
+  byId('updated').textContent = '';
+}
+
+async function load({ refresh = false } = {}) {
   pending?.abort();
   const { signal } = pending = new AbortController();
   state = describeState(new URL(location.href));
+  const key = urlFor(state);
   syncControls();
   status('Loading…');
   content.setAttribute('aria-busy', 'true');
-  content.replaceChildren();
-  byId('updated').textContent = '';
+  if (!refresh || displayed?.key !== key) clearView();
   try {
     const rendered = await loadView(signal);
     if (signal.aborted) return;
     content.replaceChildren(rendered);
-    byId('updated').textContent = `Updated ${clock.format(new Date())}`;
+    displayed = { key, time: clock.format(new Date()) };
+    byId('updated').textContent = `Updated ${displayed.time}`;
     status('');
   } catch (error) {
-    if (!signal.aborted) status(error.message, true);
+    if (signal.aborted) return;
+    if (displayed && error instanceof ViewReadError && error.status >= 500) {
+      byId('updated').textContent = `Updated ${displayed.time} · Previous result`;
+    } else clearView();
+    status(error.message, true);
   } finally {
     if (!signal.aborted) content.setAttribute('aria-busy', 'false');
   }
@@ -175,7 +226,7 @@ function missingModel() {
   const reset = element('button', 'Show available models');
   reset.type = 'button';
   reset.addEventListener('click', () => change({ model: '' }).then(() => (byId('vector-model') ?? byId('refresh')).focus()));
-  group.append(element('p', 'The selected embedding model is no longer available in this project.'), reset);
+  group.append(element('p', 'The selected embedding model is no longer available in this view.'), reset);
   return group;
 }
 
@@ -210,19 +261,22 @@ function badge(text, tone = 'neutral') {
 
 function jobTone(value) {
   if (/FAILED|ERROR/i.test(value)) return 'error';
-  if (/PROCESSING|RUNNING|OPEN|SEALED/i.test(value)) return 'active';
+  if (/PROCESSING|RUNNING|OPEN|SEALED|QUEUED/i.test(value)) return 'active';
   return 'neutral';
 }
 
-function queueRow({ id, kind, status, createdAt, processed, total, unit }) {
+function queueRow({ id, kind, status, createdAt, processed, total, unit, project, error }) {
   const job = element('div', kind);
   job.append(element('span', id, 'queue-id'));
-  const progress = total ? `${number.format(processed)} / ${number.format(total)} ${unit}` : 'Not reported';
-  return [job, badge(status, jobTone(status)), progress, timestamp(createdAt)];
+  const progress = total != null ? `${number.format(processed)} / ${number.format(total)} ${unit}` : 'Not reported';
+  const state = element('div');
+  state.append(badge(status, jobTone(status)));
+  if (error) state.append(element('p', error, 'muted'));
+  return [job, project, state, progress, timestamp(createdAt)];
 }
 
 function queue({ totals, jobs }) {
-  if (!jobs.length) return empty('No jobs for this project.');
+  if (!jobs.length) return empty('No jobs in this view.');
   const group = document.createDocumentFragment();
   const summary = element('ul', undefined, 'summary');
   summary.setAttribute('aria-label', 'All jobs by state');
@@ -231,7 +285,7 @@ function queue({ totals, jobs }) {
     item.append(badge(`${kind}: ${status} ${number.format(count)}`, jobTone(status)));
     summary.append(item);
   }
-  group.append(summary, table(`Showing ${jobs.length} jobs, active first`, ['Job', 'State', 'Progress', 'Created'], jobs.map(queueRow)));
+  group.append(summary, table(`Showing ${jobs.length} jobs, active first`, ['Job', 'Project', 'State', 'Progress', 'Created'], jobs.map(queueRow)));
   return group;
 }
 
@@ -249,13 +303,17 @@ for (const tab of tabs) tab.addEventListener('click', (event) => {
   void change({ view: tab.dataset.view });
 });
 projectSelect.addEventListener('change', () => change({ project: projectSelect.value, q: '', model: '' }));
+for (const kind of ['knowledge', 'graph']) {
+  const button = byId(`rebuild-${kind}`);
+  button.addEventListener('click', () => void rebuild(kind, button));
+}
 byId('graph-filter').addEventListener('submit', (event) => {
   event.preventDefault();
   void change({ q: byId('graph-query').value.trim() });
 });
 byId('refresh').addEventListener('click', () => {
   projects = undefined;
-  void load();
+  void load({ refresh: true });
 });
 window.addEventListener('popstate', load);
 void load();

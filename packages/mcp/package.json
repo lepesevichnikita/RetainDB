@@ -11,6 +11,7 @@
   "scripts": {
     "build": "tsup src/server.ts src/setup-agent.ts --format esm --out-dir dist",
     "dev": "tsx src/server.ts",
+    "test": "node --import tsx --test test/*.test.mjs",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run build"
   },
@@ -31,7 +32,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
     "zod": "^3.24.0",
-    "@retaindb/sdk": "^5.1.1"
+    "@retaindb/sdk": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

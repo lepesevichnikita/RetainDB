@@ -23,7 +23,7 @@ const DEFAULT_TIMEOUTS: TimeoutBudgets = {
 const DEFAULT_RETRYABLE_STATUS = [408, 429, 500, 502, 503, 504];
 const DEFAULT_API_KEY_ONLY_PREFIXES = ["/v1/memory", "/v1/context/query"];
 
-const DEFAULT_RETRY_ATTEMPTS: Record<OperationType, number> = {
+const DEFAULT_RETRY_ATTEMPTS: Partial<Record<OperationType, number>> = {
   search: 3,
   writeAck: 2,
   bulk: 2,
@@ -144,7 +144,7 @@ export class RuntimeClient {
 
   private maxAttemptsFor(operation: OperationType): number {
     const override = this.retryPolicy.maxAttemptsByOperation?.[operation];
-    return Math.max(1, override ?? DEFAULT_RETRY_ATTEMPTS[operation]);
+    return Math.max(1, override ?? DEFAULT_RETRY_ATTEMPTS[operation] ?? 1);
   }
 
   private shouldRetryStatus(status?: number): boolean {

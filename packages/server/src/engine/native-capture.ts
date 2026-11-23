@@ -1,99 +1,11 @@
 import { createHash } from "node:crypto";
-import { prisma } from "../db/index.js";
+import { prisma, type Transaction } from "../db/index.js";
 import { hashIdempotencyPayload } from "../api/idempotency.js";
 import { ingestDocument } from "./ingest.js";
 import { embedNativeCapture, stopNativeEmbeddingProcess } from "./native-embeddings.js";
+import { redactCapture } from "../../../local/plugin/scripts/_redact.mjs";
 
-export function redactCapture(value: unknown): unknown {
-  const secrets = new Set<string>();
-  function remember(entry: unknown): void {
-    if (typeof entry === "string" && entry && entry !== "[REDACTED]") {
-      secrets.add(entry);
-      secrets.add(JSON.stringify(entry).slice(1, -1));
-    } else if (typeof entry === "number" || typeof entry === "boolean") {
-      remember(String(entry));
-    } else if (Array.isArray(entry)) {
-      entry.forEach(remember);
-    } else if (entry && typeof entry === "object") {
-      Object.values(entry).forEach(remember);
-    }
-  }
-  function sanitize(entry: unknown): unknown {
-    if (typeof entry === "string") {
-      try {
-        const parsed: unknown = JSON.parse(entry);
-        if (parsed && typeof parsed === "object") return JSON.stringify(sanitize(parsed));
-      } catch {}
-      return entry
-        .replace(/-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----([\s\S]*?)-----END \1-----/g, (match, _kind, body) => {
-          remember(match);
-          String(body).trim().split(/\s+/).forEach(remember);
-          return "[REDACTED]";
-        })
-        .replace(/(\b[a-z][a-z0-9+.-]*:\/\/)([^/\s"'?#]+)@/gi, (_match, scheme, userInfo) => {
-          remember(userInfo);
-          const separator = String(userInfo).indexOf(":");
-          if (separator >= 0) {
-            const password = String(userInfo).slice(separator + 1);
-            remember(password);
-            try { remember(decodeURIComponent(password)); } catch {}
-          }
-          return `${scheme}[REDACTED]@`;
-        })
-        .replace(/\b(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})\b/g, match => {
-          remember(match);
-          return "[REDACTED]";
-        })
-        .replace(/(\bBearer\s+)([A-Za-z0-9._~+\/-]+)/gi, (_match, prefix, credential) => {
-          remember(credential);
-          return `${prefix}[REDACTED]`;
-        })
-        .replace(/(["']?(?:[a-z][a-z0-9]*[_-])*(?:api[_-]?key|(?:access|refresh|auth)[_-]?token|token|secret(?:[_-]?access[_-]?key)?|password|private[_-]?key)["']?\s*[:=]\s*)("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^"',\s}]+)/gi, (_match, prefix, credential) => {
-          try {
-            const parsed: unknown = JSON.parse(credential);
-            remember(typeof parsed === "string" ? parsed : credential);
-          }
-          catch { remember(credential.startsWith("'") ? credential.slice(1, -1).replace(/\\(['\\])/g, "$1") : credential); }
-          return `${prefix}[REDACTED]`;
-        });
-    }
-    if (Array.isArray(entry)) return entry.map(sanitize);
-    if (entry && typeof entry === "object") {
-      return Object.fromEntries(Object.entries(entry).map(([key, item]) => {
-        if (/(?:^|[_-])(?:authorization|api[_-]?key|(?:access|refresh|auth)[_-]?token|token|secret(?:[_-]?access[_-]?key)?|password|private[_-]?key)$/i.test(key)) {
-          remember(item);
-          sanitize(item);
-          return [key, "[REDACTED]"];
-        }
-        return [key, sanitize(item)];
-      }));
-    }
-    return entry;
-  }
-  const sanitized = sanitize(value);
-  const ordered = [...secrets].sort((a, b) => b.length - a.length);
-  function scrub(entry: unknown): unknown {
-    if (typeof entry === "string") {
-      // A whole-value match is the only safe replacement for a one-character
-      // secret ("1", "f"): it has no information value and appears in ordinary
-      // prose, so replacing it inside a sentence corrupts the captured text.
-      if (ordered.includes(entry)) return "[REDACTED]";
-      return ordered.reduce((text, secret) => {
-        if (secret.length >= 8) return text.split(secret).join("[REDACTED]");
-        if (secret.length < 2) return text;
-        // Two to seven characters are replaced as complete tokens, never inside a
-        // word, so a short echo is removed without touching "fixture-project".
-        const escaped = secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        return text.replace(new RegExp(`(^|[^\\p{L}\\p{N}_-])${escaped}(?=$|[^\\p{L}\\p{N}_-])`, "gu"), "$1[REDACTED]");
-      }, entry);
-    }
-    if ((typeof entry === "number" || typeof entry === "boolean") && secrets.has(String(entry))) return "[REDACTED]";
-    if (Array.isArray(entry)) return entry.map(scrub);
-    if (entry && typeof entry === "object") return Object.fromEntries(Object.entries(entry).map(([key, item]) => [key, scrub(item)]));
-    return entry;
-  }
-  return scrub(sanitized);
-}
+export { redactCapture };
 
 function stableId(value: string): string {
   const hex = createHash("sha256").update(value).digest("hex");
@@ -115,6 +27,7 @@ export interface NativeCaptureInput {
   hookType: string;
   data: Record<string, unknown>;
   timestamp?: string;
+  workstation?: { text: string; model: string; vector: number[] };
 }
 
 export async function acceptNativeCapture(input: NativeCaptureInput) {
@@ -123,7 +36,7 @@ export async function acceptNativeCapture(input: NativeCaptureInput) {
   const id = stableId(`native-event:${digest}`);
   const sessionKey = stableId(JSON.stringify([orgId, projectId, sessionId]));
   const safeData = redactCapture(input.data) as Record<string, unknown>;
-  const content = `${hookType}\n${JSON.stringify(safeData)}`;
+  const content = input.workstation?.text ?? `${hookType}\n${JSON.stringify(safeData)}`;
   const timestamp = input.timestamp ? new Date(input.timestamp) : new Date();
   const message = await prisma.$transaction(async tx => {
     await tx.session.upsert({
@@ -146,9 +59,10 @@ export async function acceptNativeCapture(input: NativeCaptureInput) {
       where: { id: sessionKey },
       data: { messageCount: { increment: 1 }, lastMessageAt: timestamp },
     });
+    if (input.workstation) return indexWorkstationReceipt(tx, input, stored);
     return stored;
   });
-  void drainNativeCaptures().catch(error => console.error("[NativeCapture] Drain failed:", error));
+  if (!input.workstation) void drainNativeCaptures().catch(error => console.error("[NativeCapture] Drain failed:", error));
   return { id: message.id, status: (message.metadata as Record<string, unknown>).native_capture_state };
 }
 
@@ -161,10 +75,18 @@ interface PendingCapture {
   externalSessionId: string;
 }
 
-async function indexCapture(message: PendingCapture): Promise<string> {
+async function indexWorkstationReceipt(tx: Transaction, input: NativeCaptureInput, stored: { id: string; content: string; metadata: unknown }) {
+  const metadata = stored.metadata as Record<string, unknown>;
+  const documentId = await indexCapture({ ...stored, metadata, projectId: input.projectId, orgId: input.orgId, externalSessionId: input.sessionId }, tx, input.workstation);
+  return tx.message.update({ where: { id: stored.id }, data: { metadata: { ...metadata,
+    native_capture_state: "indexed", document_id: documentId, indexed_at: new Date().toISOString(), capture_attempts: 1,
+  } } });
+}
+
+async function indexCapture(message: PendingCapture, db: Transaction, embedding?: NativeCaptureInput["workstation"]): Promise<string> {
   const deadline = Date.now() + 120_000;
   const sourceName = `native-agent-hooks-${message.projectId}`;
-  const source = await prisma.source.upsert({
+  const source = await db.source.upsert({
     where: { projectId_name: { projectId: message.projectId, name: sourceName } },
     create: {
       orgId: message.orgId, projectId: message.projectId, name: sourceName,
@@ -176,13 +98,13 @@ async function indexCapture(message: PendingCapture): Promise<string> {
     sourceId: source.id, projectId: message.projectId, externalId: message.id,
     title: `${message.metadata.hook_type} (${message.externalSessionId})`, content: message.content,
     ingestionProfile: "plain_text", strategyOverride: "fixed", skipEntityExtraction: true,
-    embedTexts: texts => embedNativeCapture(texts, deadline - Date.now()),
+    embedTexts: texts => embedding === undefined ? embedNativeCapture(texts, deadline - Date.now()) : suppliedCaptureEmbedding(message.content, texts, embedding),
     metadata: {
       ...message.metadata, native_capture_state: undefined,
       event_id: message.id, session_id: message.externalSessionId, source: "native_agent_hook",
     },
-  });
-  const [{ total, vectors }] = await prisma.$queryRaw<Array<{ total: number; vectors: number }>>`
+  }, db);
+  const [{ total, vectors }] = await db.$queryRaw<Array<{ total: number; vectors: number }>>`
     SELECT COUNT(*)::int AS total, COUNT(embedding)::int AS vectors
     FROM chunks WHERE "documentId" = ${document.id} AND COALESCE(metadata->>'searchable', 'true') != 'false'
   `;
@@ -190,6 +112,11 @@ async function indexCapture(message: PendingCapture): Promise<string> {
     throw new Error("Native capture requires vectors for every searchable chunk");
   }
   return document.id;
+}
+
+async function suppliedCaptureEmbedding(content: string, texts: string[], embedding: { model: string; vector: number[] }) {
+  if (texts.length !== 1 || texts[0] !== content) throw new Error("Workstation capture vector must cover exactly one unchanged searchable chunk");
+  return { vectors: [embedding.vector], model: embedding.model };
 }
 
 async function processNextCapture(): Promise<boolean> {
@@ -206,8 +133,9 @@ async function processNextCapture(): Promise<boolean> {
     const message = rows[0];
     if (!message) return false;
     const attempts = Number(message.metadata.capture_attempts || 0) + 1;
+    await tx.$executeRaw`SAVEPOINT native_capture_index`;
     try {
-      const documentId = await indexCapture(message);
+      const documentId = await indexCapture(message, tx);
       await tx.$executeRaw`
         UPDATE messages SET metadata = (metadata - 'last_error' - 'retry_at') || jsonb_build_object(
           'native_capture_state', 'indexed', 'document_id', ${documentId}::text,
@@ -215,6 +143,7 @@ async function processNextCapture(): Promise<boolean> {
         ) WHERE id = ${message.id}
       `;
     } catch (error) {
+      await tx.$executeRaw`ROLLBACK TO SAVEPOINT native_capture_index`;
       const errorText = String(redactCapture(error instanceof Error ? error.message : String(error))).slice(0, 1000);
       const retry = captureRetryPlan(attempts);
       await tx.$executeRaw`

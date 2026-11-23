@@ -4,6 +4,7 @@ import { after, test, type TestContext } from "node:test";
 import { once } from "node:events";
 import { serve } from "@hono/node-server";
 import { chromium } from "playwright";
+import OpenAI from "openai";
 
 const databaseUrl = process.env.RETAINDB_TEST_DATABASE_URL;
 const run = databaseUrl ? test : test.skip;
@@ -26,7 +27,10 @@ if (databaseUrl) Object.assign(process.env, {
 async function fixture(t: TestContext, modelForText?: (text: string) => string | undefined) {
   Object.assign(process.env, { RETAINDB_DASHBOARD_ORIGIN: origin, RETAINDB_DASHBOARD_AUTH_URL: authUrl });
   t.mock.method(globalThis, "fetch", async (url: string | URL, init?: RequestInit) => {
-    if (String(url) === authUrl) return new Response(null, { headers: { "Remote-User": "operator" } });
+    if (String(url) === authUrl) {
+      const isAdmin = new Headers(init?.headers).get("cookie") === "authelia_session=fixture-admin";
+      return new Response(null, { headers: { "Remote-User": "operator", "Remote-Groups": isAdmin ? "admins" : "readers" } });
+    }
     assert.equal(String(url), `${inferenceUrl}/v1/inference/embeddings`);
     assert.ok(modelForText, "Only the embedding provenance scenarios call inference");
     const { inputs } = JSON.parse(String(init?.body)) as { inputs: string[] };
@@ -56,6 +60,43 @@ async function fixture(t: TestContext, modelForText?: (text: string) => string |
 
 after(async () => {
   if (databaseUrl) await (await import("../src/db/index.js")).db.$disconnect();
+});
+
+run("the signed-in dashboard shares knowledge across projects without crossing organizations", async (t) => {
+  const { db, project, other, read } = await fixture(t);
+  const sibling = await db.project.create({ data: { name: "Sibling", slug: `${project.slug}-sibling` } });
+  t.after(async () => { await db.project.delete({ where: { id: sibling.id } }); });
+  const names = ["Shared reader", "Shared index", hidden];
+  const entities: { id: string }[] = [];
+  // A foreign project deliberately has rows that claim the default organization.
+  for (const [index, owner] of [project, sibling, other].entries()) {
+    const name = names[index];
+    const source = await db.source.create({ data: { projectId: owner.id, name, type: "text", status: "READY" } });
+    const document = await db.document.create({ data: { sourceId: source.id, projectId: owner.id, title: name, status: "READY" } });
+    const chunk = await db.chunk.create({ data: { documentId: document.id, projectId: owner.id, content: name, metadata: { embedding_model: "fixture/shared" } } });
+    await db.$executeRaw`UPDATE chunks SET embedding = ${vector(1, index)}::vector WHERE id = ${chunk.id}`;
+    await db.memory.create({ data: { content: name, projectId: owner.id, orgId: project.orgId } });
+    entities.push(await db.entity.create({ data: { name, type: "concept", projectId: owner.id, isManual: true } }));
+  }
+  for (const target of entities.slice(1)) {
+    await db.entityRelation.create({ data: { projectId: project.id, fromEntityId: entities[0].id, toEntityId: target.id, relationType: "references", isManual: true } });
+  }
+
+  const shared = { scope: "shared" };
+  const overview = await read("overview", shared);
+  assert.equal(overview.status, 200);
+  const counts = await overview.json();
+  assert.deepEqual(counts.models.find((item: { model: string }) => item.model === "fixture/shared"), { model: "fixture/shared", count: 2 });
+  assert.ok(counts.memories >= 2);
+  const graph = await (await read("graph", { ...shared, q: names[0] })).json();
+  assert.deepEqual(graph.nodes.map((node: { label: string; project: string }) => [node.label, node.project]), [[names[0], project.name], [names[1], sibling.name]]);
+  assert.deepEqual(graph.edges.map((edge: { toEntityId: string }) => edge.toEntityId), [entities[1].id]);
+  const map = await (await read("vectors", { ...shared, model: "fixture/shared" })).json();
+  assert.deepEqual(new Map(map.points.map((p: { label: string; project: string }) => [p.label, p.project])), new Map([[names[0], project.name], [names[1], sibling.name]]));
+  assert.equal((await read("graph", { ...shared, project: other.id })).status, 400);
+  const filtered = await (await read("graph", { project: project.id, q: names[0] })).json();
+  assert.deepEqual(filtered.nodes.map((node: { label: string }) => node.label), [names[0]]);
+  assert.deepEqual(filtered.edges, []);
 });
 
 run("the project views read live graph provenance and separate recorded vector models", async (t) => {
@@ -287,8 +328,36 @@ run("the queue reflects persisted server jobs and capture retries without exposi
   assert.equal(Date.parse(createdAt), event.createdAt.getTime());
   assert.deepEqual(capture, {
     id: event.id, kind: "Native capture", status: "indexed",
-    processed: 1, total: 1, unit: "event",
+    processed: 1, total: 1, unit: "event", project: project.name,
   });
+});
+
+run("the All projects queue aggregates authorized jobs and keeps project labels", async (t) => {
+  const { db, project, other, read } = await fixture(t);
+  const sibling = await db.project.create({ data: { name: "Sibling queue", slug: `${project.slug}-sibling` } });
+  t.after(async () => {
+    await db.$executeRaw`DELETE FROM ingestion_jobs WHERE project_id = ${sibling.id}`;
+    await db.project.delete({ where: { id: sibling.id } });
+  });
+  const first = randomUUID(), second = randomUUID(), foreign = randomUUID(), mislabelled = randomUUID();
+  // Two authorized projects, plus mismatches in each direction between project and job ownership.
+  await db.$executeRaw`INSERT INTO ingestion_jobs (id, org_id, project_id, user_id, status, total_documents, processed_documents, error)
+    VALUES (${first}, 'default', ${project.id}, ${hidden}, 'PROCESSING', 4, 2, ${hidden}),
+           (${second}, 'default', ${sibling.id}, ${hidden}, 'PROCESSING', 1, 0, ${hidden}),
+           (${foreign}, 'default', ${other.id}, ${hidden}, 'PROCESSING', 99, 0, ${hidden}),
+           (${mislabelled}, ${other.orgId}, ${project.id}, ${hidden}, 'PROCESSING', 99, 0, ${hidden})`;
+
+  const response = await read("queue", { scope: "shared" });
+  assert.equal(response.status, 200);
+  const text = await response.text();
+  assert.ok(!text.includes(hidden));
+  const state = JSON.parse(text);
+  assert.deepEqual(state.totals, [{ kind: "Ingestion", status: "PROCESSING", count: 2 }]);
+  assert.deepEqual(new Map(state.jobs.map(({ id, project }: { id: string; project: string }) => [id, project])),
+    new Map([[first, project.name], [second, sibling.name]]));
+  const filtered = await (await read("queue")).json();
+  assert.deepEqual(filtered.jobs.map(({ id }: { id: string }) => id), [first]);
+  assert.equal((await read("queue", { scope: "shared", project: project.id })).status, 400);
 });
 
 run("queue prioritizes runnable attempts and labels paused, withdrawn, and superseded work", async (t) => {
@@ -327,12 +396,252 @@ run("queue prioritizes runnable attempts and labels paused, withdrawn, and super
   ]);
 });
 
+run("administrator rebuilds repair missing knowledge without replacing stored workstation vectors", async (t) => {
+  const { db, project, other, read } = await fixture(t, () => "fixture/rebuild");
+  const { createNodeApp } = await import("../src/api/app.js");
+  const app = createNodeApp({ includeApiRoutes: false });
+  const enqueue = (body: object, session = "fixture-admin", from = origin) => app.request(`${origin}/dashboard/rebuilds`, {
+    method: "POST", headers: { cookie: `authelia_session=${session}`, origin: from, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const body = { kind: "knowledge", project: project.id };
+  assert.equal((await enqueue(body, "fixture-session")).status, 403);
+  assert.equal((await enqueue(body, "fixture-admin", "https://unrelated.example.test")).status, 403);
+  assert.equal((await enqueue({ kind: "knowledge", project: other.id })).status, 404);
+  assert.equal((await enqueue({ ...body, scope: "shared" })).status, 400);
+
+  // Only the missing vector is repaired; original content and workstation provenance survive.
+  const source = await db.source.create({ data: { name: "Rebuild input", type: "text", projectId: project.id } });
+  const document = await db.document.create({ data: { title: "Repair", sourceId: source.id, projectId: project.id, status: "READY" } });
+  const missing = await db.chunk.create({ data: { documentId: document.id, projectId: project.id, content: "Needs repair", metadata: { fixture: true } } });
+  const existing = await db.chunk.create({ data: { documentId: document.id, projectId: project.id, content: "Already searchable", metadata: { embedding_model: "fixture/workstation" } } });
+  await db.$executeRaw`UPDATE chunks SET embedding = ${vector(0, 1)}::vector WHERE id = ${existing.id}`;
+
+  const queued = await enqueue(body);
+  assert.equal(queued.status, 202);
+  const { id } = await queued.json();
+  assert.equal((await enqueue({ kind: "knowledge", scope: "shared" })).status, 409);
+  // A replacement worker must honor a live lease and reclaim an interrupted batch after expiry.
+  await db.$executeRaw`UPDATE dashboard_rebuilds SET status = 'running', lease_token = 'interrupted-worker',
+    lease_until = now() + interval '1 minute' WHERE id = ${id}`;
+  const { runDashboardRebuildBatch } = await import("../src/engine/dashboard-rebuild.js");
+  await runDashboardRebuildBatch();
+  const [beforeRecovery] = await db.$queryRaw<{ missing: boolean }[]>`SELECT embedding IS NULL AS missing FROM chunks WHERE id = ${missing.id}`;
+  assert.equal(beforeRecovery.missing, true);
+  await db.$executeRaw`UPDATE dashboard_rebuilds SET lease_until = now() - interval '1 second' WHERE id = ${id}`;
+  await runDashboardRebuildBatch();
+  const [prepared] = await db.$queryRaw<{ missing: boolean }[]>`SELECT embedding IS NULL AS missing FROM chunks WHERE id = ${missing.id}`;
+  assert.equal(prepared.missing, true, "prepared embeddings must not be visible before the job completes");
+  await runDashboardRebuildBatch();
+  const jobs = await (await read("queue")).json();
+  const job = jobs.jobs.find((item: { id: string }) => item.id === id);
+  assert.deepEqual([job.status, job.processed, job.total], ["completed", 1, 1]);
+  const rows = await db.$queryRaw<{ id: string; content: string; metadata: object; matches: boolean }[]>`
+    SELECT id, content, metadata, embedding = (CASE WHEN id = ${missing.id} THEN ${vector(1, 0)} ELSE ${vector(0, 1)} END)::vector AS matches
+    FROM chunks WHERE id IN (${missing.id}, ${existing.id})`;
+  assert.deepEqual(rows.find(({ id }) => id === missing.id), {
+    id: missing.id, content: "Needs repair", metadata: { fixture: true, embedding_model: "fixture/rebuild" }, matches: true,
+  });
+  assert.deepEqual(rows.find(({ id }) => id === existing.id), {
+    id: existing.id, content: "Already searchable", metadata: { embedding_model: "fixture/workstation" }, matches: true,
+  });
+});
+
+run("a knowledge rebuild with a stalled provider releases its slot without publishing late vectors", async (t) => {
+  const { db, project, read } = await fixture(t, () => "fixture/rebuild");
+  const { createNodeApp } = await import("../src/api/app.js");
+  const { runDashboardRebuildBatch } = await import("../src/engine/dashboard-rebuild.js");
+  const app = createNodeApp({ includeApiRoutes: false });
+  const enqueue = () => app.request(`${origin}/dashboard/rebuilds`, {
+    method: "POST", headers: { cookie: "authelia_session=fixture-admin", origin, "Content-Type": "application/json" },
+    body: JSON.stringify({ kind: "knowledge", project: project.id }),
+  });
+  const source = await db.source.create({ data: { name: "Slow rebuild input", type: "text", projectId: project.id } });
+  const document = await db.document.create({ data: { title: "Slow rebuild", sourceId: source.id, projectId: project.id, status: "READY" } });
+  const chunk = await db.chunk.create({ data: { documentId: document.id, projectId: project.id, content: "Needs a vector" } });
+  const queued = await enqueue();
+  assert.equal(queued.status, 202);
+  const { id } = await queued.json();
+
+  // Shorten only the worker deadline. Keep the DB lease and HTTP entry points real.
+  const originalSetTimeout = globalThis.setTimeout;
+  t.mock.method(globalThis, "setTimeout", (fn: () => void, ms?: number) => originalSetTimeout(fn, ms === 60_000 ? 15 : ms));
+  const normalFetch = globalThis.fetch;
+  let release!: () => void;
+  const stalled = new Promise<void>(resolve => { release = resolve; });
+  let providerSignal: AbortSignal | undefined;
+  let finishResponse!: () => void;
+  const lateResponse = new Promise<void>(resolve => { finishResponse = resolve; });
+  let holdProvider = true;
+  t.mock.method(globalThis, "fetch", async (url: string | URL, init?: RequestInit) => {
+    if (holdProvider && String(url) === `${inferenceUrl}/v1/inference/embeddings`) {
+      providerSignal = init?.signal ?? undefined;
+      await stalled;
+      const response = await normalFetch(url, init);
+      finishResponse();
+      return response;
+    }
+    return normalFetch(url, init);
+  });
+
+  const batch = runDashboardRebuildBatch();
+  let safeguard: ReturnType<typeof setTimeout> | undefined;
+  try {
+    // Prevent RED from hanging when the old worker has no deadline.
+    assert.equal(await Promise.race([batch.then(() => "settled"), new Promise(resolve => {
+      safeguard = originalSetTimeout(() => resolve("still waiting for provider"), 750);
+    })]), "settled");
+    assert.equal(providerSignal?.aborted, true);
+    const queue = await (await read("queue")).json();
+    const job = queue.jobs.find((item: { id: string }) => item.id === id);
+    assert.deepEqual([job.status, job.processed], ["failed", 0]);
+    assert.match(job.error, /timed out/);
+  } finally {
+    clearTimeout(safeguard);
+    release();
+    await batch;
+  }
+  await lateResponse;
+  const [late] = await db.$queryRaw<{ missing: boolean }[]>`SELECT embedding IS NULL AS missing FROM chunks WHERE id = ${chunk.id}`;
+  assert.equal(late.missing, true);
+  holdProvider = false;
+  const retry = await enqueue();
+  assert.equal(retry.status, 202);
+  const retryId = (await retry.json()).id;
+  await runDashboardRebuildBatch();
+  await runDashboardRebuildBatch();
+  const finalQueue = await (await read("queue")).json();
+  const completed = finalQueue.jobs.find((item: { id: string }) => item.id === retryId);
+  assert.deepEqual([completed.status, completed.processed], ["completed", 1]);
+});
+
+run("shared graph rebuild publishes chunk-derived relations and preserves manual knowledge", async (t) => {
+  const { db, project, other, read } = await fixture(t);
+  let failure: "transport" | "incomplete" | undefined;
+  let omitPreviousRelation = false;
+  let failSecondChunk = false;
+  t.mock.method(OpenAI.Chat.Completions.prototype, "create", async ({ messages }: { messages: { content: string }[] }) => {
+    if (failure === "transport") throw new Error("fixture-private-provider-response");
+    if (failure === "incomplete") return {
+      choices: [{ finish_reason: "length", message: { content: '{"entities":[],"relations":[]}' } }],
+    };
+    if (messages[0].content.includes("Second eligible dashboard chunk")) {
+      if (failSecondChunk) throw new Error("second fixture batch failed");
+      return { choices: [{ finish_reason: "stop", message: { content: '{"entities":[],"relations":[]}' } }] };
+    }
+    assert.match(messages[0].content, /Rebuild Alpha depends on Rebuild Beta/);
+    return { choices: [{ finish_reason: "stop", message: { content: JSON.stringify({
+      entities: [{ name: "Rebuild Alpha", type: "service" }, { name: omitPreviousRelation ? "Rebuild Gamma" : "Rebuild Beta", type: "service" }],
+      relations: omitPreviousRelation
+        ? [{ from: "Rebuild Alpha", fromType: "service", to: "Rebuild Gamma", toType: "service", relation: "references" }]
+        : [{ from: "Rebuild Alpha", fromType: "service", to: "Rebuild Beta", toType: "service", relation: "depends_on" }],
+    }) } }] };
+  });
+  const { createNodeApp } = await import("../src/api/app.js");
+  const app = createNodeApp({ includeApiRoutes: false });
+  const headers = { cookie: "authelia_session=fixture-admin", origin, "Content-Type": "application/json" };
+  const enqueue = () => app.request(`${origin}/dashboard/rebuilds`, { method: "POST", headers, body: JSON.stringify({ kind: "graph", scope: "shared" }) });
+  assert.equal((await enqueue()).status, 503);
+  for (const [key, value] of Object.entries({ EXTRACTION_MODEL: "fixture/graph", OPENAI_BASE_URL: "https://extraction.example.test/v1", OPENAI_API_KEY: "fixture-only-key" })) {
+    const original = process.env[key];
+    process.env[key] = value;
+    t.after(() => { if (original === undefined) delete process.env[key]; else process.env[key] = original; });
+  }
+
+  // A foreign chunk must never reach extraction, even when using All projects.
+  for (const [owner, text] of [[project, "Rebuild Alpha depends on Rebuild Beta. Rebuild Alpha references Rebuild Gamma."], [other, hidden]] as const) {
+    const source = await db.source.create({ data: { name: "Graph source", type: "text", projectId: owner.id, orgId: owner.orgId } });
+    const document = await db.document.create({ data: { title: text, sourceId: source.id, projectId: owner.id, status: "READY" } });
+    await db.chunk.create({ data: { id: `${owner.id}-a`, documentId: document.id, projectId: owner.id, content: text } });
+    if (owner.id === project.id) await db.chunk.create({ data: {
+      id: `${owner.id}-b`, documentId: document.id, projectId: owner.id, content: "Second eligible dashboard chunk",
+    } });
+  }
+  const manual = await db.entity.create({ data: { name: "Manual entry", type: "concept", projectId: project.id, isManual: true } });
+  const queued = await enqueue();
+  assert.equal(queued.status, 202);
+  const { id } = await queued.json();
+  const { runDashboardRebuildBatch } = await import("../src/engine/dashboard-rebuild.js");
+  await runDashboardRebuildBatch();
+  const building = await (await read("graph", { scope: "shared", q: "Rebuild Alpha" })).json();
+  assert.deepEqual(building.edges, [], "a prepared graph batch must not affect the serving graph");
+  await runDashboardRebuildBatch();
+  await runDashboardRebuildBatch();
+  const graph = await (await read("graph", { scope: "shared", q: "Rebuild Alpha" })).json();
+  assert.deepEqual(graph.nodes.map((node: { label: string }) => node.label).sort(), ["Rebuild Alpha", "Rebuild Beta"]);
+  assert.deepEqual(graph.edges.map((edge: { relationType: string }) => edge.relationType), ["depends_on"]);
+  assert.equal((await db.entity.findUniqueOrThrow({ where: { id: manual.id } })).isManual, true);
+  const queue = await (await read("queue", { scope: "shared" })).json();
+  const job = queue.jobs.find((item: { id: string }) => item.id === id);
+  assert.deepEqual([job.status, job.processed], ["completed", 2]);
+
+  // A non-final response can contain valid JSON; it must not replace the serving graph.
+  for (failure of ["transport", "incomplete"] as const) {
+    const retry = await enqueue();
+    assert.equal(retry.status, 202);
+    const failedId = (await retry.json()).id;
+    await runDashboardRebuildBatch();
+    const failedQueue = await (await read("queue", { scope: "shared" })).json();
+    const failed = failedQueue.jobs.find((item: { id: string }) => item.id === failedId);
+    assert.deepEqual([failed.status, failed.processed], ["failed", 0], failure);
+    assert.match(failed.error, /Check the configured extraction provider/);
+    assert.doesNotMatch(JSON.stringify(failed), /fixture-private-provider-response/);
+    const serving = await (await read("graph", { scope: "shared", q: "Rebuild Alpha" })).json();
+    assert.deepEqual(serving.edges, graph.edges, failure);
+  }
+
+  // A successful response can add evidence but omission is not evidence of deletion.
+  failure = undefined;
+  omitPreviousRelation = true;
+  failSecondChunk = true;
+  const lateFailure = await enqueue();
+  assert.equal(lateFailure.status, 202);
+  const lateFailureId = (await lateFailure.json()).id;
+  await runDashboardRebuildBatch();
+  await runDashboardRebuildBatch();
+  const lateFailureQueue = await (await read("queue", { scope: "shared" })).json();
+  assert.equal(lateFailureQueue.jobs.find((item: { id: string }) => item.id === lateFailureId).status, "failed");
+  const unchanged = await (await read("graph", { scope: "shared", q: "Rebuild Alpha" })).json();
+  assert.deepEqual(unchanged, graph, "a later provider failure must not publish earlier claims");
+
+  failSecondChunk = false;
+  const stale = await enqueue();
+  assert.equal(stale.status, 202);
+  const staleId = (await stale.json()).id;
+  await runDashboardRebuildBatch();
+  await runDashboardRebuildBatch();
+  // Changing the last staged input forces a failure during publication, after the first apply.
+  await db.chunk.update({ where: { id: `${project.id}-b` }, data: { content: "Second eligible dashboard chunk changed" } });
+  await runDashboardRebuildBatch();
+  const staleJob = (await (await read("queue", { scope: "shared" })).json()).jobs.find((item: { id: string }) => item.id === staleId);
+  assert.equal(staleJob.status, "failed");
+  assert.match(staleJob.error, /Indexed content changed/);
+  assert.deepEqual(await (await read("graph", { scope: "shared", q: "Rebuild Alpha" })).json(), graph);
+
+  const repair = await enqueue();
+  assert.equal(repair.status, 202);
+  const repairId = (await repair.json()).id;
+  await runDashboardRebuildBatch();
+  await runDashboardRebuildBatch();
+  await runDashboardRebuildBatch();
+  const merged = await (await read("graph", { scope: "shared", q: "Rebuild Alpha" })).json();
+  assert.deepEqual(merged.edges.map((edge: { relationType: string }) => edge.relationType).sort(), ["depends_on", "references"]);
+  assert.deepEqual(await db.$queryRaw`SELECT job_id FROM dashboard_rebuild_items
+    WHERE job_id IN (${id}, ${lateFailureId}, ${staleId}, ${repairId})`, []);
+});
+
 runBrowser("a browser can inspect knowledge, switch projects and refresh activity", { timeout: 30_000 }, async (t) => {
   const { db, project } = await fixture(t);
   const { createNodeApp } = await import("../src/api/app.js");
   await db.entity.create({ data: { name: "<em>Reader</em>", type: "concept", projectId: project.id, isManual: true } });
   let app: ReturnType<typeof createNodeApp>;
-  const server = serve({ hostname: "127.0.0.1", port: 0, fetch: (request) => app.fetch(request) });
+  const server = serve({ hostname: "127.0.0.1", port: 0, fetch: (request) => {
+    // The fixture uses loopback HTTP instead of the production TLS ingress.
+    if (request.headers.get("origin") === new URL(request.url).origin) {
+      request.headers.set("origin", new URL(request.url).origin.replace("http:", "https:"));
+    }
+    return app.fetch(request);
+  } });
   t.after(() => server.close());
   await once(server, "listening");
   const address = server.address();
@@ -348,11 +657,42 @@ runBrowser("a browser can inspect knowledge, switch projects and refresh activit
   await page.context().addCookies([{ name: "authelia_session", value: "fixture-session", url: base }]);
 
   // Exercise the shipped page through the same HTTP routes as a signed-in browser.
-  const response = await page.goto(`${base}/dashboard?project=${project.id}`);
+  const response = await page.goto(`${base}/dashboard`);
   assert.equal(response?.status(), 200);
+  await page.getByText("Read-only", { exact: true }).waitFor();
+  assert.equal(await page.getByRole("button", { name: "Rebuild knowledge" }).count(), 0);
+  // Signing in as an admin changes the actual page, not just the API response.
+  await page.context().addCookies([{ name: "authelia_session", value: "fixture-admin", url: base }]);
+  await page.reload();
+  await page.getByText("Administrator", { exact: true }).waitFor();
   await page.getByRole("heading", { name: "Overview", exact: true }).waitFor();
   await page.getByText("Entities", { exact: true }).waitFor();
+  const selector = page.getByLabel("Project", { exact: true });
+  assert.equal(await selector.locator("option:checked").textContent(), "All projects");
+  // A failed refresh must preserve the last result for this scope, but not for a different project.
+  const overviewRoute = "**/dashboard/data/overview?*";
+  await page.route(overviewRoute, (route) => route.fulfill({ status: 503 }));
+  await page.getByRole("button", { name: "Refresh" }).click();
+  await page.getByText("RetainDB could not load this view. Try Refresh.", { exact: true }).waitFor();
+  assert.equal(await page.getByText("Entities", { exact: true }).count(), 1);
+  assert.match(await page.locator("#updated").textContent() ?? "", /^Updated .+ · Previous result$/);
+  await selector.selectOption(project.id);
+  await page.getByText("RetainDB could not load this view. Try Refresh.", { exact: true }).waitFor();
+  assert.equal(await page.getByText("Entities", { exact: true }).count(), 0);
+  await page.unroute(overviewRoute);
+  await selector.selectOption("");
+  await page.getByText("Entities", { exact: true }).waitFor();
+  await page.route(overviewRoute, (route) => route.fulfill({ status: 401 }));
+  await page.getByRole("button", { name: "Refresh" }).click();
+  await page.getByText("Your session expired. Reload the page to sign in again.", { exact: true }).waitFor();
+  assert.equal(await page.getByText("Entities", { exact: true }).count(), 0);
+  assert.equal(await page.locator("#updated").textContent(), "");
+  await page.unroute(overviewRoute);
   const nav = page.getByRole("navigation", { name: "Dashboard views" });
+  await nav.getByRole("link", { name: "Knowledge graph" }).click();
+  await page.getByRole("button", { name: "<em>Reader</em>", exact: true }).click();
+  await page.getByRole("status", { name: "Selected item" }).filter({ hasText: `Project: ${project.name}` }).waitFor();
+  await selector.selectOption(project.id);
   await nav.getByRole("link", { name: "Knowledge graph" }).click();
   await page.getByRole("button", { name: "<em>Reader</em>", exact: true }).click();
   await page.getByRole("status", { name: "Selected item" }).filter({ hasText: "<em>Reader</em>" }).waitFor();
@@ -388,10 +728,27 @@ runBrowser("a browser can inspect knowledge, switch projects and refresh activit
   await page.getByRole("button", { name: "Blueprint · chunk 1", exact: true }).waitFor();
 
   await nav.getByRole("link", { name: "Queue" }).click();
-  await page.getByText("No jobs for this project.").waitFor();
-  await db.syncJob.create({ data: { sourceId: source.id, status: "RUNNING", documentsTotal: 3, documentsIndexed: 1 } });
+  await page.getByText("No jobs in this view.").waitFor();
+  await nav.getByRole("link", { name: "Overview" }).click();
+  page.once("dialog", (dialog) => dialog.dismiss());
+  await page.getByRole("button", { name: "Rebuild knowledge" }).click({ timeout: 2500 });
+  await nav.getByRole("link", { name: "Queue" }).click();
+  await page.getByText("No jobs in this view.").waitFor();
+  await nav.getByRole("link", { name: "Overview" }).click();
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Rebuild knowledge" }).click({ timeout: 2500 });
+  await page.getByRole("row").filter({ hasText: "Knowledge rebuild" }).getByText("queued", { exact: true }).waitFor();
+  const { runDashboardRebuildBatch } = await import("../src/engine/dashboard-rebuild.js");
+  await runDashboardRebuildBatch();
   await page.getByRole("button", { name: "Refresh" }).click();
-  await page.getByRole("cell", { name: /1 \/ 3 documents/ }).waitFor();
+  await page.getByRole("row").filter({ hasText: "Knowledge rebuild" }).getByText("completed", { exact: true }).waitFor();
+  const queuedSync = await db.syncJob.create({ data: { sourceId: source.id, status: "RUNNING", documentsTotal: 3, documentsIndexed: 1 } });
+  await selector.selectOption("");
+  await page.getByRole("button", { name: "Refresh" }).click();
+  // Mobile adds the column label to the accessible cell name.
+  const sync = page.getByRole("row").filter({ hasText: queuedSync.id });
+  await sync.getByText(project.name, { exact: true }).waitFor({ timeout: 3500 });
+  await sync.getByText("1 / 3 documents", { exact: true }).waitFor({ timeout: 3500 });
   await page.request.get(`${base}/v1/browser-fixture`);
   await nav.getByRole("link", { name: "Logs" }).click();
   await page.getByRole("cell", { name: "Unmatched API route" }).first().waitFor();
@@ -409,7 +766,6 @@ runBrowser("a browser can inspect knowledge, switch projects and refresh activit
   t.after(async () => { await db.project.delete({ where: { id: second.id } }); });
   await nav.getByRole("link", { name: "Knowledge graph" }).click();
   await page.getByRole("button", { name: "Refresh" }).click();
-  const selector = page.getByLabel("Project", { exact: true });
   await selector.selectOption(second.id, { timeout: 2500 });
   await page.getByText("No visible entities in this project.").waitFor();
   assert.equal(await page.getByRole("button", { name: "<em>Reader</em>", exact: true }).count(), 0);

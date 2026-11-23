@@ -1,5 +1,11 @@
 import { Prisma } from "@prisma/client";
 
+/** Keep legacy unlabelled rows readable, but never compare a labelled vector to another or unknown model. */
+export function compatibleEmbeddingModel(metadata: Prisma.Sql, queryModel: string | null) {
+  const storedModel = Prisma.sql`(${metadata}->>'embedding_model')`;
+  return Prisma.sql`(${storedModel} IS NULL OR ${storedModel} = ${queryModel}::text)`;
+}
+
 /**
  * Builds a filtered vector search whose ranking is exact for the scope it filters to.
  *

@@ -11,7 +11,10 @@ export type OperationType =
   | "query"
   | "get"
   | "upload"
-  | "createSource";
+  | "createSource"
+  | "list_connectors" | "list_sources" | "get_source"
+  | "create_source" | "update_source" | "delete_source" | "sync_source"
+  | "company_brain" | "ask_brain" | "feed_agent";
 
 export interface TimeoutBudgets {
   searchMs: number;

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "crypto";
 import PQueue from "p-queue";
-import { prisma } from "../db/index.js";
+import { prisma, type Transaction } from "../db/index.js";
 import { chunkText, type Chunk } from "./chunker.js";
 import { embedBatch, type Embedder } from "./embeddings.js";
 import { extractEntities } from "./extractor.js";
@@ -71,7 +71,8 @@ type EmbeddedChunk = {
   model: string | null;
 };
 
-export async function ingestDocument(input: IngestDocumentInput) {
+export async function ingestDocument(input: IngestDocumentInput, transaction?: Transaction) {
+  const db = transaction ?? prisma;
   const {
     sourceId,
     projectId,
@@ -89,7 +90,7 @@ export async function ingestDocument(input: IngestDocumentInput) {
     sourceVersionId: explicitSourceVersionId,
   } = input;
 
-  const source = await prisma.source.findUnique({
+  const source = await db.source.findUnique({
     where: { id: sourceId },
     select: { id: true, activeVersionId: true, status: true },
   });
@@ -98,7 +99,7 @@ export async function ingestDocument(input: IngestDocumentInput) {
   }
   const sourceVersionId =
     explicitSourceVersionId === undefined
-      ? await resolveSourceVersionForWrite(sourceId)
+      ? await resolveSourceVersionForWrite(sourceId, transaction)
       : explicitSourceVersionId;
 
   const contentHash = createHash("sha256").update(content).digest("hex");
@@ -127,14 +128,14 @@ export async function ingestDocument(input: IngestDocumentInput) {
   };
 
   const existingDoc = sourceVersionId
-    ? await prisma.document.findFirst({
+    ? await db.document.findFirst({
         where: {
           sourceVersionId,
           externalId,
         },
         select: { id: true },
       })
-    : await prisma.document.findFirst({
+    : await db.document.findFirst({
         where: {
           sourceId,
           externalId,
@@ -144,7 +145,7 @@ export async function ingestDocument(input: IngestDocumentInput) {
       });
 
   const doc = existingDoc
-    ? await prisma.document.update({
+    ? await db.document.update({
         where: { id: existingDoc.id },
         data: {
           title,
@@ -162,7 +163,7 @@ export async function ingestDocument(input: IngestDocumentInput) {
           sourceVersionId,
         },
       })
-    : await prisma.document.create({
+    : await db.document.create({
         data: {
           sourceId,
           sourceVersionId,
@@ -185,7 +186,7 @@ export async function ingestDocument(input: IngestDocumentInput) {
   let readyDoc: typeof doc;
 
   try {
-    await prisma.chunk.deleteMany({ where: { documentId: doc.id } });
+    await db.chunk.deleteMany({ where: { documentId: doc.id } });
 
     const embeddings = await embedSearchableChunks(chunking.chunks, input.embedTexts);
     const embeddedByTempId = new Map(embeddings.map((entry) => [entry.tempId, entry]));
@@ -197,6 +198,7 @@ export async function ingestDocument(input: IngestDocumentInput) {
     }
 
     inserted = await insertDocumentChunks(chunking.chunks, {
+      db,
       documentId: doc.id,
       projectId,
       title,
@@ -205,11 +207,12 @@ export async function ingestDocument(input: IngestDocumentInput) {
       embeddingModel: input.embeddingModel,
     });
 
-    readyDoc = await prisma.document.update({
+    readyDoc = await db.document.update({
       where: { id: doc.id },
       data: { status: "READY", indexedAt: new Date(), parseError: null },
     });
   } catch (error) {
+    if (transaction) throw error;
     try {
       await prisma.chunk.deleteMany({ where: { documentId: doc.id } });
       await prisma.document.update({
@@ -223,7 +226,7 @@ export async function ingestDocument(input: IngestDocumentInput) {
     throw error;
   }
 
-  if (ENABLE_AUTO_EXTRACTION && !input.skipEntityExtraction) {
+  if (!transaction && ENABLE_AUTO_EXTRACTION && !input.skipEntityExtraction) {
     const searchableChunks = chunking.chunks
       .filter((chunk) => chunk.searchable && chunk.content.length > 200)
       .slice(0, 5);
@@ -237,7 +240,7 @@ export async function ingestDocument(input: IngestDocumentInput) {
     }
   }
 
-  if (!input.skipSourceCountUpdate) await updateSourceCounts(sourceId, sourceVersionId);
+  if (!input.skipSourceCountUpdate) await updateSourceCounts(sourceId, sourceVersionId, db);
 
   return {
     ...readyDoc,
@@ -264,6 +267,7 @@ interface ChunkInsertProgress extends InsertedChunks {
 
 /** Every value a chunk row needs that does not change from chunk to chunk. */
 interface ChunkInsertTarget {
+  db: Pick<Transaction, "$executeRaw">;
   documentId: string;
   projectId: string;
   title: string;
@@ -328,7 +332,7 @@ async function writeChunkRow(chunk: Chunk, target: ChunkInsertTarget): Promise<v
   const tokens = Math.ceil(chunk.content.length / 4);
   const searchContent = buildSearchContent(target.title, chunk.headingPath, chunk.sectionPath, chunk.content);
   const contentHash = createHash("sha256").update(chunk.content).digest("hex");
-  await prisma.$executeRaw`
+  await target.db.$executeRaw`
     INSERT INTO "chunks" (
       id, "documentId", "projectId", content, "chunkType", "chunkIndex", metadata,
       "tokenCount", tokens, "searchContent", "contentHash", "parentChunkId", "sectionPath",
@@ -374,12 +378,12 @@ function buildSearchContent(title: string, headingPath: string | undefined, sect
   return parts.slice(0, SEARCH_CONTENT_LIMIT);
 }
 
-async function updateSourceCounts(sourceId: string, sourceVersionId?: string | null) {
+async function updateSourceCounts(sourceId: string, sourceVersionId?: string | null, db: Transaction = prisma) {
   if (sourceVersionId) {
-    await refreshSourceVersionCounts(sourceVersionId);
+    await refreshSourceVersionCounts(sourceVersionId, db);
   }
 
-  const source = await prisma.source.findUnique({
+  const source = await db.source.findUnique({
     where: { id: sourceId },
     select: { activeVersionId: true },
   });
@@ -390,14 +394,14 @@ async function updateSourceCounts(sourceId: string, sourceVersionId?: string | n
   }
 
   const [docCount, chunkCount, errorCount] = await Promise.all([
-    prisma.document.count({
+    db.document.count({
       where: {
         sourceId,
         deletedAt: null,
         ...(source.activeVersionId ? { sourceVersionId: source.activeVersionId } : {}),
       },
     }),
-    prisma.chunk.count({
+    db.chunk.count({
       where: {
         document: {
           sourceId,
@@ -406,7 +410,7 @@ async function updateSourceCounts(sourceId: string, sourceVersionId?: string | n
         },
       },
     }),
-    prisma.document.count({
+    db.document.count({
       where: {
         sourceId,
         deletedAt: null,
@@ -416,7 +420,7 @@ async function updateSourceCounts(sourceId: string, sourceVersionId?: string | n
     }),
   ]);
 
-  await prisma.source.update({
+  await db.source.update({
     where: { id: sourceId },
     data: {
       documentCount: docCount,

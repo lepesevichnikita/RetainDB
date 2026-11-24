@@ -1,0 +1,62 @@
+diff --git a/dist/server.js b/dist/server.js
+--- a/dist/server.js
++++ b/dist/server.js
+@@ -1618,3 +1618,4 @@
+       source: result?.source ? String(result.source) : result?.chunk ? "memory" : null,
+       document: result?.document ? String(result.document) : result?.chunk?.id ? String(result.chunk.id) : null,
++      ...(typeof result?.project === "string" ? { project: result.project } : {}),
+       metadata: result?.metadata && typeof result.metadata === "object" && !Array.isArray(result.metadata) ? result.metadata : candidate?.metadata && typeof candidate.metadata === "object" && !Array.isArray(candidate.metadata) ? candidate.metadata : null,
+@@ -6189,18 +6190,23 @@
+ server.tool(
+   "search",
+-  "Primary retrieval alias. Call this whenever the user asks to find or recall context: use `query` for semantic retrieval, `id` for exact memory fetch, or both for hybrid recall.",
++  "Search RetainDB: use query for semantic search, id for exact memory recall, search_all for shared knowledge, or tags to require all exact knowledge labels. Pass project to narrow a tagged search.",
+   {
+     project: z2.string().optional().describe("Project name or slug"),
+     query: z2.string().optional().describe("Semantic retrieval query"),
+     id: z2.string().optional().describe("Exact memory id to fetch"),
+     top_k: z2.number().optional().default(10),
+     include_memories: z2.boolean().optional().default(false),
+     include_graph: z2.boolean().optional().default(false),
+     user_id: z2.string().optional(),
+-    session_id: z2.string().optional()
++    session_id: z2.string().optional(),
++    search_all: z2.boolean().optional().describe("Search shared knowledge across projects; omit project"),
++    tags: z2.array(z2.string().trim().min(1).max(512)).max(32).optional().describe("Require all these exact knowledge tags; omit project to search across projects")
+   },
+-  async ({ project, query, id, top_k, include_memories, include_graph, user_id, session_id }) => {
++  async ({ project, query, id, top_k, include_memories, include_graph, user_id, session_id, search_all, tags }) => {
+     try {
++      if (search_all || tags?.length) {
++        return await searchSharedKnowledge({ project, query, id, top_k, include_memories, include_graph, search_all, tags }).catch(error => sharedKnowledgeError(error.message, error.code ?? "search_failed"));
++      }
+       if (!id && !query) {
+         return toTextResult(buildMcpSearchError("Provide query, id, or both."));
+       }
+@@ -6248,4 +6254,26 @@
+   }
+ );
++function sharedKnowledgeError(message, code) {
++  return { ...primaryToolError(message, code), isError: true };
++}
++async function searchSharedKnowledge({ project, query, id, top_k, include_memories, include_graph, search_all, tags }) {
++  if (!query?.trim() || id || include_memories || include_graph || (search_all && project !== undefined)) {
++    return sharedKnowledgeError("Shared or tagged search requires a query and cannot include memory lookup or graph expansion. Omit project when search_all is set.", "KNOWLEDGE_SEARCH_ONLY");
++  }
++  const response = await whisper.request("/v1/context/query", {
++    method: "POST",
++    body: { project, query, top_k, tags, include_memories: false }
++  });
++  const applied = response.meta?.applied_tags;
++  if (tags?.length && (!Array.isArray(applied) || applied.length !== tags.length || tags.some((tag, index) => applied[index] !== tag))) {
++    return sharedKnowledgeError("The RetainDB backend did not apply the requested tags.", "TAG_FILTER_UNSUPPORTED");
++  }
++  const degradedReason = response.meta?.degraded?.reasons?.join(", ") || (response.meta?.timing?.embedding_unavailable ? "Embedding unavailable" : null);
++  return toTextResult({
++    ...buildMcpSearchPayload({ mode: "semantic", query, context: response.context, results: response.results, degradedMode: Boolean(degradedReason), degradedReason }),
++    project_scope: response.meta?.project_scope,
++    applied_tags: applied
++  });
++}
+ server.tool(
+   "search_code",

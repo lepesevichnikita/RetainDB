@@ -2,11 +2,23 @@ FROM node:20 AS base
 RUN npm install -g pnpm@9.15.0
 WORKDIR /app
 
+FROM base AS mcp-deps
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY packages/mcp/package.json ./packages/mcp/package.json
+COPY packages/sdk/package.json ./packages/sdk/package.json
+COPY packages/mcp/patches/ ./packages/mcp/patches/
+RUN pnpm install --frozen-lockfile --filter @retaindb/mcp... --ignore-scripts \
+    && cp packages/mcp/node_modules/@retaindb/mcp-server/dist/server.js /app/server.js
+
+FROM busybox:1.36 AS mcp-client
+COPY --from=mcp-deps /app/server.js /server.js
+
 # Install dependencies
 FROM base AS deps
 # Build tools needed for native modules (@xenova/transformers / onnxruntime)
 RUN apt-get update && apt-get install -y build-essential python3 && rm -rf /var/lib/apt/lists/*
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY packages/mcp/patches/ ./packages/mcp/patches/
 COPY packages/server/package.json ./packages/server/package.json
 RUN pnpm install --frozen-lockfile --filter @retaindb/server...
 

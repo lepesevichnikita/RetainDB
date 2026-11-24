@@ -4,6 +4,11 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+patchedDependencies:
+  '@retaindb/mcp-server@2.17.0':
+    hash: zat4zdfarx2knkztmopld3hh24
+    path: packages/mcp/patches/retaindb-mcp-server@2.17.0.patch
+
 importers:
 
   .:
@@ -78,6 +83,9 @@ importers:
         specifier: ^3.24.0
         version: 3.25.76
     devDependencies:
+      '@retaindb/mcp-server':
+        specifier: 2.17.0
+        version: 2.17.0(patch_hash=zat4zdfarx2knkztmopld3hh24)
       '@types/node':
         specifier: ^22.0.0
         version: 22.19.15
@@ -498,6 +506,11 @@ packages:
 
   '@protobufjs/utf8@1.1.0':
     resolution: {integrity: sha512-Vvn3zZrhQZkkBE8LSuW3em98c0FwgO4nxzv6OdSxPKJIEKY2bGbHn+mhGIPerzI4twdxaP8/0+06HBpwf345Lw==}
+
+  '@retaindb/mcp-server@2.17.0':
+    resolution: {integrity: sha512-L/UXdRCAynol0oYiF6pgYhVZcxe2QsBTnWgdZeRZtN9mU5VmpIIc803aqdbUbu1EhVg0SFo621otDUomq42geg==}
+    engines: {node: '>=18.0.0'}
+    hasBin: true
 
   '@rollup/rollup-android-arm-eabi@4.60.1':
     resolution: {integrity: sha512-d6FinEBLdIiK+1uACUttJKfgZREXrF0Qc2SmLII7W2AD8FfiZ9Wjd+rD/iRuf5s5dWrr1GgwXCvPqOuDquOowA==}
@@ -2079,6 +2092,14 @@ snapshots:
   '@protobufjs/pool@1.1.0': {}
 
   '@protobufjs/utf8@1.1.0': {}
+
+  '@retaindb/mcp-server@2.17.0(patch_hash=zat4zdfarx2knkztmopld3hh24)':
+    dependencies:
+      '@modelcontextprotocol/sdk': 1.29.0(zod@3.25.76)
+      zod: 3.25.76
+    transitivePeerDependencies:
+      - '@cfworker/json-schema'
+      - supports-color
 
   '@rollup/rollup-android-arm-eabi@4.60.1':
     optional: true

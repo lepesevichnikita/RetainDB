@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 
 const fixture = pathToFileURL(fileURLToPath(new URL("./fixtures/embedding-worker.ts", import.meta.url))).toString();
 process.env.RETAINDB_EMBEDDING_WORKER_ENTRY = fixture;
@@ -79,4 +81,21 @@ test("reranking runs in the same worker instead of blocking the API process", as
   const scores = await scoreInProcess("query", ["short", "a much longer passage"]);
   assert.equal(scores.length, 2);
   assert.ok(Math.abs(scores[1] - scores[0]) > 0);
+});
+
+test("a caller that awaits only the embedding stays alive until the answer arrives", async () => {
+  // The worker is unref'd while idle so a CLI can exit; it has to be ref'd while
+  // a request is pending, or the process exits and the pending test is cancelled
+  // with "the event loop has already resolved".
+  const moduleUrl = pathToFileURL(fileURLToPath(new URL("../src/engine/embedding-process.ts", import.meta.url))).toString();
+  const script = `import { requestEmbeddings } from ${JSON.stringify(moduleUrl)};
+const vectors = await requestEmbeddings(["keepalive-text"]);
+console.log(JSON.stringify(vectors));`;
+  const { stdout } = await promisify(execFile)(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
+    cwd: fileURLToPath(new URL("..", import.meta.url)),
+    env: { ...process.env, RETAINDB_EMBEDDING_WORKER_ENTRY: fixture },
+    timeout: 30_000,
+  });
+
+  assert.deepEqual(JSON.parse(stdout.trim().split("\n").pop()!), [[14, 1]]);
 });

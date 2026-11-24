@@ -70,6 +70,12 @@ function settle(request: PendingRequest): void {
   pending.delete(request.id);
   clearTimeout(request.timer);
   if (request.signal && request.onAbort) request.signal.removeEventListener("abort", request.onAbort);
+  // An idle worker must not keep a CLI or a test process alive, but a pending
+  // request must: otherwise the process can exit before the answer arrives.
+  if (!pending.size) {
+    worker?.unref();
+    worker?.channel?.unref();
+  }
 }
 
 function rejectAll(error: Error): void {
@@ -93,7 +99,6 @@ function startWorker(): ChildProcess {
     env: { ...process.env, RETAINDB_EMBEDDING_WORKER: "1", TSX_DISABLE_CACHE: "1" },
   });
   worker = child;
-  child.unref();
   child.on("message", (message: unknown) => onMessage(child, message));
   child.on("error", (error) => failWorker(child, error));
   child.on("close", (code, signal) => {
@@ -101,7 +106,6 @@ function startWorker(): ChildProcess {
     worker = undefined;
     failWorker(child, new Error(`Embedding process exited before completing the request (code ${code}, signal ${signal})`));
   });
-  child.channel?.unref();
   return child;
 }
 
@@ -182,6 +186,8 @@ function submit(message: Record<string, unknown>, expected: number, expectsScore
     return Promise.reject(error);
   }
   if (state !== "ready") state = "warming";
+  child.ref();
+  child.channel?.ref();
   const id = randomUUID();
   return new Promise((resolve, reject) => {
     const request: PendingRequest = {
@@ -255,6 +261,8 @@ export async function stopEmbeddingWorker(): Promise<void> {
   rejectAll(new Error("Embedding process stopped"));
   state = "cold";
   if (!child) return;
+  child.ref();
+  child.channel?.ref();
   if (child.exitCode !== null || child.signalCode !== null) return;
   await new Promise<void>((resolveClose) => {
     child.once("close", () => resolveClose());

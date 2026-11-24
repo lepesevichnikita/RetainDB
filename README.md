@@ -198,6 +198,10 @@ deadline (120 seconds by default; `NATIVE_CAPTURE_EMBEDDING_TIMEOUT_MS` can
 lower it). Retry delays start when the failure is recorded. Receipt and
 document writes remain in the Server under exclusive database row ownership.
 
+Set `RERANK_MODE=off` on the server to skip optional model-based reranking,
+even for clients that request it. Search keeps its existing vector and lexical
+ranking, including local embeddings when `EMBEDDING_MODE=local`.
+
 The vector-index migration replaces the initially empty IVFFlat indexes
 with HNSW indexes. HNSW does not require training data, so retrieval can
 work immediately after the first import without rebuilding an index.

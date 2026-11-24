@@ -273,6 +273,27 @@ test("a rerank-degraded answer says so and is not cached", { timeout: 180_000 },
   t.diagnostic(`complete answer twice: cache_hit ${complete.body.meta.cache_hit} then ${cached.body.meta.cache_hit}`);
 });
 
+test("server-off mode serves ranked search without consulting an unavailable reranker", async () => {
+  const { project, scope } = await fixture();
+  const published = await publish({ scopeId: scope.id, files: TREE });
+  assert.equal(published.code, "PUBLISHED");
+  const previous = process.env.RERANK_MODE;
+  process.env.RERANK_MODE = "off";
+  try {
+    // The default client request must behave like explicitly skipping reranking.
+    const baseline = await ask(project.id, { rerank: false, use_cache: false });
+    const result = await ask(project.id);
+    assert.equal(result.status, 200);
+    assert.ok(result.body.results.length > 3);
+    assert.deepEqual(result.body.meta.degraded, { reranked: true, reasons: [] });
+    assert.deepEqual(result.body.results, baseline.body.results);
+    assert.equal((await ask(project.id, { rerank: false })).body.meta.cache_hit, true);
+  } finally {
+    if (previous === undefined) delete process.env.RERANK_MODE;
+    else process.env.RERANK_MODE = previous;
+  }
+});
+
 after(async () => {
   const { db } = await import(dbPath);
   const client = db as any;

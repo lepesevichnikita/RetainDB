@@ -204,7 +204,7 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
     useVector = true,
     vectorWeight = 0.7,
     bm25Weight = 0.3,
-    rerank = true,
+    rerank: requestedRerank = true,
     rerankTopK,
     includeMemories = false,
     userId,
@@ -222,6 +222,7 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
     retrievalProfile = defaultRetrievalProfile,
   } = opts;
 
+  const rerank = requestedRerank && process.env.RERANK_MODE !== "off";
   const projectId = typeof scope === "string" ? scope : scope.projectId;
   const orgId = typeof scope === "string" ? undefined : scope.orgId;
   const hasTags = typeof scope !== "string" && Boolean(scope.tags?.length);

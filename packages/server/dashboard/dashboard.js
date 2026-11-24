@@ -214,9 +214,15 @@ function coverage(embedded, chunks) {
   return section;
 }
 
-function overview({ documents, chunks, sources, embedded, memories, entities, models }) {
+function countsTimestamp(value) {
+  const note = element('p', 'Counts as of ', 'muted');
+  note.append(timestamp(value));
+  return note;
+}
+
+function overview({ documents, chunks, sources, embedded, memories, entities, models, countsAsOf }) {
   const group = document.createDocumentFragment();
-  group.append(stats([['Indexed documents', documents], ['Searchable chunks', chunks], ['Indexed sources', sources], ['Memories', memories], ['Entities', entities]]), coverage(embedded, chunks));
+  group.append(stats([['Indexed documents', documents], ['Searchable chunks', chunks], ['Indexed sources', sources], ['Memories', memories], ['Entities', entities]]), countsTimestamp(countsAsOf), coverage(embedded, chunks));
   if (models.length) group.append(table('Chunk embeddings by recorded model', ['Model', 'Vectors'], models.map(({ model, count }) => [model ?? 'Unlabelled', number.format(count)])));
   return group;
 }
@@ -237,12 +243,12 @@ function vectors(data) {
   const controls = element('div', undefined, 'model-control');
   const select = element('select');
   select.id = 'vector-model';
-  select.append(...data.models.map(({ model, count }) => new Option(`${model} (${number.format(count)})`, model, false, model === data.model)));
+  select.append(...data.models.map(({ model, count }) => new Option(count === null ? model : `${model} (${number.format(count)})`, model, false, model === data.model)));
   const label = element('label', 'Embedding model');
   label.htmlFor = select.id;
   select.addEventListener('change', () => change({ model: select.value }).then(() => byId('vector-model')?.focus()));
   controls.append(label, select);
-  group.append(controls, vectorView(data));
+  group.append(controls, countsTimestamp(data.countsAsOf), vectorView(data));
   return group;
 }
 

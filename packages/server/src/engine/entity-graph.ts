@@ -304,6 +304,17 @@ export function visibleKnowledgeChunks(projectId: string | undefined, orgId: str
   return visibleGraphChunks({ projectId, orgId });
 }
 
+export function recentVisibleKnowledgeChunks(projectId: string | undefined, orgId: string) {
+  return recentGraphChunks({ projectId, orgId });
+}
+
+export function visibleKnowledgeStatistics(projectId: string | undefined, orgId: string) {
+  const scope = graphProject(Prisma.sql`c."projectId"`, { projectId, orgId });
+  return Prisma.sql`FROM dashboard_chunk_statistics c JOIN (${graphDocumentJoins}) ON ${publishedGraphDocument}
+    WHERE ${scope} ${graphSourceVisibility(orgId)} AND c."sourceId" = d."sourceId"
+      AND c."sourceVersionId" IS NOT DISTINCT FROM d."sourceVersionId"`;
+}
+
 export async function countVisibleGraphEntities(db: GraphReader, projectId: string | undefined, orgId: string) {
   const scope = projectEntities({ projectId, orgId }, visibleKnowledgeChunks(projectId, orgId));
   const [row] = await db.$queryRaw<{ count: number }[]>`SELECT count(*)::int AS count ${scope}`;

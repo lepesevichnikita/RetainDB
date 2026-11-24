@@ -704,8 +704,20 @@ the rebuild's changes become visible. No rebuild runs just because you open or
 refresh the dashboard, or deploy an update.
 
 Use **Overview** to see indexed documents, searchable chunks, sources, active
-memories, visible entities, and how many chunks have a stored embedding. Use
-**Knowledge graph** to browse stored entities and one hop of relations, or search
+memories, visible entities, and how many chunks have a stored embedding.
+Chunk, document, source and embedding statistics (including the Vector map's
+model list) are refreshed in the background about every five minutes while the
+dashboard is enabled. **Counts as of** shows when the last successful statistics
+refresh took its snapshot. If a refresh fails, the last counts and timestamp
+remain visible until the next successful refresh. The Refresh button rereads
+the latest counts; it does not scan the corpus or rebuild embeddings.
+Publication and authorization are checked live, so withdrawn documents do not
+wait for the next count refresh.
+Memory and entity counts and the plotted vector sample are read live.
+You can open a model as soon as it has visible vectors; its count may not be
+available until the next statistics refresh.
+
+Use **Knowledge graph** to browse stored entities and one hop of relations, or search
 for an entity by name. **Vector map** plots up to 200 recent, nonzero chunk
 embeddings from one recorded model. The axes show cosine similarity to two
 stored examples, not full-vector distance between points. Unlabelled vectors

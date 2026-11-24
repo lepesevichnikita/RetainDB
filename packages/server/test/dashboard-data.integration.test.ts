@@ -18,6 +18,11 @@ const hidden = "not-visible-in-the-dashboard";
 const coordinates = (x: number, y: number) => [x, y, ...Array<number>(1022).fill(0)];
 const vector = (x: number, y: number) => `[${coordinates(x, y).join(",")}]`;
 
+async function refreshStatistics() {
+  const { refreshDashboardStatistics } = await import("../src/engine/dashboard-data.js");
+  await refreshDashboardStatistics();
+}
+
 if (databaseUrl) Object.assign(process.env, {
   DATABASE_URL: databaseUrl, RETAINDB_API_KEY: apiKey, ENCRYPTION_KEY: randomUUID(), EMBEDDING_MODE: "remote",
   EMBEDDING_INFERENCE_BASE_URL: inferenceUrl, REMOTE_INFERENCE_REQUIRED: "true",
@@ -82,6 +87,7 @@ run("the signed-in dashboard shares knowledge across projects without crossing o
     await db.entityRelation.create({ data: { projectId: project.id, fromEntityId: entities[0].id, toEntityId: target.id, relationType: "references", isManual: true } });
   }
 
+  await refreshStatistics();
   const shared = { scope: "shared" };
   const overview = await read("overview", shared);
   assert.equal(overview.status, 200);
@@ -97,6 +103,64 @@ run("the signed-in dashboard shares knowledge across projects without crossing o
   const filtered = await (await read("graph", { project: project.id, q: names[0] })).json();
   assert.deepEqual(filtered.nodes.map((node: { label: string }) => node.label), [names[0]]);
   assert.deepEqual(filtered.edges, []);
+});
+
+run("dashboard counts use a snapshot while vector samples and publication checks stay live", async (t) => {
+  const { db, project, read } = await fixture(t);
+  const source = await db.source.create({ data: { projectId: project.id, name: "Snapshot fixture", type: "text" } });
+  const document = await db.document.create({ data: { sourceId: source.id, projectId: project.id, title: "Visible snapshot", status: "READY" } });
+  const model = "fixture/snapshot-model";
+  const first = await db.chunk.create({ data: { documentId: document.id, projectId: project.id, content: "First point", metadata: { embedding_model: model } } });
+  await db.$executeRaw`UPDATE chunks SET embedding = ${vector(1, 0)}::vector WHERE id = ${first.id}`;
+  await refreshStatistics();
+
+  // New chunks are immediately eligible for the plot but counts are served from the last refresh.
+  const overview = await read("overview");
+  assert.equal(overview.status, 200);
+  const initial = await overview.json();
+  assert.equal(initial.chunks, 1);
+  assert.ok(Number.isFinite(Date.parse(initial.countsAsOf)), "show when the last successful snapshot was taken");
+  const later = await db.chunk.create({ data: { documentId: document.id, projectId: project.id, chunkIndex: 1, content: "New point", metadata: { embedding_model: model } } });
+  await db.$executeRaw`UPDATE chunks SET embedding = ${vector(0, 1)}::vector WHERE id = ${later.id}`;
+  assert.equal((await (await read("overview")).json()).chunks, 1, "the dashboard must not run a live corpus count");
+  const map = await (await read("vectors", { project: project.id, model })).json();
+  assert.deepEqual(map.models, [{ model, count: 1 }]);
+  assert.equal(map.countsAsOf, initial.countsAsOf);
+  assert.deepEqual(new Set(map.points.map(({ id }: { id: string }) => id)), new Set([first.id, later.id]));
+  await refreshStatistics();
+  const refreshed = await (await read("overview")).json();
+  assert.equal(refreshed.chunks, 2);
+  assert.ok(Date.parse(refreshed.countsAsOf) > Date.parse(initial.countsAsOf));
+
+  // Retiring the source must hide old counts and the model without waiting for a refresh.
+  await db.source.update({ where: { id: source.id }, data: { deletedAt: new Date() } });
+  const withdrawn = await (await read("overview")).json();
+  assert.deepEqual([withdrawn.documents, withdrawn.sources, withdrawn.chunks, withdrawn.embedded, withdrawn.models], [0, 0, 0, 0, []]);
+  assert.equal((await read("vectors", { project: project.id, model })).status, 404);
+});
+
+run("the Vector map can open a new model before the dashboard counts refresh", async (t) => {
+  const { db, project, read } = await fixture(t);
+  const source = await db.source.create({ data: { projectId: project.id, name: "Live model fixture", type: "text" } });
+  const document = await db.document.create({ data: { sourceId: source.id, projectId: project.id, title: "Live model", status: "READY" } });
+  const chunk = await db.chunk.create({ data: { documentId: document.id, projectId: project.id, content: "Vector changes model", metadata: { embedding_model: "fixture/old-model" } } });
+  await db.$executeRaw`UPDATE chunks SET embedding = ${vector(1, 0)}::vector WHERE id = ${chunk.id}`;
+  await refreshStatistics();
+
+  // After a model change neither the bookmarked route nor the default depends on stale membership.
+  const model = "fixture/new-model";
+  await db.chunk.update({ where: { id: chunk.id }, data: { metadata: { embedding_model: model } } });
+  for (const requested of [model, undefined]) {
+    const args: Record<string, string> = { project: project.id };
+    if (requested) args.model = requested;
+    const response = await read("vectors", args);
+    assert.equal(response.status, 200);
+    const map = await response.json();
+    assert.equal(map.model, model);
+    assert.deepEqual(map.models.find((item: { model: string }) => item.model === model), { model, count: null });
+    assert.deepEqual(map.points.map((point: { id: string }) => point.id), [chunk.id]);
+  }
+  assert.equal((await read("vectors", { project: project.id, model: "fixture/old-model" })).status, 404);
 });
 
 run("the shared graph opens on recent published knowledge, not the highest chunk IDs", async (t) => {
@@ -204,7 +268,9 @@ run("the project views read live graph provenance and separate recorded vector m
     select: { id: true },
   });
 
-  const overview = await (await read("overview")).json();
+  await refreshStatistics();
+  const { countsAsOf, ...overview } = await (await read("overview")).json();
+  assert.ok(Number.isFinite(Date.parse(countsAsOf)));
   assert.deepEqual(overview, { documents: 5, chunks: 5, sources: 1, embedded: 4, memories: 1, entities: 2, models: [
     { model: "e5", count: 2 }, { model: "different", count: 1 }, { model: null, count: 1 },
   ] });
@@ -239,6 +305,7 @@ run("normal learn plots vectors under the inference model, not the document meta
     assert.equal(response.status, 200, await response.clone().text());
     assert.equal((await response.json()).status, "completed");
   }
+  await refreshStatistics();
   const overview = await (await read("overview")).json();
   assert.equal(overview.embedded, 2);
   assert.deepEqual(overview.models, [{ model: "fixture/document-model", count: 1 }, { model: null, count: 1 }]);
@@ -261,6 +328,7 @@ run("client-supplied embeddings retain their model in the dashboard after batch 
   const batch = await response.json();
   assert.equal(batch.failed, 0, JSON.stringify(batch.items));
   assert.equal(batch.items[0]?.status, "completed");
+  await refreshStatistics();
   const overview = await (await read("overview")).json();
   assert.equal(overview.embedded, 1);
   assert.deepEqual(overview.models, [{ model: "fixture/client-model", count: 1 }]);
@@ -287,6 +355,7 @@ run("repository publication makes its materialised vectors visible under their i
     manifest: { digest, dimensions: 1024, entries: [{ path, digest, vector: coordinates(0, 1) }] },
   });
   assert.equal(published.code, "PUBLISHED");
+  await refreshStatistics();
   const vectors = await (await read("vectors")).json();
   assert.equal(vectors.model, "fixture/repository-model");
   assert.deepEqual(vectors.points.map(({ label }: { label: string }) => label), [path]);
@@ -575,7 +644,14 @@ run("shared graph rebuild publishes chunk-derived relations and preserves manual
   const { createNodeApp } = await import("../src/api/app.js");
   const app = createNodeApp({ includeApiRoutes: false });
   const headers = { cookie: "authelia_session=fixture-admin", origin, "Content-Type": "application/json" };
-  const enqueue = () => app.request(`${origin}/dashboard/rebuilds`, { method: "POST", headers, body: JSON.stringify({ kind: "graph", scope: "shared" }) });
+  const jobs: string[] = [];
+  // Shared jobs have no project FK to cascade when the project fixture is removed.
+  t.after(async () => { await db.$executeRaw`DELETE FROM dashboard_rebuilds WHERE id = ANY(${jobs}::text[])`; });
+  const enqueue = async () => {
+    const response = await app.request(`${origin}/dashboard/rebuilds`, { method: "POST", headers, body: JSON.stringify({ kind: "graph", scope: "shared" }) });
+    if (response.status === 202) jobs.push((await response.clone().json()).id);
+    return response;
+  };
   assert.equal((await enqueue()).status, 503);
   for (const [key, value] of Object.entries({ EXTRACTION_MODEL: "fixture/graph", OPENAI_BASE_URL: "https://extraction.example.test/v1", OPENAI_API_KEY: "fixture-only-key" })) {
     const original = process.env[key];
@@ -702,6 +778,7 @@ runBrowser("a browser can inspect knowledge, switch projects and refresh activit
   await page.getByText("Administrator", { exact: true }).waitFor();
   await page.getByRole("heading", { name: "Overview", exact: true }).waitFor();
   await page.getByText("Entities", { exact: true }).waitFor();
+  await page.getByText("Counts as of", { exact: false }).waitFor();
   const selector = page.getByLabel("Project", { exact: true });
   assert.equal(await selector.locator("option:checked").textContent(), "All projects");
   // A failed refresh must preserve the last result for this scope, but not for a different project.
@@ -750,6 +827,7 @@ runBrowser("a browser can inspect knowledge, switch projects and refresh activit
   const tagDetails = page.getByRole("status", { name: "Selected item" });
   await tagDetails.getByText(`Search tag: project:${project.slug}`, { exact: true }).waitFor({ timeout: 2500 });
   await tagDetails.getByText("tags → Blueprint", { exact: true }).waitFor({ timeout: 2500 });
+  await refreshStatistics();
   await nav.getByRole("link", { name: "Vector map" }).click();
   await page.getByRole("button", { name: "Refresh" }).click();
   const chunks = page.getByRole("complementary").getByRole("button", { name: /^Blueprint/ });
@@ -765,6 +843,7 @@ runBrowser("a browser can inspect knowledge, switch projects and refresh activit
 
   // An old bookmark should still let you switch models after reindexing.
   await db.$executeRaw`UPDATE chunks SET metadata = '{}'::jsonb WHERE "projectId" = ${project.id} AND metadata->>'embedding_model' = 'other'`;
+  await refreshStatistics();
   await page.getByRole("button", { name: "Refresh" }).click();
   await page.getByRole("button", { name: "Show available models" }).click({ timeout: 2500 });
   await page.getByRole("button", { name: "Blueprint · chunk 1", exact: true }).waitFor();

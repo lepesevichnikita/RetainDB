@@ -1,43 +1,26 @@
 import assert from "node:assert/strict";
-import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
 import { test } from "node:test";
-import { fileURLToPath } from "node:url";
 
-test("local embeddings retain real normalized vectors when native inference falls back to WASM", {
+/**
+ * Recall and native capture must share one model session, and that session must
+ * live in the embedding process. These vectors arrive over IPC from the child,
+ * so the test also proves the API process is not loading ONNX itself.
+ */
+test("local recall and native capture share one embedding process", {
   skip: process.env.RETAINDB_TEST_LOCAL_EMBEDDINGS !== "true",
   timeout: 180_000,
 }, async (context) => {
-  const { env } = await import("@xenova/transformers");
-  const require = createRequire(import.meta.url);
-  const runtimePath = require.resolve("onnxruntime-node", {
-    paths: [dirname(fileURLToPath(import.meta.resolve("@xenova/transformers")))],
-  });
-  const { onnxruntimeBackend } = require(join(dirname(runtimePath), "backend.js"));
-  const nativeFailure = new Error("Injected native model construction failure");
-  let nativeAttempts = 0;
-  context.mock.method(onnxruntimeBackend, "createSessionHandler", async () => {
-    nativeAttempts++;
-    throw nativeFailure;
-  });
-  const warn = console.warn;
-  context.mock.method(console, "warn", (...messages: unknown[]) => {
-    if (messages[0] !== nativeFailure && !String(messages[0]).startsWith("Something went wrong during model construction")) {
-      warn(...messages);
-    }
-  });
-  const originalThreads = env.backends.onnx.wasm.numThreads;
-  context.after(() => { env.backends.onnx.wasm.numThreads = originalThreads; });
-  env.backends.onnx.wasm.numThreads = 2;
-  const { embedLocal } = await import("../src/engine/embeddings-local.js");
-  const { embedNativeCapture, stopNativeEmbeddingProcess } = await import("../src/engine/native-embeddings.js");
   const previousMode = process.env.EMBEDDING_MODE;
   process.env.EMBEDDING_MODE = "local";
+  const { embedLocal } = await import("../src/engine/embeddings-local.js");
+  const { embedNativeCapture } = await import("../src/engine/native-embeddings.js");
+  const { embeddingWorkerState, stopEmbeddingWorker } = await import("../src/engine/embedding-process.js");
   context.after(async () => {
     if (previousMode === undefined) delete process.env.EMBEDDING_MODE;
     else process.env.EMBEDDING_MODE = previousMode;
-    await stopNativeEmbeddingProcess();
+    await stopEmbeddingWorker();
   });
+
   const texts = [
     "Verify PostgreSQL database backup checksums before restoring a database.",
     "Check the database backup checksum before PostgreSQL recovery.",
@@ -48,7 +31,6 @@ test("local embeddings retain real normalized vectors when native inference fall
     embedLocal(texts), embedNativeCapture([texts[0]]), embedLocal([texts[0]]),
   ]);
 
-  assert.equal(nativeAttempts, 1);
   assert.equal(vectors.length, 3);
   assert.deepEqual(captured[0], vectors[0]);
   assert.deepEqual(concurrentQuery[0], vectors[0]);
@@ -59,4 +41,5 @@ test("local embeddings retain real normalized vectors when native inference fall
   }
   const similarity = (left: number[], right: number[]) => left.reduce((sum, value, index) => sum + value * right[index], 0);
   assert.ok(similarity(vectors[0], vectors[1]) > similarity(vectors[0], vectors[2]));
+  assert.equal(embeddingWorkerState(), "ready");
 });

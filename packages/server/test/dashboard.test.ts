@@ -104,13 +104,21 @@ test("the dashboard respects a method-specific Authelia denial for an administra
   assert.deepEqual(await rebuild.json(), { error: "Dashboard access requires a valid session." });
 });
 
-test("a non-HTTPS authorization endpoint leaves the API up and the dashboard disabled", async (t) => {
+test("a non-HTTPS authorization endpoint leaves the API live and the dashboard disabled", async (t) => {
   t.mock.method(console, "error", () => {});
+  const previousDatabaseUrl = process.env.DATABASE_URL;
+  process.env.DATABASE_URL = "postgresql://retaindb_unused@127.0.0.1:1/retaindb_unused";
+  t.after(() => {
+    if (previousDatabaseUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = previousDatabaseUrl;
+  });
   process.env.RETAINDB_DASHBOARD_ORIGIN = origin;
   process.env.RETAINDB_DASHBOARD_AUTH_URL = "http://identity.example.test/";
   const { createNodeApp } = await import("../src/api/app.js");
   const app = createNodeApp();
-  assert.equal((await app.request(`${origin}/health`)).status, 200);
+  assert.equal((await app.request(`${origin}/livez`)).status, 200);
+  // This process has no database, so readiness must report that instead of faking success.
+  assert.equal((await app.request(`${origin}/health`)).status, 503);
   assert.equal((await app.request(`${origin}/dashboard`, { headers: { cookie } })).status, 404);
 });
 

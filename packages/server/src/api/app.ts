@@ -5,6 +5,7 @@ import { randomUUID } from "crypto";
 import { latencyTraceMiddleware } from "../middleware/latency-trace.js";
 import { maybeSendAlertEmail } from "../engine/alert-email.js";
 import { createDashboard, DASHBOARD_PATH, isDashboardPath } from "../dashboard.js";
+import { readReadiness, type ReadinessReport } from "../health.js";
 
 const STACK_NAME = process.env.RETAINDB_STACK || "ec2";
 
@@ -85,8 +86,8 @@ async function maybeAlertRequestError(c: any) {
   });
 }
 
-export function createNodeApp(options: { includeApiRoutes?: boolean; routeApp?: Hono<any, any, any> } = {}) {
-  const { includeApiRoutes = true, routeApp } = options;
+export function createNodeApp(options: { includeApiRoutes?: boolean; routeApp?: Hono<any, any, any>; readinessCheck?: () => Promise<ReadinessReport> } = {}) {
+  const { includeApiRoutes = true, routeApp, readinessCheck = readReadiness } = options;
   const app = new Hono();
   const dashboard = createDashboard();
   const apiCors = cors();
@@ -167,7 +168,30 @@ export function createNodeApp(options: { includeApiRoutes?: boolean; routeApp?: 
     });
   });
 
-  app.get("/health", (c) => c.json({ status: "ok" }));
+  // Liveness answers as long as this process can serve a request. Readiness
+  // additionally proves the dependencies the API needs; a failed dependency
+  // removes the pod from the Service without restarting a healthy process.
+  app.get("/livez", (c) => c.json({ status: "ok" }));
+  app.get("/health", async (c) => {
+    c.header("Cache-Control", "no-store");
+    try {
+      const report = await readinessCheck();
+      return c.json(report, report.status === "ok" ? 200 : 503);
+    } catch (error) {
+      console.error("[health] Readiness check failed:", error);
+      return c.json(
+        {
+          status: "unhealthy",
+          checks: {
+            database: { status: "down", latencyMs: 0 },
+            embeddings: { status: "failed", mode: process.env.EMBEDDING_MODE || "remote", model: null },
+          },
+          uptimeSeconds: Math.round(process.uptime()),
+        },
+        503
+      );
+    }
+  });
   if (dashboard) {
     app.use("/v1/*", dashboard.logRequest);
     app.route(DASHBOARD_PATH, dashboard.routes);

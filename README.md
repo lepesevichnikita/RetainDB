@@ -189,14 +189,28 @@ credentials, connection-URL user information and complete private-key blocks
 are redacted before captured data is persisted. Redaction is not a substitute
 for keeping unrelated secrets out of captured tool output.
 
-With `EMBEDDING_MODE=local`, native capture and retrieval share one model
-session and run one embedding at a time. A timed-out capture does not write a
-late result or start duplicate inference; an active ONNX call keeps its slot
-until it returns. Other embedding modes keep the reusable, isolated child
-process with kill-and-wait recovery. Both paths honor the capture attempt
-deadline (120 seconds by default; `NATIVE_CAPTURE_EMBEDDING_TIMEOUT_MS` can
-lower it). Retry delays start when the failure is recorded. Receipt and
-document writes remain in the Server under exclusive database row ownership.
+With `EMBEDDING_MODE=local` or `hybrid`, every model load and every inference
+runs in one dedicated child process; the API process only sends text and
+receives vectors. Recall and native capture therefore share one model session,
+and the HTTP server keeps answering while a model warms up or a large batch is
+embedding. A timed-out request kills the stuck child, rejects only the callers
+that were waiting, and the next request (or the supervisor) starts a fresh
+process; an active ONNX call keeps its slot until it returns. Capture attempts
+honor the same deadline (120 seconds by default;
+`NATIVE_CAPTURE_EMBEDDING_TIMEOUT_MS` can lower it). External embedding modes
+never load a model in any process. Receipt and document writes remain in the
+Server under exclusive database row ownership.
+
+`GET /livez` answers while this process can serve a request; it is what the
+Kubernetes startup and liveness probes call, so a dependency outage never
+restarts a process that is working. `GET /health` is readiness: it pings
+PostgreSQL within a bounded budget (`HEALTH_DB_TIMEOUT_MS`, 2 seconds by
+default) and reports whether the local embedding process is warm. It returns
+200 only when every dependency is ready, and 503 with
+`status: degraded | unhealthy` and the failing check otherwise. Concurrent
+probes share one database query, so a hanging database cannot drain the
+connection pool. A monitor that reads this endpoint shows the real state
+instead of a hardcoded success.
 
 Set `RERANK_MODE=off` on the server to skip optional model-based reranking,
 even for clients that request it. Search keeps its existing vector and lexical
@@ -796,6 +810,7 @@ RETAINDB_TEST_DATABASE_URL="$DATABASE_URL" RETAINDB_TEST_CHROME_CHANNEL=chrome \
 | `OPENAI_API_KEY` | unset | Enables OpenAI-backed server embeddings |
 | `EMBEDDING_MODE` | `auto` | Server embedding mode |
 | `EMBEDDING_MODEL` | `Xenova/multilingual-e5-large` | Model the server loads when it embeds itself; one model per corpus |
+| `HEALTH_DB_TIMEOUT_MS` | `2000` | Budget for the readiness database probe |
 | `RETAINDB_CONFIG` | `~/.retaindb-mcp/config.json` | Config file the CLI, hooks and MCP server read |
 | `EXTRACTION_MODEL` | `gpt-4o-mini` | Server extraction model |
 | `DISABLE_AUTO_EXTRACTION` | `false` | Skip automatic entity extraction during document ingestion |

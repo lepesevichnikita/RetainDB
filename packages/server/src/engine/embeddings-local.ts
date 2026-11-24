@@ -38,6 +38,13 @@ let crossEncoder: any = null;
 /** One multilingual model is the default: it embeds every language into the same space. */
 export const LOCAL_EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'Xenova/multilingual-e5-large';
 
+/**
+ * The API process never loads the model: inference blocks the thread that runs
+ * it, so it lives in the embedding process and the API sends work there. Only
+ * that child sets this flag.
+ */
+const IN_EMBEDDING_WORKER = process.env.RETAINDB_EMBEDDING_WORKER === '1';
+
 function initEmbedder() {
   return embedder ??= loadEmbedder().catch(error => {
     embedder = undefined;
@@ -95,6 +102,10 @@ async function initCrossEncoder() {
  * Generate embeddings for multiple texts
  */
 export async function embedLocal(texts: string[], signal?: AbortSignal): Promise<number[][]> {
+  if (!IN_EMBEDDING_WORKER) {
+    const { requestEmbeddings } = await import('./embedding-process.js');
+    return requestEmbeddings(texts, { signal });
+  }
   const results: number[][] = [];
   for (const text of texts) {
     results.push(await localInference.add(() => embedLocalText(text, signal), { throwOnTimeout: true }));
@@ -127,6 +138,10 @@ export async function crossEncoderScore(
   query: string,
   passages: string[]
 ): Promise<number[]> {
+  if (!IN_EMBEDDING_WORKER) {
+    const { scoreInProcess } = await import('./embedding-process.js');
+    return scoreInProcess(query, passages);
+  }
   const model = await initCrossEncoder();
 
   // BGE reranker expects (text, text_pair) — do not concatenate with [SEP]

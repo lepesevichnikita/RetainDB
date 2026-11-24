@@ -189,14 +189,14 @@ credentials, connection-URL user information and complete private-key blocks
 are redacted before captured data is persisted. Redaction is not a substitute
 for keeping unrelated secrets out of captured tool output.
 
-Native capture embeddings run in a reusable child process with a bounded
-attempt deadline (120 seconds by default; `NATIVE_CAPTURE_EMBEDDING_TIMEOUT_MS`
-can lower it). A stalled process, failure reply or invalid vector reply causes
-termination, and the Server waits for the child to close before another attempt.
-Retry delays start when the failure is recorded, not when inference began.
-The child cannot retain the queue or perform late database writes. Receipt and
-document writes remain in the Server process under exclusive database row
-ownership, which is released immediately if that process exits.
+With `EMBEDDING_MODE=local`, native capture and retrieval share one model
+session and run one embedding at a time. A timed-out capture does not write a
+late result or start duplicate inference; an active ONNX call keeps its slot
+until it returns. Other embedding modes keep the reusable, isolated child
+process with kill-and-wait recovery. Both paths honor the capture attempt
+deadline (120 seconds by default; `NATIVE_CAPTURE_EMBEDDING_TIMEOUT_MS` can
+lower it). Retry delays start when the failure is recorded. Receipt and
+document writes remain in the Server under exclusive database row ownership.
 
 The vector-index migration replaces the initially empty IVFFlat indexes
 with HNSW indexes. HNSW does not require training data, so retrieval can

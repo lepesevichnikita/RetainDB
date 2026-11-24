@@ -1,5 +1,7 @@
+import PQueue from 'p-queue';
+
 /**
- * Local Embeddings using Transformers.js (BGE-large)
+ * Local embeddings using Transformers.js.
  * Fast, free, and high-quality embeddings without API calls
  */
 
@@ -29,31 +31,31 @@ async function ensureTransformersLoaded() {
   await transformersLoadPromise;
 }
 
-let embedder: any = null;
+let embedder: Promise<any> | undefined;
+const localInference = new PQueue({ concurrency: 1 });
 let crossEncoder: any = null;
 
 /** One multilingual model is the default: it embeds every language into the same space. */
 export const LOCAL_EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'Xenova/multilingual-e5-large';
 
-async function initEmbedder() {
+function initEmbedder() {
+  return embedder ??= loadEmbedder().catch(error => {
+    embedder = undefined;
+    throw error;
+  });
+}
+
+async function loadEmbedder() {
   await ensureTransformersLoaded();
   if (!pipeline) {
     throw new Error('@xenova/transformers not installed. Run: npm install @xenova/transformers');
   }
 
-  if (!embedder) {
-    console.log(`[LocalEmbeddings] Loading ${LOCAL_EMBEDDING_MODEL} (first time may take 1-2 min)...`);
-    const startTime = Date.now();
-
-    embedder = await pipeline(
-      'feature-extraction',
-      LOCAL_EMBEDDING_MODEL,
-      { quantized: true } // Use quantized version for faster inference
-    );
-
-    console.log(`[LocalEmbeddings] Model loaded in ${Date.now() - startTime}ms`);
-  }
-  return embedder;
+  console.log(`[LocalEmbeddings] Loading ${LOCAL_EMBEDDING_MODEL} (first time may take 1-2 min)...`);
+  const startTime = Date.now();
+  const model = await pipeline('feature-extraction', LOCAL_EMBEDDING_MODEL, { quantized: true });
+  console.log(`[LocalEmbeddings] Model loaded in ${Date.now() - startTime}ms`);
+  return model;
 }
 
 /**
@@ -92,23 +94,21 @@ async function initCrossEncoder() {
 /**
  * Generate embeddings for multiple texts
  */
-export async function embedLocal(texts: string[]): Promise<number[][]> {
-  const model = await initEmbedder();
-
-  // Batch process for efficiency
-  const results = await Promise.all(
-    texts.map(async (text) => {
-      const output = await model(text, {
-        pooling: 'mean',
-        normalize: true,
-      });
-
-      // Convert to array
-      return Array.from(output.data) as number[];
-    })
-  );
-
+export async function embedLocal(texts: string[], signal?: AbortSignal): Promise<number[][]> {
+  const results: number[][] = [];
+  for (const text of texts) {
+    results.push(await localInference.add(() => embedLocalText(text, signal), { throwOnTimeout: true }));
+  }
   return results;
+}
+
+async function embedLocalText(text: string, signal?: AbortSignal): Promise<number[]> {
+  signal?.throwIfAborted();
+  const model = await initEmbedder();
+  signal?.throwIfAborted();
+  const output = await model(text, { pooling: 'mean', normalize: true });
+  signal?.throwIfAborted();
+  return Array.from(output.data) as number[];
 }
 
 /**

@@ -129,7 +129,7 @@ async function embedWithModel(texts: string[], single = false, signal?: AbortSig
   // Explicit local mode keeps every batch local.
   if (USE_LOCAL_EMBEDDINGS) {
     try {
-      const embeddings = await embedLocal(texts);
+      const embeddings = await embedLocal(texts, signal);
       console.log(`[Embeddings] Generated ${embeddings.length} local embeddings (${LOCAL_EMBEDDING_MODEL})`);
       return { vectors: embeddings, model: LOCAL_EMBEDDING_MODEL };
     } catch (error: any) {

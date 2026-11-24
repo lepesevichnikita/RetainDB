@@ -1,5 +1,6 @@
 import { fork, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { embedLocal } from "./embeddings-local.js";
 
 interface PendingEmbedding {
   id: string;
@@ -75,10 +76,11 @@ function startWorker(): ChildProcess {
 
 export function embedNativeCapture(texts: string[], remainingMs = 120_000): Promise<number[][]> {
   if (!texts.length) return Promise.resolve([]);
-  if (pending) return Promise.reject(new Error("Native embedding process already has an active request"));
-  const child = startWorker();
   const configured = Number(process.env.NATIVE_CAPTURE_EMBEDDING_TIMEOUT_MS || 120_000);
   const timeout = Math.max(1, Math.min(remainingMs, Number.isFinite(configured) ? Math.min(120_000, Math.max(100, configured)) : 120_000));
+  if (process.env.EMBEDDING_MODE === "local") return embedLocalCapture(texts, timeout);
+  if (pending) return Promise.reject(new Error("Native embedding process already has an active request"));
+  const child = startWorker();
   return new Promise((resolve, reject) => {
     const id = randomUUID();
     const timer = setTimeout(() => {
@@ -93,6 +95,19 @@ export function embedNativeCapture(texts: string[], remainingMs = 120_000): Prom
         child.kill("SIGKILL");
       }
     });
+  });
+}
+
+/** The deadline bounds receipt processing without releasing the ONNX slot prematurely. */
+function embedLocalCapture(texts: string[], timeout: number): Promise<number[][]> {
+  const controller = new AbortController();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      const error = new Error(`Native embedding attempt timed out after ${timeout}ms`);
+      controller.abort(error);
+      reject(error);
+    }, timeout);
+    void embedLocal(texts, controller.signal).then(resolve, reject).finally(() => clearTimeout(timer));
   });
 }
 

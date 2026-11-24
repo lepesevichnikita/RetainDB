@@ -30,14 +30,28 @@ test("local embeddings retain real normalized vectors when native inference fall
   context.after(() => { env.backends.onnx.wasm.numThreads = originalThreads; });
   env.backends.onnx.wasm.numThreads = 2;
   const { embedLocal } = await import("../src/engine/embeddings-local.js");
-  const vectors = await embedLocal([
+  const { embedNativeCapture, stopNativeEmbeddingProcess } = await import("../src/engine/native-embeddings.js");
+  const previousMode = process.env.EMBEDDING_MODE;
+  process.env.EMBEDDING_MODE = "local";
+  context.after(async () => {
+    if (previousMode === undefined) delete process.env.EMBEDDING_MODE;
+    else process.env.EMBEDDING_MODE = previousMode;
+    await stopNativeEmbeddingProcess();
+  });
+  const texts = [
     "Verify PostgreSQL database backup checksums before restoring a database.",
     "Check the database backup checksum before PostgreSQL recovery.",
     "Fresh strawberries and whipped cream make a summer dessert.",
+  ];
+  // A queued hook can race the first query on cold start. Both must use the same model session.
+  const [vectors, captured, concurrentQuery] = await Promise.all([
+    embedLocal(texts), embedNativeCapture([texts[0]]), embedLocal([texts[0]]),
   ]);
 
   assert.equal(nativeAttempts, 1);
   assert.equal(vectors.length, 3);
+  assert.deepEqual(captured[0], vectors[0]);
+  assert.deepEqual(concurrentQuery[0], vectors[0]);
   for (const vector of vectors) {
     assert.equal(vector.length, 1024);
     assert.ok(vector.every(Number.isFinite));

@@ -38,17 +38,21 @@ interface GraphEntity {
 
 type GraphReader = Pick<Prisma.TransactionClient, "$queryRaw" | "$executeRaw">;
 const MAX_RELATIONS_PER_HOP = 50;
+const graphDocumentJoins = Prisma.sql`documents d JOIN sources s ON s.id = d."sourceId"`;
+const publishedGraphDocument = Prisma.sql`d.id = c."documentId" AND c."projectId" = s."projectId"
+  AND (d."projectId" IS NULL OR d."projectId" = c."projectId")
+  AND d."deletedAt" IS NULL AND s."deletedAt" IS NULL AND ${publishedDocumentSql()}`;
+const searchableGraphChunk = Prisma.sql`COALESCE(c.metadata->>'content_kind', '') <> 'parent_context'`;
+
+function graphSourceVisibility(orgId: string | undefined) {
+  return Prisma.sql`${visibleSourceSql([], orgId)}
+    ${orgId === undefined ? Prisma.empty : Prisma.sql`AND s."orgId" = ${orgId}`}`;
+}
 
 function activeGraphChunks(project: GraphScope, scope: ChunkScope = {}) {
   const { sourceIds, chunkTypes, metadataFilter } = scope;
-  return Prisma.sql`FROM chunks c
-    JOIN documents d ON d.id = c."documentId"
-    JOIN sources s ON s.id = d."sourceId"
-    WHERE c."projectId" = s."projectId" AND ${graphProject(Prisma.sql`c."projectId"`, project)}
-      AND (d."projectId" IS NULL OR d."projectId" = c."projectId")
-      AND d."deletedAt" IS NULL AND s."deletedAt" IS NULL
-      AND ${publishedDocumentSql()}
-      AND COALESCE(c.metadata->>'content_kind', '') <> 'parent_context'
+  return Prisma.sql`FROM chunks c JOIN (${graphDocumentJoins}) ON ${publishedGraphDocument}
+    WHERE ${graphProject(Prisma.sql`c."projectId"`, project)} AND ${searchableGraphChunk}
       ${knowledgeTagFilterSql(project)}
       ${sourceIds?.length ? Prisma.sql`AND s.id = ANY(${sourceIds}::text[])` : Prisma.empty}
       ${chunkTypes?.length ? Prisma.sql`AND c."chunkType" = ANY(${chunkTypes}::text[])` : Prisma.empty}
@@ -57,8 +61,17 @@ function activeGraphChunks(project: GraphScope, scope: ChunkScope = {}) {
 
 function visibleGraphChunks(project: GraphScope, scope?: ChunkScope) {
   const orgId = typeof project === "string" ? undefined : project.orgId;
-  return Prisma.sql`${activeGraphChunks(project, scope)} ${visibleSourceSql([], orgId)}
-    ${orgId === undefined ? Prisma.empty : Prisma.sql`AND s."orgId" = ${orgId}`}`;
+  return Prisma.sql`${activeGraphChunks(project, scope)} ${graphSourceVisibility(orgId)}`;
+}
+
+/** Keep the recent-chunk scan on the outside; each chunk can match at most one published document. */
+function recentGraphChunks({ projectId, orgId }: { projectId?: string; orgId: string }) {
+  const project = projectId ? Prisma.sql`AND c."projectId" = ${projectId}` : Prisma.empty;
+  return Prisma.sql`FROM chunks c JOIN LATERAL (
+    SELECT d.id, d.title FROM ${graphDocumentJoins}
+    WHERE ${publishedGraphDocument} ${graphSourceVisibility(orgId)} LIMIT 1
+  ) d ON true
+  WHERE ${graphProject(Prisma.sql`c."projectId"`, { orgId })} ${project} AND ${searchableGraphChunk}`;
 }
 
 function activeMention(chunkId: Prisma.Sql, chunks: Prisma.Sql) {
@@ -252,13 +265,18 @@ async function exactTagGraph(db: GraphReader, scope: { orgId: string; projectId?
   return buildTagGraph(rows);
 }
 
-function visibleTaggedDocuments(db: GraphReader, chunks: Prisma.Sql, query: string, limit: number) {
-  const sample = query ? Prisma.empty : Prisma.sql`ORDER BY c.id DESC LIMIT ${DASHBOARD_TAG_CHUNK_SAMPLE}`;
+function recentTagSample(scope: { projectId?: string; orgId: string }) {
+  return Prisma.sql`SELECT d.id, d.title, c."projectId", c.metadata ${recentGraphChunks(scope)}
+    ORDER BY c."createdAt" DESC, c.id DESC LIMIT ${DASHBOARD_TAG_CHUNK_SAMPLE}`;
+}
+
+function visibleTaggedDocuments(db: GraphReader, scope: { projectId?: string; orgId: string }, query: string, limit: number) {
+  const visible = query
+    ? Prisma.sql`SELECT d.id, d.title, c."projectId", c.metadata ${visibleGraphChunks(scope)}`
+    : recentTagSample(scope);
   return db.$queryRaw<TaggedDocument[]>`
-    WITH visible AS (
-      SELECT d.id, d.title, c."projectId", ${knowledgeTagsSql()} AS tags ${chunks} ${sample}
-    ), matches AS (
-      SELECT DISTINCT tag, id, title, "projectId" FROM visible CROSS JOIN LATERAL unnest(tags) AS labels(tag)
+    WITH visible AS (${visible}), matches AS (
+      SELECT DISTINCT tag, id, title, "projectId" FROM visible c CROSS JOIN LATERAL unnest(${knowledgeTagsSql()}) AS labels(tag)
       WHERE strpos(lower(tag), lower(${query})) > 0 OR ${query} = ''
     ), selected AS (
       SELECT tag FROM matches GROUP BY tag ORDER BY count(*) DESC, tag LIMIT 8
@@ -311,7 +329,7 @@ export function browseProjectGraph(projectId: string | undefined, orgId: string,
     const project = { projectId, orgId };
     const scope = projectEntities(project, chunks);
     const seeds = new Set((await browseSeeds(db, scope, query)).map(({ id }) => id));
-    const tags = buildTagGraph(await visibleTaggedDocuments(db, chunks, query, query ? 12 : 3));
+    const tags = buildTagGraph(await visibleTaggedDocuments(db, project, query, query ? 12 : 3));
     if (seeds.size === 0) return tags;
     const edges = await findGraphRelations(db, projectRelations(project, chunks), [...seeds], []);
     const nodes = await browseNodes(db, scope, [...seeds, ...nextFrontier(edges, seeds)]);

@@ -99,6 +99,41 @@ run("the signed-in dashboard shares knowledge across projects without crossing o
   assert.deepEqual(filtered.edges, []);
 });
 
+run("the shared graph opens on recent published knowledge, not the highest chunk IDs", async (t) => {
+  const { db, project, other, read } = await fixture(t);
+  const source = await db.source.create({ data: { name: "Recent graph source", type: "text", projectId: project.id } });
+  const old = await db.document.create({ data: { title: "Older knowledge", sourceId: source.id, projectId: project.id, status: "READY" } });
+  const current = await db.document.create({ data: { title: "Current knowledge", sourceId: source.id, projectId: project.id, status: "READY" } });
+  const staged = await db.document.create({ data: { title: hidden, sourceId: source.id, projectId: project.id, status: "PROCESSING" } });
+  const foreignSource = await db.source.create({ data: { name: hidden, type: "text", projectId: other.id } });
+  const foreign = await db.document.create({ data: { title: hidden, sourceId: foreignSource.id, projectId: other.id, status: "READY" } });
+  const machineTag = `machine:${project.slug}`;
+
+  // Deliberately reverse ID and creation order. Visibility must be checked before the sample limit.
+  await db.chunk.createMany({ data: Array.from({ length: 384 }, (_, index) => ({
+    id: `z-${project.id}-${index}`, documentId: old.id, projectId: project.id, content: "Older knowledge",
+    createdAt: new Date("2026-01-01T00:00:00Z"),
+  })) });
+  await db.chunk.createMany({ data: [
+    { id: `a-${project.id}`, documentId: current.id, projectId: project.id, content: "Current knowledge",
+      createdAt: new Date("2026-01-02T00:00:00Z"), metadata: { tags: [machineTag] } },
+    { documentId: current.id, projectId: project.id, content: hidden,
+      createdAt: new Date("2026-01-03T00:00:00Z"), metadata: { content_kind: "parent_context", tags: [hidden] } },
+    { documentId: staged.id, projectId: project.id, content: hidden,
+      createdAt: new Date("2026-01-03T00:00:00Z"), metadata: { tags: [hidden] } },
+    { documentId: foreign.id, projectId: other.id, content: hidden,
+      createdAt: new Date("2026-01-03T00:00:00Z"), metadata: { tags: [hidden] } },
+  ] });
+
+  const response = await read("graph", { scope: "shared" });
+  assert.equal(response.status, 200, await response.clone().text());
+  const graph = await response.json();
+  assert.ok(graph.edges.some((edge: { fromEntityId: string; toEntityId: string }) =>
+    edge.fromEntityId === `tag:${machineTag}` && edge.toEntityId === `document:${current.id}`),
+  "the default graph must show the recently published machine tag even when older chunks sort first by ID");
+  assert.ok(!JSON.stringify(graph).includes(hidden));
+});
+
 run("the project views read live graph provenance and separate recorded vector models", async (t) => {
   const { db, read, project, other } = await fixture(t);
   const projects = await read("projects", {});

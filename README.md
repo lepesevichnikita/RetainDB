@@ -669,8 +669,9 @@ The dashboard opens on **All projects**. Overview, graph and vector map can
 browse shared knowledge in the configured organization; use the project selector
 to filter. Graph and vector inspectors and queue rows show the original project.
 The graph also shows tag nodes linked to the visible documents carrying each
-tag. Select a node to see its exact search tag and displayed links. The graph
-shows a bounded neighborhood, not all matches; use tag-filtered search for retrieval.
+tag. The initial graph draws tags from a bounded sample of the most recent
+visible chunks. Select a node to see its exact search tag and displayed links.
+The graph shows a neighborhood, not all matches; use tag-filtered search for retrieval.
 For API navigation, query the exact tag with `entity_types: ["knowledge_tag"]` at
 `/v1/graph/search`. Tag nodes are derived from live records, with no rebuild or
 separate tag index required.

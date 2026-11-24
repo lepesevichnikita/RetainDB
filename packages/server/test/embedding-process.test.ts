@@ -83,6 +83,22 @@ test("reranking runs in the same worker instead of blocking the API process", as
   assert.ok(Math.abs(scores[1] - scores[0]) > 0);
 });
 
+test("a dying embedding process is reported without taking the caller down", async (t) => {
+  const { requestEmbeddings, embeddingWorkerState, stopEmbeddingWorker } = await import("../src/engine/embedding-process.js");
+  t.after(async () => {
+    delete process.env.RETAINDB_FIXTURE_EXIT_IMMEDIATELY;
+    await stopEmbeddingWorker();
+  });
+
+  process.env.RETAINDB_FIXTURE_EXIT_IMMEDIATELY = "1";
+  await assert.rejects(requestEmbeddings(["boom"]), /exited|restarted|channel|closed/i);
+  assert.equal(embeddingWorkerState(), "failed");
+
+  delete process.env.RETAINDB_FIXTURE_EXIT_IMMEDIATELY;
+  assert.deepEqual(await requestEmbeddings(["ok"]), [[2, 1]]);
+  assert.equal(embeddingWorkerState(), "ready");
+});
+
 test("a caller that awaits only the embedding stays alive until the answer arrives", async () => {
   // The worker is unref'd while idle so a CLI can exit; it has to be ref'd while
   // a request is pending, or the process exits and the pending test is cancelled

@@ -36,6 +36,7 @@ let rewarmAttempt = 0;
 let warmInFlight: Promise<void> | undefined;
 let stopping = false;
 const pending = new Map<string, PendingRequest>();
+const failedWorkers = new WeakSet<ChildProcess>();
 
 export function embeddingWorkerState(): EmbeddingWorkerState {
   return state;
@@ -104,17 +105,27 @@ function startWorker(): ChildProcess {
   child.on("close", (code, signal) => {
     if (worker !== child) return;
     worker = undefined;
+    console.warn(`[EmbeddingProcess] exited (code ${code}, signal ${signal})`);
     failWorker(child, new Error(`Embedding process exited before completing the request (code ${code}, signal ${signal})`));
   });
   return child;
 }
 
 function failWorker(child: ChildProcess, error: Error): void {
+  // kill() on an already-reaped child emits "error", which lands back here.
+  // Without this guard that is an infinite recursion, and the uncaught
+  // RangeError kills a process that was only reporting a child failure.
+  if (failedWorkers.has(child)) return;
+  failedWorkers.add(child);
   rejectAll(error);
   state = "failed";
   if (worker === child) worker = undefined;
   if (stopping) return;
-  child.kill("SIGKILL");
+  try {
+    child.kill("SIGKILL");
+  } catch {
+    // The child is already gone; the supervisor below still replaces it.
+  }
   scheduleRewarm();
 }
 
@@ -196,8 +207,6 @@ function submit(message: Record<string, unknown>, expected: number, expectsScore
         if (!pending.has(id)) return;
         settle(request);
         request.reject(new Error(`Embedding attempt timed out after ${timeoutMs}ms`));
-        state = "failed";
-        child.kill("SIGKILL");
         failWorker(child, new Error("Embedding process restarted after a timed-out request"));
       }, timeoutMs),
     };

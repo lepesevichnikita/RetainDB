@@ -6,6 +6,8 @@
  * maps to a tiny vector whose first value is the text length, which makes a
  * mismatched response visible in an assertion.
  */
+if (process.env.RETAINDB_FIXTURE_EXIT_IMMEDIATELY === "1") process.exit(1);
+
 process.on("message", (message: any) => {
   if (!message || typeof message.id !== "string") return;
   const { id, texts, query, passages } = message;

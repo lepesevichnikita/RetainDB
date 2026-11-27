@@ -6,6 +6,7 @@ export type McpSearchResult = {
   score: number | null;
   source: string | null;
   document: string | null;
+  project?: string;
   metadata: Record<string, any> | null;
 };
 

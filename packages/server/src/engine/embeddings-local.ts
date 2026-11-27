@@ -1,5 +1,7 @@
+import PQueue from 'p-queue';
+
 /**
- * Local Embeddings using Transformers.js (BGE-large)
+ * Local embeddings using Transformers.js.
  * Fast, free, and high-quality embeddings without API calls
  */
 
@@ -19,6 +21,7 @@ async function ensureTransformersLoaded() {
         // Configure transformers.js
         env.allowLocalModels = false; // Use CDN models for easier deployment
         env.useBrowserCache = false; // Use disk cache in Node.js
+        env.backends.onnx.wasm.numThreads = 1;
       } catch {
         console.warn('[LocalEmbeddings] @xenova/transformers not installed, local embeddings disabled');
         console.warn('[LocalEmbeddings] Install with: npm install @xenova/transformers');
@@ -28,34 +31,38 @@ async function ensureTransformersLoaded() {
   await transformersLoadPromise;
 }
 
-let embedder: any = null;
+let embedder: Promise<any> | undefined;
+const localInference = new PQueue({ concurrency: 1 });
 let crossEncoder: any = null;
 
+/** One multilingual model is the default: it embeds every language into the same space. */
+export const LOCAL_EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'Xenova/multilingual-e5-large';
+
 /**
- * Initialize BGE-large embedding model
- * Model: BAAI/bge-large-en-v1.5
- * Dimensions: 1024
- * MTEB Score: 63.98 (beats OpenAI text-embedding-3-small!)
+ * The API process never loads the model: inference blocks the thread that runs
+ * it, so it lives in the embedding process and the API sends work there. Only
+ * that child sets this flag.
  */
-async function initEmbedder() {
+const IN_EMBEDDING_WORKER = process.env.RETAINDB_EMBEDDING_WORKER === '1';
+
+function initEmbedder() {
+  return embedder ??= loadEmbedder().catch(error => {
+    embedder = undefined;
+    throw error;
+  });
+}
+
+async function loadEmbedder() {
   await ensureTransformersLoaded();
   if (!pipeline) {
     throw new Error('@xenova/transformers not installed. Run: npm install @xenova/transformers');
   }
 
-  if (!embedder) {
-    console.log('[LocalEmbeddings] Loading BGE-large model (first time may take 1-2 min)...');
-    const startTime = Date.now();
-
-    embedder = await pipeline(
-      'feature-extraction',
-      'Xenova/bge-large-en-v1.5',
-      { quantized: true } // Use quantized version for faster inference
-    );
-
-    console.log(`[LocalEmbeddings] Model loaded in ${Date.now() - startTime}ms`);
-  }
-  return embedder;
+  console.log(`[LocalEmbeddings] Loading ${LOCAL_EMBEDDING_MODEL} (first time may take 1-2 min)...`);
+  const startTime = Date.now();
+  const model = await pipeline('feature-extraction', LOCAL_EMBEDDING_MODEL, { quantized: true });
+  console.log(`[LocalEmbeddings] Model loaded in ${Date.now() - startTime}ms`);
+  return model;
 }
 
 /**
@@ -94,23 +101,25 @@ async function initCrossEncoder() {
 /**
  * Generate embeddings for multiple texts
  */
-export async function embedLocal(texts: string[]): Promise<number[][]> {
-  const model = await initEmbedder();
-
-  // Batch process for efficiency
-  const results = await Promise.all(
-    texts.map(async (text) => {
-      const output = await model(text, {
-        pooling: 'mean',
-        normalize: true,
-      });
-
-      // Convert to array
-      return Array.from(output.data) as number[];
-    })
-  );
-
+export async function embedLocal(texts: string[], signal?: AbortSignal): Promise<number[][]> {
+  if (!IN_EMBEDDING_WORKER) {
+    const { requestEmbeddings } = await import('./embedding-process.js');
+    return requestEmbeddings(texts, { signal });
+  }
+  const results: number[][] = [];
+  for (const text of texts) {
+    results.push(await localInference.add(() => embedLocalText(text, signal), { throwOnTimeout: true }));
+  }
   return results;
+}
+
+async function embedLocalText(text: string, signal?: AbortSignal): Promise<number[]> {
+  signal?.throwIfAborted();
+  const model = await initEmbedder();
+  signal?.throwIfAborted();
+  const output = await model(text, { pooling: 'mean', normalize: true });
+  signal?.throwIfAborted();
+  return Array.from(output.data) as number[];
 }
 
 /**
@@ -129,6 +138,10 @@ export async function crossEncoderScore(
   query: string,
   passages: string[]
 ): Promise<number[]> {
+  if (!IN_EMBEDDING_WORKER) {
+    const { scoreInProcess } = await import('./embedding-process.js');
+    return scoreInProcess(query, passages);
+  }
   const model = await initCrossEncoder();
 
   // BGE reranker expects (text, text_pair) — do not concatenate with [SEP]

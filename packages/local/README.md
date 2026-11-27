@@ -37,6 +37,33 @@ retaindb reembed         # refresh vectors with the configured embedding provide
 retaindb doctor          # print local runtime status
 ```
 
+The bundled plugin hooks and `retaindb hook` read `~/.retaindb-mcp/config.json`
+(`api`, `token`, `project`), or the file selected by `RETAINDB_CONFIG`.
+Nonempty `RETAINDB_BASE_URL`, `RETAINDB_API_KEY`, and `RETAINDB_PROJECT` override
+the matching values. Without a configured project, hooks use the event project,
+then its working directory, then `default`.
+
+The plugin records a native session-start observation when the target does not
+provide the Local session API, as on PostgreSQL Server.
+
+For PostgreSQL Server targets that support `/v1/agent-events/workstation`, set
+`RETAINDB_HOOK_EMBEDDING_MODE=workstation` or `hook_embedding_mode` in the client
+config. `local` is an alias for `workstation`. `server` is the default when no
+mode is set; an unrecognized value disables hook requests and reports the
+configuration error. Install the optional Transformers.js runtime and cache the same
+1024-dimensional model the Server uses for search. Select it via
+`RETAINDB_HOOK_EMBEDDING_MODEL` or `hook_embedding_model` (default:
+`Xenova/multilingual-e5-large`). The hook redacts recognized credentials and
+their echoes in event content before embedding or sending it. It embeds a
+short excerpt of tool output when available, otherwise a prompt or event
+summary, and submits the excerpt with the vector. It skips automatic context
+recall in this mode; if inference or submission fails, it reports the failure on
+stderr instead of sending an event for server-side embedding.
+
+The CLI hook preserves the caller's `session_id` and `agent_id` (or `sessionId`
+and `agentId`) from stdin in either mode. Explicit flags and the corresponding
+`RETAINDB_SESSION_ID` and `RETAINDB_AGENT_ID` environment overrides take precedence.
+
 ## Context Router
 
 RetainDB Local can reduce normal coding-agent token use, not just memory tokens.

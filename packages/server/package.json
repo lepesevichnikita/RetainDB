@@ -8,8 +8,12 @@
   },
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsup src/index.ts --format esm --out-dir dist --dts",
+    "build": "tsup src/index.ts src/engine/workers/native-embedding-process.ts --format esm --out-dir dist --dts",
     "typecheck": "tsc --noEmit",
+    "test": "pnpm --filter @retaindb/embedding-core run build && tsc --noEmit -p test/tsconfig.json && tsx --test --test-concurrency=1 test/*.test.ts",
+    "test:db:up": "docker compose -f ../../test/compose.yaml up -d --wait",
+    "test:db:down": "docker compose -f ../../test/compose.yaml down -v",
+    "test:db:migrate": "DATABASE_URL=${RETAINDB_TEST_DATABASE_URL:-postgresql://retaindb_test:retaindb_test@127.0.0.1:55432/retaindb_test} prisma migrate deploy",
     "db:generate": "prisma generate",
     "db:push": "prisma db push",
     "db:migrate": "prisma migrate dev",

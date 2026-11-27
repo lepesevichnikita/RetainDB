@@ -1,41 +1,51 @@
-import OpenAI from "openai";
-import { prisma } from "../db/index.js";
-import { embedSingle } from "./embeddings.js";
+import { z } from "zod";
+import { getOpenAIClient } from "./openai-client.js";
+import { entityRelationType, saveChunkGraph, type ChunkGraph, type ChunkGraphWrite } from "./entity-graph-write.js";
+import { prisma, type Transaction } from "../db/index.js";
+import { claimInputsFromGraph, saveClaims, type ClaimInput } from "./knowledge/claims.js";
 import { writeMemoryCanonical } from "./memory/write.js";
-
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // ═══════════════════════════════════════════════════════════════
 // ENTITY EXTRACTION (runs during ingestion)
 // ═══════════════════════════════════════════════════════════════
 
-interface ExtractedEntity {
-  name: string;
-  type: string; // function, class, module, concept, api_endpoint, config, service, etc.
-  description: string;
+/** Confidence prior for an extracted claim the model did not score (05 §1 G-C). */
+const EXTRACTED_CONFIDENCE_PRIOR = 0.6;
+
+const confidence = z.number().min(0).max(1).optional();
+
+const entityClaims = z.object({
+  entities: z.array(z.object({
+    name: z.string().trim().min(1), type: z.string().trim().min(1), description: z.string().optional(), confidence,
+  })),
+  relations: z.array(z.object({
+    from: z.string(), fromType: z.string(), to: z.string(), toType: z.string(), relation: z.string(), confidence,
+  })),
+});
+
+function parseGraphClaims(value: unknown): ChunkGraph {
+  const claims = entityClaims.parse(value);
+  return {
+    entities: claims.entities.slice(0, 20).map(({ type, confidence: score, ...entity }) => ({ ...entity, entityType: type, confidence: score })),
+    relations: claims.relations.slice(0, 30).flatMap(toGraphRelation),
+  };
 }
 
-interface ExtractedRelation {
-  from: string;
-  fromType: string;
-  to: string;
-  toType: string;
-  relation: string; // imports, calls, extends, depends_on, etc.
+function toGraphRelation({ from, fromType, to, toType, relation, confidence: score }: z.infer<typeof entityClaims>["relations"][number]) {
+  const type = entityRelationType.safeParse(relation);
+  if (!type.success) return [];
+  return [{
+    from: { name: from.trim(), entityType: fromType.trim() },
+    to: { name: to.trim(), entityType: toType.trim() },
+    type: type.data,
+    confidence: score,
+  }];
 }
 
-export async function extractEntities(
-  projectId: string,
-  content: string,
-  chunkType: string,
-  metadata: Record<string, any> = {},
-  chunkId?: string
-): Promise<{ entities: number; relations: number }> {
-  // Skip small chunks
-  if (content.length < 100) return { entities: 0, relations: 0 };
-
+function entityPrompt(content: string, chunkType: string) {
   const isCode = ["code", "function", "class"].includes(chunkType);
 
-  const prompt = isCode
+  return isCode
     ? `Analyze this code and extract entities and relationships.
 
 Entities: functions, classes, interfaces, types, modules, variables, constants, API endpoints, services.
@@ -49,7 +59,7 @@ ${content.slice(0, 3000)}
 Respond with JSON only:
 {
   "entities": [{"name": "...", "type": "function|class|interface|module|constant|api_endpoint|service", "description": "one line"}],
-  "relations": [{"from": "name", "fromType": "type", "to": "name", "toType": "type", "relation": "imports|calls|extends|implements|depends_on|references|part_of"}]
+  "relations": [{"from": "name", "fromType": "type", "to": "name", "toType": "type", "relation": "imports|calls|extends|implements|depends_on|references|part_of", "confidence": 0.0}]
 }`
     : `Analyze this text and extract key entities (concepts, people, tools, services, APIs, technologies) and their relationships.
 
@@ -59,104 +69,49 @@ ${content.slice(0, 3000)}
 Respond with JSON only:
 {
   "entities": [{"name": "...", "type": "concept|tool|service|api|technology|person|organization", "description": "one line"}],
-  "relations": [{"from": "name", "fromType": "type", "to": "name", "toType": "type", "relation": "references|depends_on|related_to|part_of|supersedes"}]
+  "relations": [{"from": "name", "fromType": "type", "to": "name", "toType": "type", "relation": "references|depends_on|related_to|part_of|supersedes", "confidence": 0.0}]
 }`;
+}
 
-  try {
-    const res = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0,
-      max_tokens: 1000,
-      response_format: { type: "json_object" },
-    });
+/** Where an extracted chunk came from: what the claims it produces are evidence about. */
+export interface ExtractionSource {
+  sourceId: string;
+  sourceVersionId: string | null;
+  documentId: string;
+  contentDigest: string;
+}
 
-    const text = res.choices[0]?.message?.content?.trim() || "{}";
-    const parsed = JSON.parse(text);
+export async function extractEntities(projectId: string, chunkId: string, content: string, chunkType: string, source: ExtractionSource) {
+  const graph = await readEntityClaims(content, chunkType);
+  return prisma.$transaction(async (tx) => {
+    const written = await saveChunkGraph(projectId, chunkId, graph, "extracted", tx);
+    if (written.entities || written.relations) await saveClaims(tx, await claimInputs(tx, written, graph, content, source));
+    return { entities: written.entities, relations: written.relations };
+  });
+}
 
-    const extractedEntities: ExtractedEntity[] = parsed.entities || [];
-    const extractedRelations: ExtractedRelation[] = parsed.relations || [];
+async function claimInputs(tx: Transaction, written: ChunkGraphWrite, graph: ChunkGraph, content: string, source: ExtractionSource): Promise<ClaimInput[]> {
+  const document = await tx.document.findUnique({ where: { id: source.documentId }, select: { externalId: true, path: true, webUrl: true } });
+  const evidence = {
+    sourceId: source.sourceId, contentDigest: source.contentDigest, text: content,
+    documentExternalId: document?.externalId ?? null, path: document?.path ?? null, url: document?.webUrl ?? null,
+  };
+  return claimInputsFromGraph({ graph, written, evidence, prior: EXTRACTED_CONFIDENCE_PRIOR, origin: "extracted" });
+}
 
-    let entityCount = 0;
-    let relationCount = 0;
-
-    // Upsert entities
-    const entityMap = new Map<string, string>(); // name:type -> id
-
-    for (const ent of extractedEntities.slice(0, 20)) {
-      if (!ent.name || !ent.type) continue;
-
-      const embedding = await embedSingle(`${ent.type}: ${ent.name} - ${ent.description || ""}`);
-      const embeddingStr = `[${embedding.join(",")}]`;
-
-      try {
-        await prisma.$queryRaw`
-          INSERT INTO "entities" (
-            id, "projectId", name, "entityType", description, "sourceChunkId", embedding,
-            "createdAt", "updatedAt"
-          )
-          VALUES (
-            gen_random_uuid(), ${projectId}, ${ent.name}, ${ent.type}, ${ent.description || ""},
-            ${chunkId || null}, ${embeddingStr}::vector, NOW(), NOW()
-          )
-          ON CONFLICT ("projectId", name, "entityType")
-          DO UPDATE SET
-            description = EXCLUDED.description,
-            "sourceChunkId" = EXCLUDED."sourceChunkId",
-            embedding = EXCLUDED.embedding,
-            "updatedAt" = NOW()
-        `;
-        entityMap.set(`${ent.name}:${ent.type}`, ent.name);
-        entityCount++;
-      } catch (err: any) {
-        console.error("[Extractor] Error upserting entity:", err.message);
-      }
-    }
-
-    // Upsert relations
-    for (const rel of extractedRelations.slice(0, 30)) {
-      if (!rel.from || !rel.to || !rel.relation) continue;
-
-      const fromId = entityMap.get(`${rel.from}:${rel.fromType}`);
-      const toId = entityMap.get(`${rel.to}:${rel.toType}`);
-
-      if (!fromId || !toId) continue;
-
-      // Validate relation type
-      const validRelations = [
-        "imports", "exports", "calls", "implements", "extends",
-        "references", "depends_on", "related_to", "part_of",
-        "contradicts", "supersedes",
-      ];
-      if (!validRelations.includes(rel.relation)) continue;
-
-      await prisma.entityRelation.upsert({
-        where: {
-          fromEntityId_toEntityId_relationType: {
-            fromEntityId: fromId,
-            toEntityId: toId,
-            relationType: rel.relation,
-          },
-        },
-        update: {
-          metadata: { autoExtracted: true },
-        },
-        create: {
-          projectId,
-          fromEntityId: fromId,
-          toEntityId: toId,
-          relationType: rel.relation,
-          metadata: { autoExtracted: true },
-        },
-      });
-
-      relationCount++;
-    }
-
-    return { entities: entityCount, relations: relationCount };
-  } catch {
-    return { entities: 0, relations: 0 };
+export async function readEntityClaims(content: string, chunkType: string, options?: { timeout: number; maxRetries: number }) {
+  const result = await getOpenAIClient().chat.completions.create({
+    model: process.env.EXTRACTION_MODEL || "gpt-4o-mini",
+    messages: [{ role: "user", content: entityPrompt(content, chunkType) }],
+    temperature: 0,
+    max_tokens: 1000,
+    response_format: { type: "json_object" },
+  }, options);
+  const choice = result.choices[0];
+  if (choice?.finish_reason !== "stop" || choice.message.refusal || !choice.message.content) {
+    throw new Error("Graph extraction did not return a complete response.");
   }
+  return parseGraphClaims(JSON.parse(choice.message.content));
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -207,7 +162,7 @@ Respond with JSON only:
 }`;
 
   try {
-    const res = await openai.chat.completions.create({
+    const res = await getOpenAIClient().chat.completions.create({
       model: "gpt-4o-mini",
       messages: [{ role: "user", content: prompt }],
       temperature: 0,

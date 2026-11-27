@@ -1,5 +1,5 @@
 import { Prisma } from "@prisma/client";
-import { prisma } from "../db/index.js";
+import { prisma, type Transaction } from "../db/index.js";
 
 const DEFAULT_RESTORE_WINDOW_DAYS = 7;
 const STALE_VERSION_TIMEOUT_MS = 30 * 60 * 1000;
@@ -8,45 +8,50 @@ const DEFAULT_SUPERSEDED_VERSIONS_TO_KEEP = 3;
 
 export type ConnectorOutcome = "success" | "partial_failure" | "failed";
 
-export async function ensureActiveSourceVersion(sourceId: string) {
-  const source = await prisma.source.findUnique({
-    where: { id: sourceId },
-    select: {
-      id: true,
-      orgId: true,
-      projectId: true,
-      activeVersionId: true,
-    },
-  });
-  if (!source) throw new Error(`Source ${sourceId} not found`);
-  if (source.activeVersionId) {
-    return prisma.sourceVersion.findUnique({ where: { id: source.activeVersionId } });
-  }
+export async function ensureActiveSourceVersion(sourceId: string, transaction?: Transaction) {
+  const ensure = async (tx: Transaction) => {
+    await tx.$queryRaw`SELECT id FROM sources WHERE id = ${sourceId} FOR UPDATE`;
+    const source = await tx.source.findUnique({
+      where: { id: sourceId },
+      select: {
+        id: true,
+        orgId: true,
+        projectId: true,
+        activeVersionId: true,
+      },
+    });
+    if (!source) throw new Error(`Source ${sourceId} not found`);
+    if (source.activeVersionId) {
+      return tx.sourceVersion.findUnique({ where: { id: source.activeVersionId } });
+    }
 
-  const existingCount = await prisma.sourceVersion.count({ where: { sourceId } });
-  const restoreUntil = computeRestoreUntil(90);
-  const created = await prisma.sourceVersion.create({
-    data: {
-      sourceId,
-      orgId: source.orgId,
-      projectId: source.projectId,
-      versionNumber: existingCount + 1,
-      status: "ACTIVE",
-      promotedAt: new Date(),
-      restoreUntil,
-    },
-  });
-
-  await prisma.source.update({
-    where: { id: sourceId },
-    data: { activeVersionId: created.id },
-  });
-
-  return created;
+    const aggregate = await tx.sourceVersion.aggregate({
+      where: { sourceId },
+      _max: { versionNumber: true },
+    });
+    const created = await tx.sourceVersion.create({
+      data: {
+        sourceId,
+        orgId: source.orgId,
+        projectId: source.projectId,
+        versionNumber: (aggregate._max.versionNumber ?? 0) + 1,
+        status: "ACTIVE",
+        promotedAt: new Date(),
+        restoreUntil: computeRestoreUntil(90),
+      },
+    });
+    await tx.source.update({
+      where: { id: sourceId },
+      data: { activeVersionId: created.id },
+    });
+    return created;
+  };
+  return transaction ? ensure(transaction) : prisma.$transaction(ensure);
 }
 
-export async function resolveSourceVersionForWrite(sourceId: string): Promise<string | null> {
-  const source = await prisma.source.findUnique({
+export async function resolveSourceVersionForWrite(sourceId: string, transaction?: Transaction): Promise<string | null> {
+  const db = transaction ?? prisma;
+  const source = await db.source.findUnique({
     where: { id: sourceId },
     select: {
       id: true,
@@ -57,7 +62,7 @@ export async function resolveSourceVersionForWrite(sourceId: string): Promise<st
   if (!source) return null;
 
   if (source.status === "INDEXING") {
-    const staged = await prisma.sourceVersion.findFirst({
+    const staged = await db.sourceVersion.findFirst({
       where: {
         sourceId,
         status: { in: ["STAGED", "PROMOTING"] },
@@ -69,7 +74,7 @@ export async function resolveSourceVersionForWrite(sourceId: string): Promise<st
   }
 
   if (source.activeVersionId) return source.activeVersionId;
-  const active = await ensureActiveSourceVersion(sourceId);
+  const active = await ensureActiveSourceVersion(sourceId, transaction);
   return active?.id || null;
 }
 
@@ -77,46 +82,41 @@ export async function createStagedSourceVersion(sourceId: string, params?: {
   syncJobId?: string | null;
   traceId?: string | null;
 }) {
-  const source = await prisma.source.findUnique({
-    where: { id: sourceId },
-    select: {
-      id: true,
-      orgId: true,
-      projectId: true,
-    },
-  });
-  if (!source) throw new Error(`Source ${sourceId} not found`);
-
-  const aggregate = await prisma.sourceVersion.aggregate({
-    where: { sourceId },
-    _max: { versionNumber: true },
-  });
-  const versionNumber = (aggregate._max.versionNumber || 0) + 1;
-  const restoreUntil = computeRestoreUntil(90);
-
-  return prisma.sourceVersion.create({
-    data: {
-      sourceId,
-      orgId: source.orgId,
-      projectId: source.projectId,
-      versionNumber,
-      status: "STAGED",
-      syncJobId: params?.syncJobId || null,
-      restoreUntil,
-      errorMessage: params?.traceId ? `trace:${params.traceId}` : null,
-    },
+  return prisma.$transaction(async tx => {
+    await tx.$queryRaw`SELECT id FROM sources WHERE id = ${sourceId} FOR UPDATE`;
+    const source = await tx.source.findUnique({
+      where: { id: sourceId },
+      select: { id: true, orgId: true, projectId: true },
+    });
+    if (!source) throw new Error(`Source ${sourceId} not found`);
+    const aggregate = await tx.sourceVersion.aggregate({
+      where: { sourceId },
+      _max: { versionNumber: true },
+    });
+    return tx.sourceVersion.create({
+      data: {
+        sourceId,
+        orgId: source.orgId,
+        projectId: source.projectId,
+        versionNumber: (aggregate._max.versionNumber ?? 0) + 1,
+        status: "STAGED",
+        syncJobId: params?.syncJobId || null,
+        restoreUntil: computeRestoreUntil(90),
+        errorMessage: params?.traceId ? `trace:${params.traceId}` : null,
+      },
+    });
   });
 }
 
-export async function refreshSourceVersionCounts(sourceVersionId: string) {
-  const version = await prisma.sourceVersion.findUnique({
+export async function refreshSourceVersionCounts(sourceVersionId: string, db: Transaction = prisma) {
+  const version = await db.sourceVersion.findUnique({
     where: { id: sourceVersionId },
     select: { sourceId: true },
   });
   if (!version) return null;
   const [documentCount, chunkCount] = await Promise.all([
-    prisma.document.count({ where: { sourceVersionId, deletedAt: null } }),
-    prisma.chunk.count({
+    db.document.count({ where: { sourceVersionId, deletedAt: null } }),
+    db.chunk.count({
       where: {
         document: {
           sourceVersionId,
@@ -125,7 +125,7 @@ export async function refreshSourceVersionCounts(sourceVersionId: string) {
       },
     }),
   ]);
-  return prisma.sourceVersion.update({
+  return db.sourceVersion.update({
     where: { id: sourceVersionId },
     data: {
       documentCount,

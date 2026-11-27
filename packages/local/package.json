@@ -16,8 +16,9 @@
     "package.json"
   ],
   "scripts": {
-    "build": "tsup src/cli.ts --format esm --out-dir dist",
+    "build": "pnpm --filter @retaindb/embedding-core run build && tsup src/cli.ts --format esm --out-dir dist",
     "dev": "tsx src/cli.ts",
+    "test": "pnpm --filter @retaindb/embedding-core run build && node --test test/*.test.mjs",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run build"
   },
@@ -38,6 +39,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
+    "@retaindb/embedding-core": "workspace:*",
     "@hono/node-server": "^1.13.0",
     "hono": "^4.7.0",
     "zod": "^3.25.76"

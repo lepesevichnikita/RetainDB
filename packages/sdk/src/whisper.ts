@@ -840,14 +840,14 @@ export class RetainDBClient {
     return this.runOrThrow(async () => {
       // strip alias keys so they don't leak into the request body
       const { q, userId, ...rest } = params;
+      const project = rest.project ?? this.config.project;
       const normalized: QueryParams = {
         ...rest,
         query: rest.query ?? q ?? "",
         user_id: rest.user_id ?? userId,
-        include_memories: rest.include_memories ?? true,
+        include_memories: rest.include_memories ?? (Boolean(project) && !rest.tags?.length),
       };
       const identityParams = await this.withIdentity(normalized);
-      const project = (await this.resolveProject(identityParams.project)).id;
       const response = await this.runtimeClient.request<QueryResult>({
         endpoint: "/v1/context/query",
         method: "POST",

@@ -3,29 +3,25 @@
   "version": "1.0.0",
   "description": "TypeScript SDK for RetainDB — add persistent memory to your AI agents",
   "type": "module",
-  "main": "dist/index.js",
-  "module": "dist/index.mjs",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.mjs",
-      "require": "./dist/index.js"
+      "import": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+      "require": { "types": "./dist/index.d.cts", "default": "./dist/index.cjs" }
     },
     "./ai-sdk": {
-      "types": "./dist/adapters/ai-sdk.d.ts",
-      "import": "./dist/adapters/ai-sdk.mjs",
-      "require": "./dist/adapters/ai-sdk.js"
+      "import": { "types": "./dist/adapters/ai-sdk.d.ts", "default": "./dist/adapters/ai-sdk.js" },
+      "require": { "types": "./dist/adapters/ai-sdk.d.cts", "default": "./dist/adapters/ai-sdk.cjs" }
     },
     "./tools": {
-      "types": "./dist/adapters/tools.d.ts",
-      "import": "./dist/adapters/tools.mjs",
-      "require": "./dist/adapters/tools.js"
+      "import": { "types": "./dist/adapters/tools.d.ts", "default": "./dist/adapters/tools.js" },
+      "require": { "types": "./dist/adapters/tools.d.cts", "default": "./dist/adapters/tools.cjs" }
     },
     "./router": {
-      "types": "./dist/router/memory-router.d.ts",
-      "import": "./dist/router/memory-router.mjs",
-      "require": "./dist/router/memory-router.js"
+      "import": { "types": "./dist/router/memory-router.d.ts", "default": "./dist/router/memory-router.js" },
+      "require": { "types": "./dist/router/memory-router.d.cts", "default": "./dist/router/memory-router.cjs" }
     }
   },
   "scripts": {

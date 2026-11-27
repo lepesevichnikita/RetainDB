@@ -309,3 +309,54 @@ export function shouldExtractMemory(message: string): boolean {
 
   return true;
 }
+
+// ── Shared post-processing (moved from the retired extractor.ts) ──────────────
+
+/**
+ * Build a pronoun→name map from recent memories.
+ *
+ * Only maps pronouns when we have clear, unambiguous evidence:
+ * - a single person name appearing in entityMentions
+ * - confidence above threshold
+ *
+ * Returns empty map if ambiguous — better to provide no hints than wrong ones.
+ */
+export function buildEntityContext(
+  recentMemories: Array<{ content: string; entityMentions: string[]; confidence: number }>,
+): Map<string, string> {
+  const entityMap = new Map<string, string>();
+  const personNameFreq = new Map<string, number>();
+  const personNamePattern = /^[A-Z][a-z]{1,25}(?:\s[A-Z][a-z]{1,25})*$/;
+
+  for (const mem of recentMemories) {
+    if (mem.confidence < 0.7) continue;
+    for (const entity of mem.entityMentions) {
+      if (personNamePattern.test(entity) && entity.length > 2) {
+        personNameFreq.set(entity, (personNameFreq.get(entity) ?? 0) + 1);
+      }
+    }
+  }
+
+  const persons = Array.from(personNameFreq.entries())
+    .filter(([, n]) => n >= 2)
+    .sort((a, b) => b[1] - a[1]);
+
+  if (persons.length === 1) {
+    const [name] = persons[0];
+    for (const pronoun of ["he", "she", "him", "her", "they"]) entityMap.set(pronoun, name);
+  }
+
+  return entityMap;
+}
+
+/**
+ * Post-extraction quality filter: reject unresolved ambiguity rather than any pronoun.
+ */
+export function validateMemory(memory: ExtractedMemory): boolean {
+  if (memory.confidence < 0.75) return false;
+  if (memory.content.length < 10) return false;
+  const trimmed = memory.content.trim();
+  if (/^(he|she|they|it)\b/i.test(trimmed) && memory.entityMentions.length === 0) return false;
+  if (/^(the company|that project|this thing|the system)\b/i.test(trimmed) && memory.entityMentions.length === 0) return false;
+  return true;
+}

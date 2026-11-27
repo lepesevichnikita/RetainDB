@@ -4,8 +4,7 @@
  */
 
 import { db } from "../../db/index.js";
-import { buildEntityContext, validateMemory } from "./extractor.js";
-import { extractMemories as extractMemoriesUnified } from "./extractor-unified.js";
+import { buildEntityContext, extractMemories as extractMemoriesUnified, validateMemory } from "./extractor-unified.js";
 import { extractEventDate } from "./temporal.js";
 import type { ExtractionContext, MemoryScopeTarget, PromotionMode, SessionWorkEvent } from "./types.js";
 import {

@@ -95,10 +95,26 @@ Use this path when you want the full API server with Postgres and pgvector.
 ```bash
 git clone https://github.com/retaindb/retaindb
 cd retaindb
+export ENCRYPTION_KEY="$(openssl rand -hex 32)"
 docker compose up
 ```
 
 Server runs on `http://localhost:3000`.
+
+Keep `ENCRYPTION_KEY` stable across restarts so stored agent credentials remain readable. Local BGE embeddings do not require an OpenAI key; the first request downloads the model. Explicit `EMBEDDING_MODE=local` keeps all batches local, including large documents. Set `EMBEDDING_MODE=openai` and `OPENAI_API_KEY` to use OpenAI embeddings instead; hybrid mode switches large batches to OpenAI. LLM extraction and research still require an OpenAI key.
+
+Local inference prefers the native CPU backend. If model construction falls back to WebAssembly, the Server uses a single WASM thread because Node cannot start the browser Blob workers used by the pinned ONNX runtime. This does not limit native CPU inference threads or switch embedding providers.
+
+Use pgvector 0.8 or later for filtered HNSW retrieval. Document and memory vector searches enable strict iterative scans inside their own transaction so project, source, type and metadata filters can continue past unrelated neighbors without changing pooled connection settings. Approximate search still has pgvector's scan limits. Compose supplies pgvector; an existing PostgreSQL installation must upgrade its extension separately.
+
+Database upgrades preserve existing organization IDs, ownership and slugs. If another organization already uses the `default` slug, the ownerless default organization receives an available `default-oss-N` slug instead. Previously deployed migration files remain unchanged.
+
+To verify the packaged Prisma client and migration CLI without network access or a running database:
+
+```bash
+docker build -t retaindb-runtime-check -f packages/server/Dockerfile .
+node scripts/check-server-image.mjs retaindb-runtime-check
+```
 
 ### Node + Postgres
 
@@ -107,11 +123,115 @@ git clone https://github.com/retaindb/retaindb
 cd retaindb
 cp .env.example packages/server/.env
 pnpm install
-pnpm --filter @retaindb/server run db:push
+pnpm --filter @retaindb/server run db:generate
+pnpm --filter @retaindb/server exec prisma migrate deploy
 pnpm dev:server
 ```
 
 Postgres must have the `pgvector` extension enabled.
+
+Set a stable `ENCRYPTION_KEY` in `packages/server/.env` before starting the server. Apply the committed migrations with `prisma migrate deploy`; do not replace an existing database with the generated Prisma schema. The migration history also contains legacy tables not managed by the current server client.
+
+Concurrent synchronous text learns reuse one ingestion source per project.
+Source-version allocation is serialized in PostgreSQL for each source, so
+first writes and staged syncs do not race to allocate the same version number.
+Retained version-number gaps are preserved rather than reused.
+
+Batch ingestion binds source versions before submitting queued work. A failed
+batch waits for its submitted tasks to settle before returning an error, so
+connector failure handling cannot race later writes from that batch. Documents
+remain `PROCESSING` during a rebuild and become `READY` after chunk persistence.
+A required embedding or persistence failure records `ERROR` with the failure
+message as `parseError`; a successful retry clears the previous `parseError`.
+An empty, wrong-width or missing embedding fails that document instead of
+publishing a searchable chunk the store cannot answer.
+
+### Coding-agent hooks with PostgreSQL
+
+The Server accepts the native Local hooks at `POST /retaindb/observe` and
+`POST /v1/agent-events`. Point `RETAINDB_BASE_URL` at the Server and set
+`RETAINDB_API_KEY` for both the hook process and Server. Keep the existing
+project and session identifiers in the hook payload.
+
+The bundled plugin hooks and `retaindb hook` use the same client config for
+the API URL, credentials and project. They resolve the project from
+`RETAINDB_PROJECT`, the client config's `project`, the hook payload's project,
+then its working directory. Plugin capture and session lifecycle requests
+use that same project and send the configured API key on every request.
+
+For workstation-side capture, set `RETAINDB_HOOK_EMBEDDING_MODE=workstation`
+(or `hook_embedding_mode` in the client config). `local` also selects the
+workstation. `server` is the default when unset; invalid values stop hook
+requests rather than falling back to the server. The hook computes a vector
+for a short event summary with the cached Transformers.js model selected by
+`RETAINDB_HOOK_EMBEDDING_MODEL` / `hook_embedding_model`. Use the same
+1024-dimensional model as the Server's semantic search. Context search only
+ranks labelled chunk vectors against a query from the same model. Chunks from
+other models remain available to text search; older unlabelled chunks retain
+their existing behavior until re-embedded. The hook redacts recognized
+credentials and their echoes in event content before embedding or sending it.
+A short excerpt of tool output is searchable, rather than just the tool name.
+The Server commits the receipt and searchable summary together at
+`/v1/agent-events/workstation`.
+This mode does not download a model, request automatic context, or fall back
+to server-side inference. Missing models and rejected submissions are reported
+on the hook's stderr; the agent session continues.
+
+A successful capture returns HTTP 202 only after the event is committed to
+PostgreSQL. In `server` mode this acknowledges the event, not the embedding.
+The Server indexes in the background with its configured provider and commits
+the searchable document and indexed status together. A failed indexing attempt
+leaves the receipt retryable without exposing a partial document. Pending events
+resume after restart. Repeating the same event payload reuses
+its receipt. `GET /v1/agent-events/:eventId` reports `pending`, `processing`
+or `indexed`, including retry diagnostics when embedding fails. Recognized
+credentials, connection-URL user information and complete private-key blocks
+are redacted before captured data is persisted. Redaction is not a substitute
+for keeping unrelated secrets out of captured tool output.
+
+With `EMBEDDING_MODE=local` or `hybrid`, every model load and every inference
+runs in one dedicated child process; the API process only sends text and
+receives vectors. Recall and native capture therefore share one model session,
+and the HTTP server keeps answering while a model warms up or a large batch is
+embedding. A timed-out request kills the stuck child, rejects only the callers
+that were waiting, and the next request (or the supervisor) starts a fresh
+process; an active ONNX call keeps its slot until it returns. Capture attempts
+honor the same deadline (120 seconds by default;
+`NATIVE_CAPTURE_EMBEDDING_TIMEOUT_MS` can lower it). External embedding modes
+never load a model in any process. Receipt and document writes remain in the
+Server under exclusive database row ownership.
+
+`GET /livez` answers while this process can serve a request; it is what the
+Kubernetes startup and liveness probes call, so a dependency outage never
+restarts a process that is working. `GET /health` is readiness: it pings
+PostgreSQL within a bounded budget (`HEALTH_DB_TIMEOUT_MS`, 2 seconds by
+default) and reports whether the local embedding process is warm. It returns
+200 only when every dependency is ready, and 503 with
+`status: degraded | unhealthy` and the failing check otherwise. Concurrent
+probes share one database query, so a hanging database cannot drain the
+connection pool. A monitor that reads this endpoint shows the real state
+instead of a hardcoded success.
+
+Set `RERANK_MODE=off` on the server to skip optional model-based reranking,
+even for clients that request it. Search keeps its existing vector and lexical
+ranking, including local embeddings when `EMBEDDING_MODE=local`.
+
+The vector-index migration replaces the initially empty IVFFlat indexes
+with HNSW indexes. HNSW does not require training data, so retrieval can
+work immediately after the first import without rebuilding an index.
+
+The Server also supports `POST /v1/context/pack`, `POST /v1/context/delta`
+and `POST /v1/context/compress-output` without a cloud model. Context packs
+combine indexed documents and memories within the requested project and
+token budget. An unchanged context hash returns an empty delta, which CLI and
+plugin hooks preserve rather than replacing it with the previous full context. Client `cwd`
+and `files` paths are diagnosed, not read from the Server filesystem; ingest
+those files through the source APIs first.
+
+To exercise the packaged Server, migrations, vectors, hook receipts,
+authentication and restart recovery in a disposable Compose project, run
+`node scripts/check-server-compose.mjs`. The script removes only its own
+containers, image and database volume when it finishes.
 
 ## RetainDB Local
 
@@ -310,29 +430,54 @@ const result = await streamText({
 
 RetainDB also ships adapters for LangChain and LangGraph workflows, so memory can be retrieved before a chain/graph step and written back after the agent learns something useful.
 
-## MCP
+## Installing the local tools
 
-Start the MCP server through the Local package:
+Three tools, one configuration file. Write it once:
 
-```bash
-RETAINDB_BASE_URL=http://localhost:3111 npx -y @retaindb/local mcp
+```json
+{ "api": "https://retaindb-api.example.lan", "token": "<api key>", "project": "my-agent" }
 ```
 
-Example MCP config:
+at `~/.retaindb-mcp/config.json`. Every tool below reads it; environment variables
+(`RETAINDB_BASE_URL`, `RETAINDB_API_KEY`, `RETAINDB_PROJECT`, `RETAINDB_CONFIG`) override it.
+
+**1. Indexer CLI** — reads files on this machine and ships chunks and vectors:
+
+```bash
+git clone https://github.com/lepesevichnikita/RetainDB.git && cd RetainDB
+npm i -g --install-links ./packages/local-indexer
+retaindb-index --root ~/src/my-project --graph --embed
+```
+
+**2. MCP server** — exposes recall/remember/context to the agent:
+
+```bash
+npx -y @retaindb/local mcp        # configuration comes from ~/.retaindb-mcp/config.json
+```
 
 ```json
 {
   "mcpServers": {
-    "retaindb": {
-      "command": "npx",
-      "args": ["-y", "@retaindb/local", "mcp"],
-      "env": {
-        "RETAINDB_BASE_URL": "http://localhost:3111",
-        "RETAINDB_PROJECT": "my-agent"
-      }
-    }
+    "retaindb": { "command": "npx", "args": ["-y", "@retaindb/local", "mcp"] }
   }
 }
+```
+
+**3. Coding-agent hooks** — capture prompts, tool calls and session ends:
+
+```bash
+ls packages/local/plugin/hooks/hooks.json        # Claude Code
+ls packages/local/plugin/hooks/hooks.codex.json  # Codex
+```
+
+Point the harness at the matching file; each hook script resolves the same config file, so a
+machine configured once needs no per-hook environment. `RETAINDB_AUTO_CONTEXT=false` turns off
+context injection, `RETAINDB_COMPRESS_TOOL_OUTPUT=false` turns off tool-output compression.
+
+Verify a consumer end to end:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" "$(python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.retaindb-mcp/config.json')))['api'])")/health"
 ```
 
 Core tools:
@@ -371,6 +516,42 @@ If `RETAINDB_API_KEY` is set, protected deployments require `Authorization: Bear
 | `GET` | `/v1/projects/:id/sources` | List project sources |
 | `POST` | `/v1/sources/:id/sync` | Trigger source sync |
 | `GET` | `/v1/sources/:id` | Inspect source status |
+
+Server graph endpoints:
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/v1/entities` | Create or update a project entity without a separate inference request |
+| `POST` | `/v1/relations` | Create or update an edge between project entities |
+| `POST` | `/v1/graph/search` | Find up to `top_k` visible name or vector matches and follow up to 50 edges per hop in both directions, for 1–3 hops; traversal-only entities have score `0` |
+| `GET` | `/v1/memory/graph` | Return memory nodes, stored relationships, and chronological session edges |
+| `GET` | `/v1/memory/graph/conversation/:sessionId` | Read the same memory graph for one conversation |
+
+In `/v1/context/query`, `include_graph: true` adds chunks linked by the entity graph and preserves the matched entities and relationships in each result's `metadata.graph`, even if vector or lexical search found the same chunk. `graph_depth` accepts 1–3. Graph queries bypass the response cache and respect project, source, chunk-type, metadata, and active-version filters.
+
+`include_evidence: true` (with `include_graph`) attaches the assertions behind each returned relation: `metadata.graph.relations[].claims[]` carries `snippet`, `sourceId`, `documentExternalId`, `path`, `url`, `contentDigest`, `confidence`, `origin`. Only claims whose evidence digest is still present in the source's active version are returned, at most three per relation, best confidence first, and the whole answer costs one extra query regardless of how many relations it contains. `path` and `url` make the evidence openable. Entities are not evidence-bearing in this version.
+
+An answer produced while the embedder is unavailable is reported as partial: `meta.timing.embedding_unavailable` marks the vector half that was skipped, and `meta.timing.memory_skipped` marks memories that were asked for and never searched. Such an answer is not written to the response cache, so the next identical question is recomputed instead of being served a partial result as complete, and it comes back complete as soon as the embedder does.
+
+Entity and edge IDs are stable within the project. Extraction records claims per source chunk, so staged, failed, superseded, and deleted content does not replace the active graph. Graph search, export, and entity counts use the same visibility rule. Manually written entities and edges remain independent of source versions; extraction does not replace their annotations.
+
+Graph search and graph-assisted context do not compare vectors labelled with another embedding model. Entity name matches in graph search and traversal of visible edges do not depend on vector compatibility. Legacy unlabelled vectors remain eligible.
+
+Omit `project` on `/v1/context/query` or `/v1/graph/search` to search visible knowledge across the authenticated organization. Document hits and graph entities include their source project as `project`; context responses also report `meta.project_scope`. Pass a project name, slug, or ID to narrow the query. An unknown or inaccessible project returns `404` without creating a project or widening the search. Context queries with `include_memories: true` still require a project: shared knowledge search does not search personal memories in other projects.
+
+Use `tags: ["project:mp", "machine:mac-mini"]` on `/v1/context/query` or the workspace MCP `search` to require every listed tag before ranking. Omit both `tags` and `project` for organization-wide search. Hits return the effective tags in `metadata.tags`. RetainDB derives `project:<slug>` from the owning project, so a caller-supplied project tag cannot mislabel a record. Other tags come from indexed metadata. On a workstation, set `RETAINDB_MACHINE` or `machine` in the shared hook config to add `machine:<label>` to future captures in either embedding mode. Machine labels are optional; older records are not guessed or rewritten.
+
+Requests with `include_memories: true` or nonempty `tags` bypass the shared response cache even when `use_cache` is set. `tags` filters indexed knowledge, not personal memories; do not combine it with `include_memories: true`.
+
+The API echoes accepted filters in `meta.applied_tags`. The workspace MCP rejects tagged searches against older backends that do not confirm the filter, rather than presenting unfiltered results as matches.
+
+The TypeScript SDK uses an explicit project or a project configured on the client, if present. The in-repository `@retaindb/mcp` tool `search` uses shared knowledge unless its call supplies `project`; the write-project setting does not narrow it. Project labels are retained in its results. An API failure is an MCP error, not an empty successful search. The separately published `@retaindb/mcp-server` is a different package and is not updated by building this workspace.
+
+The cluster RetainDB integration uses the pinned `@retaindb/mcp-server@2.17.0` with the [compatibility patch](packages/mcp/patches/retaindb-mcp-server@2.17.0.patch) to retain its existing MCP tool catalog. Use `retaindb:search` through MCPProxy with `search_all: true` for shared knowledge or `tags` for all-of exact filters. Omit `project` for organization-wide tagged search; pass it to narrow tagged search. These modes require `query` and do not combine with memory lookup or graph expansion. Existing search calls without either option keep their original scope and behavior.
+
+Semantic graph search uses the stored vector of the visible source chunk, with a legacy mention vector as a fallback when the chunk has none. A structural entity with neither remains searchable by name on `/v1/graph/search`.
+
+Entity extraction runs only on eligible documents ingested with automatic extraction enabled and a configured inference provider. Native hook capture skips it. The migration preserves existing graph rows and backfills explicit legacy entity-to-chunk links. Old automatic edges without recorded provenance stay hidden until extraction confirms them. The migration does not extract from existing documents, and importing vector embeddings alone does not create graph edges.
 
 Local-only runtime endpoints:
 
@@ -438,6 +619,204 @@ The self-hosted server can index external knowledge sources into agent context:
 | HuggingFace | Model cards |
 | Plain text | Inline content |
 
+## Repository indexer and client-side vectors
+
+`retaindb-index` walks a directory, chunks every text file, and ships the chunks to a self-hosted
+server. It is a separate package on purpose: the service stores what it is given, the machine that
+holds the files does the reading.
+
+`--install-links` matters: without it npm links the global command to the checkout, so moving or
+deleting `~/Documents/projects/RetainDB` breaks `retaindb-index` everywhere. With it npm installs a
+real copy of the package and the command survives the checkout.
+
+The file set is what git says it is: `git ls-files --cached --others --exclude-standard` inside the
+target. `.gitignore` therefore decides — `node_modules`, vendored code, build output and everything
+your global excludes skip are not indexed, and a tracked file under an ignored path still is. A
+directory outside a git work tree falls back to skipping the usual dependency and build stores
+(`node_modules`, `.venv`, `__pycache__`, `.next`, `coverage`, …).
+
+```bash
+git clone https://github.com/lepesevichnikita/RetainDB.git
+cd RetainDB
+npm i -g --install-links ./packages/local-indexer   # provides the `retaindb-index` command
+```
+
+Configure once, in the same file the MCP server and the hooks read:
+
+```json
+{ "api": "https://retaindb-api.example.lan", "token": "<api key>", "project": "default" }
+```
+
+`~/.retaindb-mcp/config.json`. Environment variables win over it: `RETAINDB_BASE_URL`,
+`RETAINDB_API_KEY`, `RETAINDB_PROJECT`.
+
+A machine that already runs the RetainDB MCP server needs no extra configuration: the indexer reads
+the server entry in `~/.claude.json` (or the Claude Desktop config) and takes the base URL, key and
+project from its `env`. Ask for the key once in the client, and both tools use it.
+
+```bash
+retaindb-index --root . --graph           # index, and write module/reference edges
+retaindb-index --root . --embed           # compute the vectors here, not on the server
+retaindb-index --root . --embed custom/model-id   # any 1024-dimension model
+retaindb-index --reembed                  # move the stored corpus onto the current model
+retaindb-index --root . --dry-run         # show what would be sent
+```
+
+**Vectors.** `--embed` runs `@xenova/transformers` locally; the default model is
+`Xenova/multilingual-e5-large`, because a vector is a vector and the model must embed every
+language of the corpus into one space, not only English. The chunk row records the producing
+model in `metadata.embedding_model`, so which model made a vector is data, not a schema change:
+a new model needs no migration and no extra column.
+
+Existing corpora move with `--reembed`: the server hands out the text of chunks whose vector came
+from another model (`GET /v1/chunks/stale`), this machine embeds them, and posts the vectors back
+(`POST /v1/chunks/vectors`) in batches of 16, which stays under the proxy body limit. The service
+itself never loads a model in that path.
+
+**References become graph edges.** Markdown links and images, `[[wiki links]]`, HTML `href`/`src`,
+`import`/`require`/`export from`, and `#include` are extracted from each file and resolved against
+the set of indexed files (extensions, `index.*`, relative traversal). An edge is written only when
+both ends are real files; an unresolved target is dropped instead of stored as a name nobody can
+open, and a self reference never becomes an edge. That is the chain: a README points at a document,
+which points at code, and search can walk it.
+
+**One chunk in, one vector out.** An item that carries an `embedding` must be exactly one chunk.
+The server refuses anything that would split, with
+`client embedding covers one chunk, this item split into N: send one chunk per item` — a vector
+cannot honestly represent several chunks.
+
+## Self-hosted dashboard
+
+The dashboard opens on **All projects**. Overview, graph and vector map can
+browse shared knowledge in the configured organization; use the project selector
+to filter. Graph and vector inspectors and queue rows show the original project.
+The graph also shows tag nodes linked to the visible documents carrying each
+tag. The initial graph draws tags from a bounded sample of the most recent
+visible chunks. Select a node to see its exact search tag and displayed links.
+The graph shows a neighborhood, not all matches; use tag-filtered search for retrieval.
+For API navigation, query the exact tag with `entity_types: ["knowledge_tag"]` at
+`/v1/graph/search`. Tag nodes are derived from live records, with no rebuild or
+separate tag index required.
+This view does not move data or change machine API search scope.
+The dashboard identifies members of Authelia's `admins` group as administrators.
+It checks this group in Authelia's authorization response for the actual route
+and request method, not in headers sent by the browser. Other signed-in viewers
+retain read-only access.
+
+Administrators can select one project or **All projects**, then choose **Rebuild
+knowledge** in Overview or **Rebuild graph** in Knowledge graph. Knowledge repair
+uses the configured server embedder for missing chunk vectors only; it does not
+re-embed or relabel existing vectors, including workstation-generated ones.
+Graph rebuild runs extraction on the selected scope's visible, indexed chunks
+and merges the derived mentions only when the entire job can publish. A model
+can omit facts even in a successful response, so omissions do not remove
+existing mentions. Incomplete or refused responses fail the job in **Queue**
+without changing the serving graph.
+Manual entities and relations are preserved. This action sends eligible chunk
+text to the configured extraction provider and requires `OPENAI_BASE_URL`,
+`OPENAI_API_KEY`, and `EXTRACTION_MODEL`; it does not enable automatic extraction
+during ingestion. Neither rebuild deletes source documents or memories.
+
+Each operation queues one persisted job; only one rebuild can be active in the
+organization. **Queue** shows the selected scope, chunks prepared, and failure
+details. Prepared vectors and graph claims stay private to the job across
+worker restarts. The last step rechecks the indexed inputs and publishes all
+changes in one transaction. If an input changed or publication fails, none of
+the rebuild's changes become visible. No rebuild runs just because you open or
+refresh the dashboard, or deploy an update.
+
+Use **Overview** to see indexed documents, searchable chunks, sources, active
+memories, visible entities, and how many chunks have a stored embedding.
+Chunk, document, source and embedding statistics (including the Vector map's
+model list) are refreshed in the background about every five minutes while the
+dashboard is enabled. **Counts as of** shows when the last successful statistics
+refresh took its snapshot. If a refresh fails, the last counts and timestamp
+remain visible until the next successful refresh. The Refresh button rereads
+the latest counts; it does not scan the corpus or rebuild embeddings.
+Publication and authorization are checked live, so withdrawn documents do not
+wait for the next count refresh.
+Memory and entity counts and the plotted vector sample are read live.
+You can open a model as soon as it has visible vectors; its count may not be
+available until the next statistics refresh.
+
+Use **Knowledge graph** to browse stored entities and one hop of relations, or search
+for an entity by name. **Vector map** plots up to 200 recent, nonzero chunk
+embeddings from one recorded model. The axes show cosine similarity to two
+stored examples, not full-vector distance between points. Unlabelled vectors
+count toward coverage but are not plotted with known models. Normal document
+ingestion and repository publication record the model that generated each new
+vector when the provider identifies it. Existing vectors are not relabelled.
+The inspector shows the document title and chunk number. If a bookmarked model
+is no longer present, use **Show available models**.
+
+**Queue** shows persisted ingestion jobs, source syncs, repository index
+generations, and native capture jobs across all authorized projects or for the
+selected project. Counts cover all matching jobs; the table shows up to 50 with
+active jobs first. Repository
+attempts that cannot publish are marked blocked or superseded, not active. The
+table does not show jobs queued only on another device. **Logs** shows up to 200
+recent `/v1/` request outcomes for this server process, with the handling route's
+template, status and duration. It is not a container log archive, and it clears
+on process restart.
+The **Refresh** button reads current data again without starting work. If the
+server returns an error, the dashboard can keep the last result for that same
+view and mark it as **Previous result**; changing scope or losing access clears it.
+
+The dashboard is off by default. On the home cluster, enable it on the RetainDB
+server in `terraform/stack/retaindb.tf` with the existing Authelia ingress:
+
+```dotenv
+RETAINDB_DASHBOARD_ORIGIN=https://retaindb.home.lan
+RETAINDB_DASHBOARD_AUTH_URL=https://auth.home.lan/api/authz/forward-auth
+```
+
+Set `RETAINDB_DASHBOARD_SESSION_COOKIE` only if the Authelia cookie name differs
+from `authelia_session`. Keep TLS verification enabled and use the existing
+`NODE_EXTRA_CA_CERTS` bundle for the internal CA. The backend checks the browser
+session with Authelia; it does not trust incoming identity headers or give the
+browser the API key. The dashboard reads the OSS `default` organization only.
+Apply the release's Prisma migrations before starting an upgraded server. The
+dashboard Queue and rebuild controls require the `dashboard_rebuilds` table.
+The Docker entrypoint applies migrations; on non-Docker installs, run
+`pnpm --filter @retaindb/server exec prisma migrate deploy` against the server's
+database before starting the new version. No host changes are required. The
+browser opens `/dashboard` from the root URL; the machine API and its auth
+remain unchanged.
+
+If embedding a Knowledge rebuild batch takes longer than 60 seconds, the
+job shows a timeout in **Queue** and releases the slot for another rebuild.
+The timed-out batch cannot publish vectors after the error.
+
+### Knowledge engine upgrade (origin, evidence, claims)
+
+The graph provenance release ships as two migrations that must not be collapsed:
+
+1. `knowledge_engine_origin_and_claims` adds `origin` to `entities` and `entity_relations` with a
+   default, creates `evidence` and `claims`, and adds the read-path indexes. It adds no constraint,
+   so a process from the previous version keeps writing during a rolling upgrade.
+2. `knowledge_engine_origin_check` backfills `origin = 'extracted'` for every `isManual = false`
+   row, then validates the `origin`/`isManual` constraint.
+3. `claim_anchor_check` rejects a claim that carries both an entity and a relation anchor; a claim
+   with neither anchor is a cascaded orphan and stays storable for the maintenance job to collect.
+
+Apply step 2 only after every writer runs the new version. Applying it early makes an old writer
+fail its inserts. Both migrations are additive: existing graph rows, weights and manual
+annotations are preserved, and no document is re-extracted by the upgrade.
+
+Claims are active while their evidence digest is present in a document of the source's active
+version, so an unchanged re-import, a version rollback, or a pruned version need no rebind writes.
+The maintenance job deletes claims whose entity and relation anchors both cascaded away and claims
+whose digest left every document of their source outside the history window; `GET
+/v1/admin/ops/routes` reports the current claim total and orphan count next to the route matrix.
+
+Run the dashboard end-to-end tests against a dedicated, migrated pgvector test
+database and an installed Chrome browser:
+
+```bash
+RETAINDB_TEST_DATABASE_URL="$DATABASE_URL" RETAINDB_TEST_CHROME_CHANNEL=chrome \
+  pnpm --filter @retaindb/server exec tsx --test test/dashboard.test.ts test/dashboard-data.integration.test.ts
+```
+
 ## Configuration
 
 | Env var | Default | Description |
@@ -449,9 +828,16 @@ The self-hosted server can index external knowledge sources into agent context:
 | `RETAINDB_EMBEDDING_PROVIDER` | `hash` | `hash` or `local-transformers` |
 | `DATABASE_URL` | unset | Postgres connection string for server |
 | `RETAINDB_API_KEY` | unset | Optional API auth key |
+| `RETAINDB_DASHBOARD_ORIGIN` | unset | HTTPS origin reserved for the browser dashboard |
+| `RETAINDB_DASHBOARD_AUTH_URL` | unset | Trusted HTTPS Authelia forward-auth endpoint |
+| `RETAINDB_DASHBOARD_SESSION_COOKIE` | `authelia_session` | Authelia cookie validated by the dashboard |
 | `OPENAI_API_KEY` | unset | Enables OpenAI-backed server embeddings |
 | `EMBEDDING_MODE` | `auto` | Server embedding mode |
+| `EMBEDDING_MODEL` | `Xenova/multilingual-e5-large` | Model the server loads when it embeds itself; one model per corpus |
+| `HEALTH_DB_TIMEOUT_MS` | `2000` | Budget for the readiness database probe |
+| `RETAINDB_CONFIG` | `~/.retaindb-mcp/config.json` | Config file the CLI, hooks and MCP server read |
 | `EXTRACTION_MODEL` | `gpt-4o-mini` | Server extraction model |
+| `DISABLE_AUTO_EXTRACTION` | `false` | Skip automatic entity extraction during document ingestion |
 | `PORT` | `3000` | Server HTTP port |
 | `DISABLE_SCHEDULER` | `false` | Disable server background sync |
 
@@ -489,6 +875,7 @@ Self-hosted notes:
 | `packages/sdk` | `@retaindb/sdk` | TypeScript SDK |
 | `packages/mcp` | `@retaindb/mcp` | MCP server |
 | `packages/server` | not published | Self-hostable API server |
+| `packages/repo-sync` | not published | Rust `retaindb-repo` client: hook hints and Git reconcile |
 
 ## Development
 
@@ -496,7 +883,9 @@ Self-hosted notes:
 pnpm install
 pnpm local:demo
 pnpm --filter @retaindb/local typecheck
+pnpm --filter @retaindb/sdk build
 pnpm --filter @retaindb/mcp typecheck
+pnpm --filter @retaindb/mcp test
 pnpm --filter @retaindb/sdk typecheck
 ```
 
@@ -504,8 +893,42 @@ Server development:
 
 ```bash
 cp .env.example packages/server/.env
-pnpm --filter @retaindb/server run db:push
+pnpm --filter @retaindb/server run db:generate
+pnpm --filter @retaindb/server exec prisma migrate deploy
 pnpm dev:server
+```
+
+Database-client regression tests use the generated Prisma client without a running database:
+
+```bash
+pnpm --filter @retaindb/server run db:generate
+pnpm --filter @retaindb/server test
+```
+
+To run the same suite against a dedicated PostgreSQL database with pgvector, start the ephemeral fixture and point the suite at it:
+
+```bash
+# pgvector on 127.0.0.1:55432, data on a tmpfs; `down -v` throws the database away.
+# Podman is used through its Docker-compatible socket, so the commands are the same:
+#   export DOCKER_HOST="unix://$(podman machine inspect --format '{{.ConnectionInfo.PodmanSocket.Path}}')"
+pnpm --filter @retaindb/server run test:db:up
+pnpm --filter @retaindb/server run test:db:migrate
+RETAINDB_TEST_DATABASE_URL=postgresql://retaindb_test:retaindb_test@127.0.0.1:55432/retaindb_test \
+  RETAINDB_TEST_LOCAL_EMBEDDINGS=true EMBEDDING_MODE=local \
+  DISABLE_AUTO_EXTRACTION=true pnpm --filter @retaindb/server test
+pnpm --filter @retaindb/server run test:db:down
+```
+
+The fixture is `test/compose.yaml`, a standard-name Compose file, so `cd test && docker compose up -d --wait` works without flags. Any PostgreSQL with the `vector` extension works instead; set `RETAINDB_TEST_DATABASE_URL` to its URL and skip the compose steps.
+
+The integration tests create and remove their own project data and a temporary chunk constraint for failure injection; some also create and drop their own temporary databases, so the test role needs permission to do that. Use a dedicated test database, never a production memory store. Without `RETAINDB_TEST_DATABASE_URL`, these tests are reported as skipped. Vector ingestion/retrieval, bulk local embeddings and queued-document checks additionally require `RETAINDB_TEST_LOCAL_EMBEDDINGS=true` and download the BGE model on first use. Test processes isolate their database, embedding mode and credential environment before imports, then restore it during teardown. The Node 20/22 CI jobs apply all migrations, repeat deployment, and run this real-database suite. These checks cover the ownerless `default` organization without a fabricated user, retained tenant/project foreign keys, source versions, document vectors, queued document processing, persistence-failure reporting, connector job health, and API loading; they do not establish parity for every legacy table or optional agent/storage feature.
+
+Client (`packages/repo-sync`, std-only Rust, no crates.io dependencies):
+
+```bash
+cargo fmt --manifest-path packages/repo-sync/Cargo.toml --check
+cargo clippy --manifest-path packages/repo-sync/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path packages/repo-sync/Cargo.toml
 ```
 
 ## Contributing

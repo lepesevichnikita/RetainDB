@@ -1,0 +1,15 @@
+.git
+.metrics
+target
+**/node_modules
+**/dist
+**/.turbo
+**/coverage
+**/.env
+**/.env.*
+!**/.env.example
+**/*.db
+**/*.db-*
+packages/server/test
+packages/local/test
+.DS_Store

@@ -53,10 +53,13 @@ function assertInferenceBaseUrl(route: InferenceRoute, baseUrl: string) {
   }
 }
 
-async function postJson(route: InferenceRoute, path: string, payload: Record<string, any>) {
+async function postJson(route: InferenceRoute, path: string, payload: Record<string, any>, signal?: AbortSignal) {
   const baseUrl = resolveBaseUrl(route);
   assertInferenceBaseUrl(route, baseUrl);
   const controller = new AbortController();
+  const abort = () => controller.abort(signal?.reason);
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) abort();
   const timeout = setTimeout(() => controller.abort(), Math.max(100, INFERENCE_TIMEOUT_MS));
   try {
     const response = await fetch(`${baseUrl}${path}`, {
@@ -72,6 +75,7 @@ async function postJson(route: InferenceRoute, path: string, payload: Record<str
     return data;
   } finally {
     clearTimeout(timeout);
+    signal?.removeEventListener("abort", abort);
   }
 }
 
@@ -86,14 +90,15 @@ function parseEmbeddings(data: any): number[][] {
   return embeddings;
 }
 
-export async function embedWithInferenceService(texts: string[]): Promise<number[][]> {
-  if (!texts.length) return [];
-  const data = await postJson("embedding", "/v1/inference/embeddings", { inputs: texts });
+export async function embedWithInferenceService(texts: string[], signal?: AbortSignal) {
+  if (!texts.length) return { vectors: [], model: null };
+  const data = await postJson("embedding", "/v1/inference/embeddings", { inputs: texts }, signal);
   const embeddings = parseEmbeddings(data);
   if (embeddings.length !== texts.length) {
     throw new Error("Embedding count mismatch from inference service");
   }
-  return embeddings;
+  const model = typeof data.model === "string" ? data.model.trim() : "";
+  return { vectors: embeddings, model: model.length > 0 && model.length <= 256 ? model : null };
 }
 
 export async function rerankWithInferenceService<T extends { content: string; score: number }>(

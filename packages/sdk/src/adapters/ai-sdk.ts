@@ -1,6 +1,6 @@
 import type { QueryParams } from "../index.js";
 import { RetainDBError } from "../errors.js";
-import { RetainDBClient, type RetainDBClientConfig } from "../context.js";
+import { RetainDBClient, type RetainDBClientConfig } from "../whisper.js";
 
 type AnyRecord = Record<string, unknown>;
 

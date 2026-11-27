@@ -7,6 +7,7 @@ import {
   purgeExpiredDeletedSources,
 } from "./source-versions.js";
 import { runSessionLifecycle } from "./memory/session-lifecycle.js";
+import { pruneClaims } from "./knowledge/claims.js";
 
 // ─── Cron Parser ────────────────────────────────────────────
 // Lightweight cron matching — supports: minute hour dayOfMonth month dayOfWeek
@@ -210,6 +211,7 @@ async function runOperationalMaintenance() {
       purgeExpiredDeletedSources(),
       pruneSupersededSourceVersions(),
       evaluateOperationalAlerts(),
+      pruneClaims(),
     ]);
 
     if (OPS_ALERT_ORG_ID) {

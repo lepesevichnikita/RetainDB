@@ -28,10 +28,12 @@ export interface QueryParams {
   threshold?: number;
   chunk_types?: string[];
   source_ids?: string[];
+  tags?: string[];
   metadata_filter?: Record<string, any>;
   hybrid?: boolean;
   vector_weight?: number;
   bm25_weight?: number;
+  use_vector?: boolean;
   rerank?: boolean;
   include_memories?: boolean;
   include_pending?: boolean;
@@ -40,6 +42,8 @@ export interface QueryParams {
   agent_id?: string;
   include_graph?: boolean;
   graph_depth?: number;
+  /** With include_graph: attach up to three active claims (snippet, path, url, confidence) per relation. */
+  include_evidence?: boolean;
   max_tokens?: number;
   compress?: boolean;
   compression_strategy?: "summarize" | "extract" | "delta" | "adaptive";
@@ -56,12 +60,16 @@ export interface QueryResult {
     metadata: Record<string, any>;
     source: string;
     document: string;
+    project?: string;
     type: string;
     retrieval_source: string;
   }>;
   context: string;
   meta: {
     query: string;
+    project_scope?: "project" | "organization";
+    applied_tags?: string[];
+    degraded?: { reranked: boolean; reasons: string[] };
     total: number;
     latency_ms: number;
     cache_hit: boolean;
@@ -79,6 +87,7 @@ export interface QueryResult {
     timing?: {
       cache_check_ms?: number;
       embed_ms?: number;
+      embedding_unavailable?: boolean;
       vector_ms?: number;
       fts_ms?: number;
       rerank_ms?: number;
@@ -86,7 +95,7 @@ export interface QueryResult {
       pack_ms?: number;
       cache_set_ms?: number;
       total_ms?: number;
-      [key: string]: number | undefined;
+      [key: string]: number | boolean | undefined;
     };
   };
 }
@@ -860,11 +869,11 @@ export class RetainDBContext {
   }
 
   async query(params: QueryParams): Promise<QueryResult> {
-    const projectRef = this.getRequiredProject(params.project);
-    return this.withProjectRefFallback(projectRef, (project) => this.request<QueryResult>("/v1/context/query", {
+    const project = params.project ?? this.defaultProject;
+    return this.request<QueryResult>("/v1/context/query", {
       method: "POST",
       body: JSON.stringify({ ...params, project }),
-    }));
+    });
   }
 
   async readContextFile(params: ContextFilesystemParams = {}): Promise<ContextFilesystemResult> {
@@ -2270,7 +2279,7 @@ export class RetainDBContext {
   };
 }
 
-export { RetainDBClient } from "./context.js";
+export { RetainDBClient } from "./whisper.js";
 export { RetainDBError };
 export type { RetainDBErrorCode };
 export type {
@@ -2281,18 +2290,13 @@ export type {
   RetainDBPreflightCheck,
   RetainDBPreflightResult,
   RetainDBResolvedIdentity,
-  RetainDBAgentScope,
-  RetainDBTaskScope,
-  AgentMemoryEventInput,
-  AgentMemoryContextInput,
-  AgentMemoryHandoffInput,
   RememberParams,
   IngestParams,
   QueryInput,
-} from "./context.js";
+} from "./whisper.js";
 export type {
   AgentRunContext,
-  RetainDBAgentRuntime,
+  WhisperAgentRuntime as RetainDBAgentRuntime,
   AgentRuntimeRankWeights,
   AgentRuntimeRetrievalOptions,
   AgentRuntimeSourceActivityOptions,

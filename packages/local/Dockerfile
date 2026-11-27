@@ -5,6 +5,7 @@ RUN npm install -g pnpm@9.15.0
 WORKDIR /app
 
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml turbo.json ./
+COPY packages/mcp/patches/ ./packages/mcp/patches/
 COPY packages/local/package.json ./packages/local/package.json
 
 RUN pnpm install --frozen-lockfile --filter @retaindb/local...

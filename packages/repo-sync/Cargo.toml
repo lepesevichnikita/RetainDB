@@ -1,0 +1,20 @@
+[package]
+name = "retaindb-repo"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Metadata-only Git reconciler and hook hint client for RetainDB"
+license = "Apache-2.0"
+publish = false
+
+# No dependencies on purpose: this client must build with std only so that
+# `cargo build --offline` works on a machine without crates.io access.
+# SHA-256 and the JSON reader/writer are implemented in-tree.
+
+[lib]
+name = "retaindb_repo"
+path = "src/lib.rs"
+
+[[bin]]
+name = "retaindb-repo"
+path = "src/main.rs"

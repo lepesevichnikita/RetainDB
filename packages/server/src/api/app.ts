@@ -4,6 +4,8 @@ import { logger } from "hono/logger";
 import { randomUUID } from "crypto";
 import { latencyTraceMiddleware } from "../middleware/latency-trace.js";
 import { maybeSendAlertEmail } from "../engine/alert-email.js";
+import { createDashboard, DASHBOARD_PATH, isDashboardPath } from "../dashboard.js";
+import { readReadiness, type ReadinessReport } from "../health.js";
 
 const STACK_NAME = process.env.RETAINDB_STACK || "ec2";
 
@@ -84,12 +86,15 @@ async function maybeAlertRequestError(c: any) {
   });
 }
 
-export function createNodeApp(options: { includeApiRoutes?: boolean; routeApp?: Hono<any, any, any> } = {}) {
-  const { includeApiRoutes = true, routeApp } = options;
+export function createNodeApp(options: { includeApiRoutes?: boolean; routeApp?: Hono<any, any, any>; readinessCheck?: () => Promise<ReadinessReport> } = {}) {
+  const { includeApiRoutes = true, routeApp, readinessCheck = readReadiness } = options;
   const app = new Hono();
+  const dashboard = createDashboard();
+  const apiCors = cors();
+  const apiLogger = logger();
 
-  app.use("*", cors());
-  app.use("*", logger());
+  app.use("*", (c, next) => isDashboardPath(c.req.path) ? next() : apiCors(c, next));
+  app.use("*", (c, next) => isDashboardPath(c.req.path) ? next() : apiLogger(c, next));
   app.use("*", async (c, next) => {
     const traceId = getTraceIdFromRequest(c);
     c.header("x-trace-id", traceId);
@@ -109,6 +114,11 @@ export function createNodeApp(options: { includeApiRoutes?: boolean; routeApp?: 
   });
 
   app.get("/", (c) => {
+    if (dashboard) c.header("Vary", "Accept, Host", { append: true });
+    if (dashboard?.wantsPage(c)) {
+      c.header("Cache-Control", "no-store");
+      return c.redirect(DASHBOARD_PATH);
+    }
     return c.json({
       name: "RetainDB - SOTA Memory & Context System",
       version: "2.1.0",
@@ -158,7 +168,34 @@ export function createNodeApp(options: { includeApiRoutes?: boolean; routeApp?: 
     });
   });
 
-  app.get("/health", (c) => c.json({ status: "ok" }));
+  // Liveness answers as long as this process can serve a request. Readiness
+  // additionally proves the dependencies the API needs; a failed dependency
+  // removes the pod from the Service without restarting a healthy process.
+  app.get("/livez", (c) => c.json({ status: "ok" }));
+  app.get("/health", async (c) => {
+    c.header("Cache-Control", "no-store");
+    try {
+      const report = await readinessCheck();
+      return c.json(report, report.status === "ok" ? 200 : 503);
+    } catch (error) {
+      console.error("[health] Readiness check failed:", error);
+      return c.json(
+        {
+          status: "unhealthy",
+          checks: {
+            database: { status: "down", latencyMs: 0 },
+            embeddings: { status: "failed", mode: process.env.EMBEDDING_MODE || "remote", model: null },
+          },
+          uptimeSeconds: Math.round(process.uptime()),
+        },
+        503
+      );
+    }
+  });
+  if (dashboard) {
+    app.use("/v1/*", dashboard.logRequest);
+    app.route(DASHBOARD_PATH, dashboard.routes);
+  }
   if (includeApiRoutes && routeApp) {
     app.route("/", routeApp);
   }

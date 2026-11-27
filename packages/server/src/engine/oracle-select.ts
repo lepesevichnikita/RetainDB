@@ -1,5 +1,7 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "../db/index.js";
+import { compatibleEmbeddingModel, exactDistanceOrder } from "./vector-order.js";
+import { visibleSourceSql } from "./oracle-visibility.js";
 
 export type OracleSelectScope = {
   seed_hits: Array<{
@@ -37,6 +39,7 @@ function safeSectionPath(value: unknown): string {
 export async function selectOracleScope(params: {
   projectId: string;
   queryEmbedding: number[];
+  queryModel?: string | null;
   sourceIds?: string[];
   chunkTypes?: string[];
   metadataFilter?: Record<string, any>;
@@ -48,6 +51,7 @@ export async function selectOracleScope(params: {
   const {
     projectId,
     queryEmbedding,
+    queryModel = null,
     sourceIds,
     chunkTypes,
     metadataFilter,
@@ -66,10 +70,10 @@ export async function selectOracleScope(params: {
   const scopedSourceIds = uniqueStrings(sourceIds || []);
   const scopedChunkTypes = uniqueStrings(chunkTypes || []);
 
-  const sourceFilterSql =
-    scopedSourceIds.length > 0
-      ? Prisma.sql`AND d."sourceId" = ANY(${scopedSourceIds})`
-      : Prisma.empty;
+  // The source side of the scope: the caller's own narrowing, plus the rule that a repository scope
+  // no reader may see is not visible. It belongs inside the scoped set - the ranking takes its k
+  // from the rows this selected, so a hidden row cannot occupy a slot a visible one should have.
+  const sourceFilterSql = visibleSourceSql(scopedSourceIds);
   const chunkTypeFilterSql =
     scopedChunkTypes.length > 0
       ? Prisma.sql`AND c."chunkType" = ANY(${scopedChunkTypes})`
@@ -85,16 +89,14 @@ export async function selectOracleScope(params: {
     sectionPath: string | null;
     headingPath: string | null;
     similarity: number;
-  }>>(Prisma.sql`
-    SELECT
-      c.id,
-      c."documentId",
-      c."sectionPath",
-      c."headingPath",
-      1 - (c.embedding <=> ${embeddingStr}::vector) as similarity
-    FROM chunks c
-    WHERE c."projectId" = ${projectId}
+  }>>(exactDistanceOrder({
+    table: "chunks",
+    alias: "c",
+    columns: Prisma.sql`c.id, c."documentId", c."sectionPath", c."headingPath"`,
+    scope: Prisma.sql`
+      c."projectId" = ${projectId}
       AND c.embedding IS NOT NULL
+      AND ${compatibleEmbeddingModel(Prisma.sql`c.metadata`, queryModel)}
       AND COALESCE(c.metadata->>'content_kind', '') <> 'parent_context'
       ${chunkTypeFilterSql}
       ${metadataFilterSql}
@@ -109,10 +111,10 @@ export async function selectOracleScope(params: {
             s."activeVersionId" IS NULL
             OR d."sourceVersionId" = s."activeVersionId"
           )
-      )
-    ORDER BY c.embedding <=> ${embeddingStr}::vector
-    LIMIT ${Math.max(10, Math.min(maxSeedHits, 400))}
-  `)) || [];
+      )`,
+    embedding: embeddingStr,
+    limit: Math.max(10, Math.min(maxSeedHits, 400)),
+  }))) || [];
 
   const normalizedSeedHits = seedHits.map((hit) => ({
     chunk_id: hit.id,
@@ -159,7 +161,11 @@ export async function selectOracleScope(params: {
     const rows = (await prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
       SELECT c.id
       FROM chunks c
+      INNER JOIN documents d ON d.id = c."documentId"
+      INNER JOIN sources s ON s.id = d."sourceId"
       WHERE c."documentId" = ${doc.document_id}
+        AND d."deletedAt" IS NULL
+        ${visibleSourceSql()}
         AND COALESCE(c.metadata->>'content_kind', '') <> 'parent_context'
         AND c."sectionPath" = ANY(${doc.section_paths})
         ${chunkTypeFilterSql}

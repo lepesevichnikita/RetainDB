@@ -2,17 +2,19 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { spawnSync } from "child_process";
+import { execFile as execFileCallback, spawnSync } from "child_process";
+import { promisify } from "util";
 import { readdirSync, readFileSync, statSync } from "fs";
 import { join, relative, extname } from "path";
 import { userInfo } from "os";
 import { createHash } from "crypto";
-import { RetainDBContext } from "../../sdk/src/index.js";
+import { RetainDBContext } from "@retaindb/sdk";
 import {
   buildMcpSearchPayload,
   buildPrimaryToolSuccess,
   buildPrimaryToolError,
 } from "./search-payload.mjs";
+import { buildIndexArgs } from "./index-args.mjs";
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
@@ -22,18 +24,21 @@ const BASE_URL = process.env.RETAINDB_BASE_URL || "http://localhost:3111";
 
 // ─── Client bootstrap ──────────────────────────────────────────────────────
 
-function makeClient(): RetainDBContext {
+function makeClient(project?: string): RetainDBContext {
   return new RetainDBContext({
-    apiKey: API_KEY,
-    project: DEFAULT_PROJECT,
+    apiKey: API_KEY || "anonymous",
+    project,
     ...(BASE_URL ? { baseUrl: BASE_URL } : {}),
   });
 }
 
-const client = makeClient();
+const client = makeClient(DEFAULT_PROJECT);
+const knowledgeClient = makeClient();
 let cachedProject: string | undefined;
 
 // ─── Server ────────────────────────────────────────────────────────────────
+
+const execFile = promisify(execFileCallback);
 
 const server = new McpServer({
   name: "retaindb",
@@ -868,41 +873,36 @@ server.tool(
 // 6. SEARCH — semantic search over indexed sources + local codebase
 server.tool(
   "search",
-  "Search both indexed project sources (GitHub, docs, PDFs) and the local codebase. Use this to find relevant code, documentation, or context.",
+  "Search indexed knowledge across the organization. Supply tags to require all exact labels, such as project:mp or machine:mac-mini. An explicit project also narrows the search.",
   {
     query: z.string().describe("What to search for"),
     top_k: z.number().optional().default(10),
     session_id: z.string().optional(),
+    project: z.string().trim().min(1).optional().describe("Filter by project name, slug, or ID; omit for shared knowledge"),
+    tags: z.array(z.string().trim().min(1).max(512)).max(32).optional().describe("Require all these exact tags; omit to search all knowledge"),
   },
-  async ({ query, top_k, session_id }) => {
+  async ({ query, top_k, session_id, project, tags }) => {
     try {
-      const project = await resolveProject();
-      const localResults = searchLocalFiles(query, process.cwd(), top_k ?? 10);
-
-      let remoteContext = "";
-      let remoteResults: unknown[] = [];
-      try {
-        const response = await client.query({
-          project,
-          query,
-          top_k,
-          include_memories: false,
-          user_id: defaultUserId(),
-          session_id: session_id?.trim(),
-        });
-        remoteContext = response.context || "";
-        remoteResults = response.results || [];
-      } catch { /* return local results if API fails */ }
-
-      return { content: [{ type: "text" as const, text: JSON.stringify(buildMcpSearchPayload({
+      const response = await knowledgeClient.query({ project, query, top_k, include_memories: false, session_id, tags });
+      const applied = response.meta?.applied_tags;
+      if (tags?.length && (!Array.isArray(applied) || applied.length !== tags.length || tags.some((tag, i) => tag !== applied[i]))) {
+        return { ...err("TAG_FILTER_UNSUPPORTED: the RetainDB backend did not apply the requested tags."), isError: true };
+      }
+      const localResults = tags?.length ? [] : searchLocalFiles(query, process.cwd(), top_k ?? 10);
+      const payload = buildMcpSearchPayload({
         mode: "semantic",
         query,
-        context: remoteContext,
-        results: remoteResults,
+        context: response.context,
+        results: response.results,
+        degradedMode: Boolean(response.meta?.degraded?.reasons?.length || response.meta?.timing?.embedding_unavailable),
+        degradedReason: response.meta?.degraded?.reasons?.join(", ") || (response.meta?.timing?.embedding_unavailable ? "Embedding unavailable" : null),
+      });
+      return { content: [{ type: "text" as const, text: JSON.stringify({
+        ...payload,
         ...(localResults.length > 0 ? { local_results: localResults } : {}),
-      } as any), null, 2) }] };
-    } catch (error: any) {
-      return err(error.message);
+      }, null, 2) }] };
+    } catch (error) {
+      return { ...err(error instanceof Error ? error.message : "Search failed"), isError: true };
     }
   }
 );
@@ -982,23 +982,38 @@ server.tool(
   }
 );
 
-// ─── Entry point ───────────────────────────────────────────────────────────
-
-async function startupProbe() {
-  try {
-    const project = await resolveProject();
-    const userId = defaultUserId();
-    console.error(`[retaindb-mcp] ready — project: ${project}, user: ${userId}`);
-  } catch (e: any) {
-    console.error(`[retaindb-mcp] warning: could not resolve project (${e?.message ?? e})`);
+server.tool(
+  "index_directory",
+  "Index every text file under a directory on this machine with tree-sitter and ship the chunks plus the symbol graph into RetainDB pgvector. " +
+  "Runs the installed `retaindb-index` CLI, so the same queue, dedup and batching apply. Returns what was sent.",
+  {
+    root: z.string().describe("Absolute path of the directory to index"),
+    project: z.string().optional().describe("Project to write into (defaults to the configured project)"),
+    graph: z.boolean().optional().default(true).describe("Also ship entities and relations"),
+    dry_run: z.boolean().optional().default(false).describe("Report what would be sent and post nothing"),
+    batch: z.number().optional().describe("Rows per request (default 200)"),
+    delay: z.number().optional().describe("Pause between batches in ms"),
+  },
+  async (options) => {
+    try {
+      const { stdout } = await execFile("retaindb-index", buildIndexArgs(options), {
+        maxBuffer: 8 * 1024 * 1024,
+        timeout: 30 * 60 * 1000,
+      });
+      const report = JSON.parse(stdout.trim().split("\n").pop() ?? "{}");
+      return ok({ tool: "index_directory", ...report });
+    } catch (error: any) {
+      return err(error?.stdout?.trim() || error?.message || "indexing failed");
+    }
   }
-}
+);
+
+// ─── Entry point ───────────────────────────────────────────────────────────
 
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error(`[retaindb-mcp] running on stdio (${API_KEY ? "authenticated" : "local no-key mode"}, ${BASE_URL})`);
-  startupProbe().catch(() => {});
 }
 
 if (process.argv[1] && /server\.(mjs|cjs|js|ts)$/.test(process.argv[1])) {

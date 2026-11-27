@@ -1,6 +1,6 @@
 import { prisma } from "../db/index.js";
 import { Prisma } from "@prisma/client";
-import { embedSingle } from "./embeddings.js";
+import { embedSingle, embedSingleWithModel } from "./embeddings.js";
 import { compressContext } from "./compressor.js";
 import { createHash } from "crypto";
 import OpenAI from "openai";
@@ -9,6 +9,10 @@ import { getFromCache, setInCache } from "./cache.js";
 import { recordRetrievalWorkloadSample, recordStageBreakdown } from "./latency-tracing.js";
 import { rerankWithInferenceService } from "./inference-client.js";
 import { selectOracleCandidateChunkIds } from "./oracle-select.js";
+import { searchGraphChunks } from "./entity-graph.js";
+import { compatibleEmbeddingModel, exactDistanceOrder } from "./vector-order.js";
+import { knowledgeTagFilterSql, knowledgeTagsSql, projectScopeSql, publishedDocumentSql, type ProjectSearchScope, visibleSourceSql } from "./oracle-visibility.js";
+import { relationEvidence, type RelationEvidence } from "./knowledge/claims.js";
 
 let openaiClient: OpenAI | null = null;
 
@@ -51,12 +55,12 @@ export interface RetrievalResult {
   metadata: Record<string, any>;
   documentTitle?: string;
   sourceName?: string;
+  project?: string;
   chunkType: string;
   source: "vector" | "bm25" | "hybrid" | "memory" | "graph";
 }
 
-export interface QueryOptions {
-  projectId: string;
+export type QueryOptions = ({ scope: ProjectSearchScope; projectId?: never } | { projectId: string; scope?: never }) & {
   query: string;
   topK?: number;
   threshold?: number;
@@ -85,6 +89,8 @@ export interface QueryOptions {
   // Graph
   includeGraph?: boolean;
   graphDepth?: number;
+  /** Attach the top three openable claims to every returned relation (relations only in v1). */
+  includeEvidence?: boolean;
   // Context packing
   maxTokens?: number;
   // Compression
@@ -97,7 +103,7 @@ export interface QueryOptions {
   // Payload + rollout
   includeParentContent?: boolean;
   retrievalProfile?: RetrievalProfile;
-}
+};
 
 export interface ContextResponse {
   results: RetrievalResult[];
@@ -121,11 +127,23 @@ export interface ContextResponse {
       matchedSources?: number;
     };
     profile?: string;
+    degraded?: {
+      reranked: boolean;
+      reasons: string[];
+    };
     retrievalProfile?: RetrievalProfile;
     sourceFamily?: string;
     timing?: {
       cache_check_ms?: number;
       embed_ms?: number;
+      /** True when the embedder could not be reached, so this answer came from the lexical half only. */
+      embedding_unavailable?: boolean;
+      /**
+       * True when memories were asked for but never searched: that search is a vector query too, and an
+       * empty embedding would return unrelated rows. Without this a client cannot tell "no memories"
+       * from "we did not look".
+       */
+      memory_skipped?: boolean;
       oracle_ms?: number;
       vector_ms?: number;
       fts_ms?: number;
@@ -157,10 +175,23 @@ export interface ContextResponse {
 
 // ─── Main Query Function ─────────────────────────────────────
 
+export async function applyRerank<T>(
+  results: T[],
+  rerank: (results: T[]) => Promise<T[]>,
+): Promise<{ results: T[]; degraded: boolean }> {
+  try {
+    return { results: await rerank(results), degraded: false };
+  } catch (error) {
+    console.warn("[Retriever] Reranking unavailable, returning fused order:", error instanceof Error ? error.message : error);
+    return { results, degraded: true };
+  }
+}
+
 export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
+  const scope = opts.scope ?? opts.projectId;
+  if (scope === undefined) throw new Error("Retrieval requires a project or organization scope");
   const defaultRetrievalProfile: RetrievalProfile = RETRIEVAL_PRECISION_V1_DEFAULT ? "precision_v1" : "legacy";
   const {
-    projectId,
     query,
     topK = 10,
     threshold = 0.25,  // Increased from 0.05 for better quality (0.25 = good balance)
@@ -176,7 +207,7 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
     useVector = true,
     vectorWeight = 0.7,
     bm25Weight = 0.3,
-    rerank = true,
+    rerank: requestedRerank = true,
     rerankTopK,
     includeMemories = false,
     userId,
@@ -184,6 +215,7 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
     agentId,
     includeGraph = false,
     graphDepth = 1,
+    includeEvidence = false,
     maxTokens,
     compress = false,
     compressionStrategy = "adaptive",
@@ -194,9 +226,18 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
     retrievalProfile = defaultRetrievalProfile,
   } = opts;
 
+  const rerank = requestedRerank && process.env.RERANK_MODE !== "off";
+  const projectId = typeof scope === "string" ? scope : scope.projectId;
+  const orgId = typeof scope === "string" ? undefined : scope.orgId;
+  const hasTags = typeof scope !== "string" && Boolean(scope.tags?.length);
+
   const startTime = Date.now();
   const timing: NonNullable<ContextResponse["meta"]["timing"]> = {};
+  // Cached answers cannot recheck personal identity or changes to tag membership.
+  const cacheResults = useCache && !includeGraph && !includeMemories && !hasTags;
   const cacheParams = {
+    retrievalScopeVersion: 3,
+    orgId,
     query,
     topK,
     threshold,
@@ -224,9 +265,9 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
   };
   const precisionV1Enabled = retrievalProfile === "precision_v1";
   const explicitSourceIds = uniqueStrings(sourceIds || []);
-  const hasExplicitScope = explicitSourceIds.length > 0 || Boolean(metadataFilter && Object.keys(metadataFilter).length > 0);
-  const sourceIntent = explicitSourceIds.length === 0 ? detectQuerySourceIntent(query) : null;
-  const autoSourceIds = sourceIntent ? await resolveAutoSourceIds(projectId, sourceIntent) : [];
+  const hasExplicitScope = hasTags || explicitSourceIds.length > 0 || Boolean(metadataFilter && Object.keys(metadataFilter).length > 0);
+  const sourceIntent = !hasTags && explicitSourceIds.length === 0 ? detectQuerySourceIntent(query) : null;
+  const autoSourceIds = sourceIntent && projectId ? await resolveAutoSourceIds(projectId, sourceIntent) : [];
   const scopedSourceIds = explicitSourceIds.length > 0 ? explicitSourceIds : autoSourceIds;
   const sourceScope: NonNullable<ContextResponse["meta"]["sourceScope"]> = explicitSourceIds.length > 0
     ? {
@@ -248,7 +289,7 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
       };
 
   // ─── Check Cache ─────────────────────────────────────────
-  if (useCache) {
+  if (cacheResults && projectId) {
     const t0 = Date.now();
     const cached = await checkCache(projectId, cacheParams);
     timing.cache_check_ms = Date.now() - t0;
@@ -305,6 +346,10 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
           profile: RETRIEVAL_PROFILE,
           retrievalProfile,
           sourceFamily,
+          // Only a complete answer is ever stored (see the write below), so a hit cannot be degraded.
+          // It says so rather than omitting the field: a client reading `degraded.reasons` on every
+          // answer must not have to tell "nothing was lost" from "the field is missing".
+          degraded: { reranked: true, reasons: [] },
           timing,
         },
       };
@@ -313,20 +358,36 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
 
   // ─── Embed Query ─────────────────────────────────────────
   const tEmbed = Date.now();
-  const oracleActive = shouldEnableOracle({ query, oracleMode, chunkTypes, metadataFilter });
+  // Do not preselect unfiltered Oracle candidates before applying explicit tags.
+  const oracleActive = !hasTags && shouldEnableOracle({ query, oracleMode, chunkTypes, metadataFilter });
   const needsEmbedding = useVector || includeMemories || includeGraph || oracleActive;
-  let queryEmbedding = needsEmbedding ? await embedSingle(query) : [];
+  // The route declares use_vector defaulting to true, so a client that says nothing about vectors is
+  // asking for them. If the embedder is unavailable that must not become a 500 - it becomes a lexical
+  // answer, and the caller is told the answer is partial rather than left to believe it is complete.
+  let embeddingUnavailable: string | null = null;
+  let queryEmbedding: number[] = [];
+  let queryModel: string | null = null;
+  const loadQueryEmbedding = async () => {
+    const { vector, model } = await embedSingleWithModel(query);
+    queryEmbedding = vector;
+    queryModel = model;
+    return vector;
+  };
+  if (needsEmbedding) {
+    try {
+      await loadQueryEmbedding();
+    } catch (error) {
+      embeddingUnavailable = (error as Error).message;
+      console.warn(`[Retriever] embeddings unavailable, answering without the vector half: ${embeddingUnavailable}`);
+      timing.embedding_unavailable = true;
+    }
+  }
   timing.embed_ms = Date.now() - tEmbed;
   const codebaseIntent = precisionV1Enabled
     ? await classifyCodebaseIntent({
       query,
       queryEmbedding,
-      ensureEmbedding: async () => {
-        if (queryEmbedding.length === 0) {
-          queryEmbedding = await embedSingle(query);
-        }
-        return queryEmbedding;
-      },
+      ensureEmbedding: async () => queryEmbedding.length ? queryEmbedding : loadQueryEmbedding(),
     })
     : {
       isCodebaseIntent: false,
@@ -339,12 +400,13 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
   let allResults: RetrievalResult[] = [];
 
   let oracleChunkIdFilter: string[] | undefined;
-  if (oracleActive && queryEmbedding.length > 0) {
+  if (projectId && oracleActive && queryEmbedding.length > 0) {
     const tOracle = Date.now();
     try {
       const candidateChunkIds = await selectOracleCandidateChunkIds({
         projectId,
         queryEmbedding,
+        queryModel,
         sourceIds: scopedSourceIds,
         chunkTypes,
         metadataFilter,
@@ -370,7 +432,7 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
   // "do you remember me", "what did I tell you") skip all document search entirely
   // and route straight to memories. This avoids polluting memory-only results with
   // irrelevant document chunks and cuts latency significantly.
-  const personalQuery = isPersonalQuery(query);
+  const personalQuery = !hasTags && isPersonalQuery(query);
 
   // ─── Query Expansion (parallel, zero critical-path latency) ──────────────
   // Fire off paraphrase generation concurrently with the first vector search.
@@ -379,7 +441,7 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
   // more preference-related queries that all miss on document search anyway.
   const expansionPromise: Promise<RetrievalResult[]> =
     !personalQuery && useVector && queryEmbedding.length > 0 && process.env.OPENAI_API_KEY
-      ? expandQueryAndSearch(query, projectId, maxResultsPerSearch, chunkTypes, metadataFilter, scopedSourceIds, oracleChunkIdFilter)
+      ? expandQueryAndSearch(query, scope, maxResultsPerSearch, chunkTypes, metadataFilter, scopedSourceIds, oracleChunkIdFilter)
           .catch(() => [])
       : Promise.resolve([]);
 
@@ -388,8 +450,8 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
   const vectorResults =
     !personalQuery && useVector && queryEmbedding.length > 0
       ? await vectorSearch(
-        projectId,
-        queryEmbedding,
+        scope,
+        { vector: queryEmbedding, model: queryModel },
         maxResultsPerSearch,
         chunkTypes,
         metadataFilter,
@@ -404,7 +466,7 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
   if (!personalQuery && hybridSearch) {
     const tBm25 = Date.now();
     const bm25Results = await fullTextSearch(
-      projectId,
+      scope,
       query,
       maxResultsPerSearch,
       chunkTypes,
@@ -423,7 +485,7 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
   }
 
   // ─── Memory Search ───────────────────────────────────────
-  if (includeMemories) {
+  if (includeMemories && projectId && embeddingUnavailable === null) {
     const tMem = Date.now();
     // Personal queries ("what do I prefer", "my name", "do you remember me")
     // dominate the result set — give them the full topK budget plus extra headroom.
@@ -432,6 +494,7 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
       ? Math.max(topK, 25)
       : Math.min(Math.ceil(topK / 3), 10);
     const memoryResults = await memorySearch(projectId, queryEmbedding, {
+      orgId,
       userId,
       sessionId,
       agentId,
@@ -439,17 +502,27 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
     });
     timing.memory_ms = Date.now() - tMem;
     allResults.push(...memoryResults);
+  } else if (includeMemories) {
+    // Nothing was searched, so the absence of memory hits is not "no memories": the answer says the
+    // half was skipped, in the same place it says the vector half was.
+    timing.memory_skipped = true;
   }
 
   // ─── Graph Traversal ─────────────────────────────────────
-  if (includeGraph) {
+  let graph: Awaited<ReturnType<typeof searchGraphChunks>> | undefined;
+  if (includeGraph && embeddingUnavailable === null) {
     const tGraph = Date.now();
-    const graphResults = await graphSearch(projectId, queryEmbedding, {
-      depth: Math.min(graphDepth, 2),
+    graph = await searchGraphChunks({
+      scope,
+      embedding: queryEmbedding,
+      embeddingModel: queryModel,
+      depth: graphDepth,
       topK: Math.min(Math.ceil(topK / 3), 10),
+      primaryChunkIds: [...new Set(allResults.filter((hit) => hit.source !== "memory" && hit.score >= threshold).map(({ id }) => id))],
+      chunkScope: { sourceIds: scopedSourceIds, chunkTypes, metadataFilter },
     });
     timing.graph_ms = Date.now() - tGraph;
-    allResults.push(...graphResults);
+    allResults.push(...graph.results);
   }
 
   // Cap candidate churn to keep worst-case work bounded.
@@ -496,13 +569,17 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
   }
 
   // ─── Rerank with LLM ────────────────────────────────────
+  const degradedReasons: string[] = [];
   if (rerank && allResults.length > 0) {
     const tRerank = Date.now();
-    const reranked = await rerankResults(query, allResults, rerankTopK || topK, {
-      startTimeMs: startTime,
-      requestBudgetMs: RERANK_BUDGET_MS,
-    });
-    allResults = reranked;
+    const outcome = await applyRerank(allResults, (candidates) =>
+      rerankResults(query, candidates, rerankTopK || topK, {
+        startTimeMs: startTime,
+        requestBudgetMs: RERANK_BUDGET_MS,
+      }),
+    );
+    allResults = outcome.results;
+    if (outcome.degraded) degradedReasons.push("reranker_unavailable");
     timing.rerank_ms = Date.now() - tRerank;
   }
 
@@ -519,6 +596,8 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
 
   // ─── Context packing ─────────────────────────────────────
   allResults = allResults.slice(0, topK);
+  if (graph) allResults = attachGraphEvidence(allResults, graph.evidence);
+  if (graph && includeEvidence) allResults = await attachClaimEvidence(allResults, projectId);
 
   const tPack = Date.now();
   let context = packContext(allResults, maxTokens);
@@ -545,7 +624,17 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
   }
 
   // ─── Cache results ───────────────────────────────────────
-  if (useCache && allResults.length > 0) {
+  // Only a complete answer is stored. A cached answer is served for the whole TTL and cannot be
+  // re-checked: a partial one would keep presenting itself as complete, and would keep doing it after
+  // the embedder recovered. Not writing it costs one recomputation per repeated question during an
+  // outage and lets the next one be answered in full the moment the embedder is back.
+  //
+  // A degraded answer is partial for the same reason and is stored by the same rule: the fused order
+  // is what a reader gets when the reranker could not be consulted, and a stored copy would keep
+  // saying so only in a field nobody re-reads - the reranker may be healthy long before the entry
+  // expires. `degradedReasons` is empty for every answer that lost nothing, so the rule cannot drift
+  // into "never cache".
+  if (cacheResults && projectId && allResults.length > 0 && embeddingUnavailable === null && degradedReasons.length === 0) {
     const tSet = Date.now();
     await setCache(projectId, cacheParams, allResults, cacheTtlSeconds);
     timing.cache_set_ms = Date.now() - tSet;
@@ -577,6 +666,7 @@ export async function retrieve(opts: QueryOptions): Promise<ContextResponse> {
       profile: RETRIEVAL_PROFILE,
       retrievalProfile,
       sourceFamily,
+      degraded: { reranked: degradedReasons.length === 0, reasons: degradedReasons },
       timing,
     },
   };
@@ -764,7 +854,7 @@ function isPersonalQuery(query: string): boolean {
  */
 async function expandQueryAndSearch(
   query: string,
-  projectId: string,
+  scope: ProjectSearchScope,
   maxResults: number,
   chunkTypes?: string[],
   metadataFilter?: Record<string, any>,
@@ -790,10 +880,10 @@ async function expandQueryAndSearch(
 
     if (expansions.length === 0) return [];
 
-    const embeddings = await Promise.all(expansions.map(q => embedSingle(q)));
+    const embeddings = await Promise.all(expansions.map(q => embedSingleWithModel(q)));
     const searchResults = await Promise.all(
       embeddings.map(emb =>
-        vectorSearch(projectId, emb, Math.ceil(maxResults / 2), chunkTypes, metadataFilter, sourceIds ?? [], oracleFilter)
+        vectorSearch(scope, emb, Math.ceil(maxResults / 2), chunkTypes, metadataFilter, sourceIds ?? [], oracleFilter)
           .catch(() => [] as RetrievalResult[])
       )
     );
@@ -926,400 +1016,115 @@ function scoreSourceIntentMatch(
 
 // ─── Vector Search ───────────────────────────────────────────
 
+/** Applies ownership and source visibility before either ranking path limits candidates. */
+function searchableChunkFilter(scope: ProjectSearchScope, sourceIds?: string[], chunkTypes?: string[], metadataFilter?: Record<string, unknown>, chunkIds?: string[]) {
+  const orgId = typeof scope === "string" ? undefined : scope.orgId;
+  return Prisma.sql`${projectScopeSql(Prisma.sql`c."projectId"`, scope)}
+    ${knowledgeTagFilterSql(scope)}
+    ${chunkTypes?.length ? Prisma.sql`AND c."chunkType" = ANY(${chunkTypes}::text[])` : Prisma.empty}
+    ${metadataFilter ? Prisma.sql`AND c.metadata @> ${JSON.stringify(metadataFilter)}::jsonb` : Prisma.empty}
+    ${chunkIds?.length ? Prisma.sql`AND c.id = ANY(${chunkIds}::text[])` : Prisma.empty}
+    AND COALESCE(c.metadata->>'content_kind', '') <> 'parent_context'
+    AND EXISTS (
+      SELECT 1 FROM documents d JOIN sources s ON s.id = d."sourceId"
+      WHERE d.id = c."documentId" AND s."projectId" = c."projectId"
+        AND (d."projectId" IS NULL OR d."projectId" = c."projectId")
+        AND d."deletedAt" IS NULL AND s."deletedAt" IS NULL
+        ${orgId === undefined ? Prisma.empty : Prisma.sql`AND s."orgId" = ${orgId}`}
+        ${visibleSourceSql(sourceIds, orgId)}
+        AND ${typeof scope !== "string" && scope.tags?.length ? publishedDocumentSql()
+          : Prisma.sql`(s."activeVersionId" IS NULL OR d."sourceVersionId" = s."activeVersionId")`}
+    )`;
+}
+
+const searchChunkColumns = Prisma.sql`c.id, c.content, c."chunkType", c.metadata, c."parentChunkId", c."sectionPath", c."headingPath"`;
+
+interface SearchChunk {
+  id: string;
+  content: string;
+  chunkType: string;
+  metadata: Record<string, unknown> | null;
+  parentChunkId: string | null;
+  sectionPath: string | null;
+  headingPath: string | null;
+}
+
+function chunkResult(row: SearchChunk, score: number, source: "vector" | "bm25"): RetrievalResult {
+  const metadata = row.metadata || {};
+  return {
+    id: row.id, content: row.content, score, chunkType: row.chunkType, source,
+    metadata: { ...metadata, parent_chunk_id: row.parentChunkId || metadata.parent_chunk_id,
+      section_path: row.sectionPath || metadata.section_path, heading_path: row.headingPath || metadata.heading_path },
+  };
+}
+
 async function vectorSearch(
-  projectId: string,
-  queryEmbedding: number[],
+  scope: ProjectSearchScope,
+  embedding: { vector: number[]; model: string | null },
   limit: number,
   chunkTypes?: string[],
-  metadataFilter?: Record<string, any>,
+  metadataFilter?: Record<string, unknown>,
   sourceIds?: string[],
   chunkIds?: string[],
 ): Promise<RetrievalResult[]> {
-  const embeddingStr = `[${queryEmbedding.join(",")}]`;
-  const metadataJson = metadataFilter ? JSON.stringify(metadataFilter) : null;
-  const scopedSourceIds = uniqueStrings(sourceIds || []);
-  const sourceFilterSql = scopedSourceIds.length > 0
-    ? Prisma.sql`AND d."sourceId" = ANY(${scopedSourceIds})`
-    : Prisma.empty;
-  const scopedChunkIds = uniqueStrings(chunkIds || []);
-  const chunkIdFilterSql = scopedChunkIds.length > 0
-    ? Prisma.sql`AND id = ANY(${scopedChunkIds}::uuid[])`
-    : Prisma.empty;
-
-  let results: any;
-  if (chunkTypes && chunkTypes.length > 0 && metadataJson) {
-    results = await prisma.$queryRaw`
-      SELECT
-        id, content, "chunkType", metadata, "parentChunkId", "sectionPath", "headingPath",
-        1 - (embedding <=> ${embeddingStr}::vector) as similarity
-      FROM chunks
-      WHERE "projectId" = ${projectId}
-        AND embedding IS NOT NULL
-        AND "chunkType" = ANY(${chunkTypes})
-        AND metadata @> ${metadataJson}::jsonb
-        AND COALESCE(metadata->>'content_kind', '') <> 'parent_context'
-        ${chunkIdFilterSql}
-        AND EXISTS (
-          SELECT 1
-          FROM documents d
-          INNER JOIN sources s ON s.id = d."sourceId"
-          WHERE d.id = chunks."documentId"
-            AND d."deletedAt" IS NULL
-            ${sourceFilterSql}
-            AND (
-              s."activeVersionId" IS NULL
-              OR d."sourceVersionId" = s."activeVersionId"
-            )
-        )
-      ORDER BY embedding <=> ${embeddingStr}::vector
-      LIMIT ${limit}
-    `;
-  } else if (chunkTypes && chunkTypes.length > 0) {
-    results = await prisma.$queryRaw`
-      SELECT
-        id, content, "chunkType", metadata, "parentChunkId", "sectionPath", "headingPath",
-        1 - (embedding <=> ${embeddingStr}::vector) as similarity
-      FROM chunks
-      WHERE "projectId" = ${projectId}
-        AND embedding IS NOT NULL
-        AND "chunkType" = ANY(${chunkTypes})
-        AND COALESCE(metadata->>'content_kind', '') <> 'parent_context'
-        ${chunkIdFilterSql}
-        AND EXISTS (
-          SELECT 1
-          FROM documents d
-          INNER JOIN sources s ON s.id = d."sourceId"
-          WHERE d.id = chunks."documentId"
-            AND d."deletedAt" IS NULL
-            ${sourceFilterSql}
-            AND (
-              s."activeVersionId" IS NULL
-              OR d."sourceVersionId" = s."activeVersionId"
-            )
-        )
-      ORDER BY embedding <=> ${embeddingStr}::vector
-      LIMIT ${limit}
-    `;
-  } else if (metadataJson) {
-    results = await prisma.$queryRaw`
-      SELECT
-        id, content, "chunkType", metadata, "parentChunkId", "sectionPath", "headingPath",
-        1 - (embedding <=> ${embeddingStr}::vector) as similarity
-      FROM chunks
-      WHERE "projectId" = ${projectId}
-        AND embedding IS NOT NULL
-        AND metadata @> ${metadataJson}::jsonb
-        AND COALESCE(metadata->>'content_kind', '') <> 'parent_context'
-        ${chunkIdFilterSql}
-        AND EXISTS (
-          SELECT 1
-          FROM documents d
-          INNER JOIN sources s ON s.id = d."sourceId"
-          WHERE d.id = chunks."documentId"
-            AND d."deletedAt" IS NULL
-            ${sourceFilterSql}
-            AND (
-              s."activeVersionId" IS NULL
-              OR d."sourceVersionId" = s."activeVersionId"
-            )
-        )
-      ORDER BY embedding <=> ${embeddingStr}::vector
-      LIMIT ${limit}
-    `;
-  } else {
-    results = await prisma.$queryRaw`
-      SELECT
-        id, content, "chunkType", metadata, "parentChunkId", "sectionPath", "headingPath",
-        1 - (embedding <=> ${embeddingStr}::vector) as similarity
-      FROM chunks
-      WHERE "projectId" = ${projectId}
-        AND embedding IS NOT NULL
-        AND COALESCE(metadata->>'content_kind', '') <> 'parent_context'
-        ${chunkIdFilterSql}
-        AND EXISTS (
-          SELECT 1
-          FROM documents d
-          INNER JOIN sources s ON s.id = d."sourceId"
-          WHERE d.id = chunks."documentId"
-            AND d."deletedAt" IS NULL
-            ${sourceFilterSql}
-            AND (
-              s."activeVersionId" IS NULL
-              OR d."sourceVersionId" = s."activeVersionId"
-            )
-        )
-      ORDER BY embedding <=> ${embeddingStr}::vector
-      LIMIT ${limit}
-    `;
-  }
-
-  return (results as any[]).map((r) => ({
-    id: r.id,
-    content: r.content,
-    score: r.similarity,
-    metadata: {
-      ...(r.metadata || {}),
-      parent_chunk_id: r.parentChunkId || (r.metadata || {}).parent_chunk_id,
-      section_path: r.sectionPath || (r.metadata || {}).section_path,
-      heading_path: r.headingPath || (r.metadata || {}).heading_path,
-    },
-    chunkType: r.chunkType,
-    source: "vector" as const,
+  const rows = await prisma.$queryRaw<Array<SearchChunk & { similarity: number }>>(exactDistanceOrder({
+    table: "chunks", alias: "c", columns: searchChunkColumns,
+    scope: Prisma.sql`${searchableChunkFilter(scope, sourceIds, chunkTypes, metadataFilter, chunkIds)}
+      AND c.embedding IS NOT NULL AND ${compatibleEmbeddingModel(Prisma.sql`c.metadata`, embedding.model)}`,
+    embedding: `[${embedding.vector.join(",")}]`, limit,
   }));
+  return rows.map(row => chunkResult(row, row.similarity, "vector"));
 }
 
-// ─── PostgreSQL FTS Retrieval ────────────────────────────────
-
 async function fullTextSearch(
-  projectId: string,
+  scope: ProjectSearchScope,
   query: string,
   limit: number,
   chunkTypes?: string[],
-  metadataFilter?: Record<string, any>,
+  metadataFilter?: Record<string, unknown>,
   sourceIds?: string[],
   chunkIds?: string[],
 ): Promise<RetrievalResult[]> {
-  const normalizedQuery = query.trim();
-  if (!normalizedQuery) return [];
-
-  const metadataJson = metadataFilter ? JSON.stringify(metadataFilter) : null;
-  const scopedSourceIds = uniqueStrings(sourceIds || []);
-  const sourceFilterSql = scopedSourceIds.length > 0
-    ? Prisma.sql`AND d."sourceId" = ANY(${scopedSourceIds})`
-    : Prisma.empty;
-  const scopedChunkIds = uniqueStrings(chunkIds || []);
-  const chunkIdFilterSql = scopedChunkIds.length > 0
-    ? Prisma.sql`AND id = ANY(${scopedChunkIds}::uuid[])`
-    : Prisma.empty;
-  let results: any[] = [];
-
-  if (chunkTypes && chunkTypes.length > 0 && metadataJson) {
-    results = await prisma.$queryRaw`
-      SELECT id, content, metadata, "chunkType", "parentChunkId", "sectionPath", "headingPath", rank
-      FROM (
-        SELECT
-          id,
-          content,
-          metadata,
-          "chunkType",
-          "parentChunkId",
-          "sectionPath",
-          "headingPath",
-          ts_rank_cd(
-            to_tsvector('english', coalesce("searchContent", content)),
-            websearch_to_tsquery('english', ${normalizedQuery})
-          ) AS rank
-        FROM chunks
-        WHERE "projectId" = ${projectId}
-          AND "chunkType" = ANY(${chunkTypes})
-          AND metadata @> ${metadataJson}::jsonb
-          AND COALESCE(metadata->>'content_kind', '') <> 'parent_context'
-          ${chunkIdFilterSql}
-          AND EXISTS (
-            SELECT 1
-            FROM documents d
-            INNER JOIN sources s ON s.id = d."sourceId"
-              WHERE d.id = chunks."documentId"
-                AND d."deletedAt" IS NULL
-                ${sourceFilterSql}
-                AND (
-                  s."activeVersionId" IS NULL
-                  OR d."sourceVersionId" = s."activeVersionId"
-                )
-          )
-          AND websearch_to_tsquery('english', ${normalizedQuery}) @@ to_tsvector('english', coalesce("searchContent", content))
-      ) ranked
-      ORDER BY rank DESC
-      LIMIT ${limit}
-    ` as any[];
-  } else if (chunkTypes && chunkTypes.length > 0) {
-    results = await prisma.$queryRaw`
-      SELECT id, content, metadata, "chunkType", "parentChunkId", "sectionPath", "headingPath", rank
-      FROM (
-        SELECT
-          id,
-          content,
-          metadata,
-          "chunkType",
-          "parentChunkId",
-          "sectionPath",
-          "headingPath",
-          ts_rank_cd(
-            to_tsvector('english', coalesce("searchContent", content)),
-            websearch_to_tsquery('english', ${normalizedQuery})
-          ) AS rank
-        FROM chunks
-        WHERE "projectId" = ${projectId}
-          AND "chunkType" = ANY(${chunkTypes})
-          AND COALESCE(metadata->>'content_kind', '') <> 'parent_context'
-          ${chunkIdFilterSql}
-          AND EXISTS (
-            SELECT 1
-            FROM documents d
-            INNER JOIN sources s ON s.id = d."sourceId"
-              WHERE d.id = chunks."documentId"
-                AND d."deletedAt" IS NULL
-                ${sourceFilterSql}
-                AND (
-                  s."activeVersionId" IS NULL
-                  OR d."sourceVersionId" = s."activeVersionId"
-                )
-          )
-          AND websearch_to_tsquery('english', ${normalizedQuery}) @@ to_tsvector('english', coalesce("searchContent", content))
-      ) ranked
-      ORDER BY rank DESC
-      LIMIT ${limit}
-    ` as any[];
-  } else if (metadataJson) {
-    results = await prisma.$queryRaw`
-      SELECT id, content, metadata, "chunkType", "parentChunkId", "sectionPath", "headingPath", rank
-      FROM (
-        SELECT
-          id,
-          content,
-          metadata,
-          "chunkType",
-          "parentChunkId",
-          "sectionPath",
-          "headingPath",
-          ts_rank_cd(
-            to_tsvector('english', coalesce("searchContent", content)),
-            websearch_to_tsquery('english', ${normalizedQuery})
-          ) AS rank
-        FROM chunks
-        WHERE "projectId" = ${projectId}
-          AND metadata @> ${metadataJson}::jsonb
-          AND COALESCE(metadata->>'content_kind', '') <> 'parent_context'
-          ${chunkIdFilterSql}
-          AND EXISTS (
-            SELECT 1
-            FROM documents d
-            INNER JOIN sources s ON s.id = d."sourceId"
-              WHERE d.id = chunks."documentId"
-                AND d."deletedAt" IS NULL
-                ${sourceFilterSql}
-                AND (
-                  s."activeVersionId" IS NULL
-                  OR d."sourceVersionId" = s."activeVersionId"
-                )
-          )
-          AND websearch_to_tsquery('english', ${normalizedQuery}) @@ to_tsvector('english', coalesce("searchContent", content))
-      ) ranked
-      ORDER BY rank DESC
-      LIMIT ${limit}
-    ` as any[];
-  } else {
-    results = await prisma.$queryRaw`
-      SELECT id, content, metadata, "chunkType", "parentChunkId", "sectionPath", "headingPath", rank
-      FROM (
-        SELECT
-          id,
-          content,
-          metadata,
-          "chunkType",
-          "parentChunkId",
-          "sectionPath",
-          "headingPath",
-          ts_rank_cd(
-            to_tsvector('english', coalesce("searchContent", content)),
-            websearch_to_tsquery('english', ${normalizedQuery})
-          ) AS rank
-        FROM chunks
-        WHERE "projectId" = ${projectId}
-          AND COALESCE(metadata->>'content_kind', '') <> 'parent_context'
-          ${chunkIdFilterSql}
-          AND EXISTS (
-            SELECT 1
-            FROM documents d
-            INNER JOIN sources s ON s.id = d."sourceId"
-              WHERE d.id = chunks."documentId"
-                AND d."deletedAt" IS NULL
-                ${sourceFilterSql}
-                AND (
-                  s."activeVersionId" IS NULL
-                  OR d."sourceVersionId" = s."activeVersionId"
-                )
-          )
-          AND websearch_to_tsquery('english', ${normalizedQuery}) @@ to_tsvector('english', coalesce("searchContent", content))
-      ) ranked
-      ORDER BY rank DESC
-      LIMIT ${limit}
-    ` as any[];
-  }
-
-  const maxScore = results.length > 0 ? Math.max(...results.map((r: any) => Number(r.rank || 0))) : 1;
-
-  return results.map((r: any) => ({
-    id: r.id,
-    content: r.content,
-    score: maxScore > 0 ? Number(r.rank || 0) / maxScore : 0,
-    metadata: {
-      ...(r.metadata || {}),
-      parent_chunk_id: r.parentChunkId || (r.metadata || {}).parent_chunk_id,
-      section_path: r.sectionPath || (r.metadata || {}).section_path,
-      heading_path: r.headingPath || (r.metadata || {}).heading_path,
-    },
-    chunkType: r.chunkType,
-    source: "bm25" as const,
-  }));
+  if (!query.trim()) return [];
+  const searchQuery = Prisma.sql`websearch_to_tsquery('english', ${query.trim()})`;
+  const indexedText = Prisma.sql`to_tsvector('english', coalesce(c."searchContent", c.content))`;
+  const rows = await prisma.$queryRaw<Array<SearchChunk & { rank: number }>>`
+    SELECT ${searchChunkColumns}, ts_rank_cd(${indexedText}, ${searchQuery}) AS rank FROM chunks c
+    WHERE ${searchableChunkFilter(scope, sourceIds, chunkTypes, metadataFilter, chunkIds)} AND ${searchQuery} @@ ${indexedText}
+    ORDER BY rank DESC, c.id LIMIT ${limit}`;
+  const maxRank = rows[0]?.rank || 1;
+  return rows.map(row => chunkResult(row, row.rank / maxRank, "bm25"));
 }
 // ─── Memory Search ───────────────────────────────────────────
 
 async function memorySearch(
   projectId: string,
   queryEmbedding: number[],
-  opts: { userId?: string; sessionId?: string; agentId?: string; topK: number }
+  opts: { orgId?: string; userId?: string; sessionId?: string; agentId?: string; topK: number }
 ): Promise<RetrievalResult[]> {
   // Never fall back to project-wide personal-memory search. Callers must provide user scope.
   if (!opts.userId) return [];
   const embeddingStr = `[${queryEmbedding.join(",")}]`;
 
-  let query;
-  if (opts.userId && opts.sessionId && opts.agentId) {
-    query = prisma.$queryRaw`
-      SELECT
-        id, content, "memoryType", metadata, importance,
-        1 - (embedding <=> ${embeddingStr}::vector) as similarity
-      FROM memories
-      WHERE "projectId" = ${projectId}
-        AND "isActive" = true
-        AND ("expiresAt" IS NULL OR "expiresAt" > NOW())
-        AND "userId" = ${opts.userId}
-        AND "sessionId" = ${opts.sessionId}
-        AND "agentId" = ${opts.agentId}
-      ORDER BY embedding <=> ${embeddingStr}::vector
-      LIMIT ${opts.topK}
-    `;
-  } else if (opts.userId && opts.sessionId) {
-    query = prisma.$queryRaw`
-      SELECT
-        id, content, "memoryType", metadata, importance,
-        1 - (embedding <=> ${embeddingStr}::vector) as similarity
-      FROM memories
-      WHERE "projectId" = ${projectId}
-        AND "isActive" = true
-        AND ("expiresAt" IS NULL OR "expiresAt" > NOW())
-        AND "userId" = ${opts.userId}
-        AND "sessionId" = ${opts.sessionId}
-      ORDER BY embedding <=> ${embeddingStr}::vector
-      LIMIT ${opts.topK}
-    `;
-  } else if (opts.userId) {
-    query = prisma.$queryRaw`
-      SELECT
-        id, content, "memoryType", metadata, importance,
-        1 - (embedding <=> ${embeddingStr}::vector) as similarity
-      FROM memories
-      WHERE "projectId" = ${projectId}
-        AND "isActive" = true
-        AND ("expiresAt" IS NULL OR "expiresAt" > NOW())
-        AND "userId" = ${opts.userId}
-      ORDER BY embedding <=> ${embeddingStr}::vector
-      LIMIT ${opts.topK}
-    `;
-  }
+  const sessionFilter = opts.sessionId ? Prisma.sql`AND m."sessionId" = ${opts.sessionId}` : Prisma.empty;
+  // The agent narrows the session's scope, as before: an agent without a session does not filter.
+  const agentFilter = opts.sessionId && opts.agentId ? Prisma.sql`AND m."agentId" = ${opts.agentId}` : Prisma.empty;
 
-  const results = await query;
+  const results = await prisma.$queryRaw(exactDistanceOrder({
+    table: "memories",
+    alias: "m",
+    columns: Prisma.sql`m.id, m.content, m."memoryType", m.metadata, m.importance`,
+    scope: Prisma.sql`
+      m."projectId" = ${projectId}
+        ${opts.orgId === undefined ? Prisma.empty : Prisma.sql`AND m."orgId" = ${opts.orgId}`}
+        AND m."isActive" = true
+        AND (m."expiresAt" IS NULL OR m."expiresAt" > NOW())
+        AND m."userId" = ${opts.userId}
+        ${sessionFilter}
+        ${agentFilter}`,
+    embedding: embeddingStr,
+    limit: opts.topK,
+  }));
 
   // Update access counts
   const ids = (results as any[]).map((r) => r.id);
@@ -1343,85 +1148,6 @@ async function memorySearch(
     chunkType: "memory" as any,
     source: "memory" as const,
   }));
-}
-
-// ─── Graph Search ────────────────────────────────────────────
-
-async function graphSearch(
-  projectId: string,
-  queryEmbedding: number[],
-  opts: { depth: number; topK: number }
-): Promise<RetrievalResult[]> {
-  const embeddingStr = `[${queryEmbedding.join(",")}]`;
-
-  // Find most relevant entities using vector search
-  const relevantEntities = await prisma.$queryRaw`
-    SELECT
-      id, name, "entityType", description, metadata, "sourceChunkId",
-      1 - (embedding <=> ${embeddingStr}::vector) as similarity
-    FROM entities
-    WHERE "projectId" = ${projectId}
-    ORDER BY embedding <=> ${embeddingStr}::vector
-    LIMIT 5
-  `;
-
-  if ((relevantEntities as any[]).length === 0) return [];
-
-  // Traverse relationships
-  const entityIds = (relevantEntities as any[]).map((e) => e.id);
-
-  const relatedEntities = await prisma.$queryRaw`
-    SELECT
-      e.id, e.name, e."entityType", e.description, e.metadata, e."sourceChunkId",
-      er."relationType", er.weight
-    FROM entity_relations er
-    INNER JOIN entities e ON er."toEntityId" = e.id
-    WHERE er."projectId" = ${projectId}
-      AND er."fromEntityId" = ANY(${entityIds})
-    LIMIT ${opts.topK}
-  `;
-
-  // Get chunks for related entities
-  const chunkIds = [
-    ...(relevantEntities as any[]).map((e) => e.sourceChunkId).filter(Boolean),
-    ...(relatedEntities as any[]).map((e) => e.sourceChunkId).filter(Boolean),
-  ] as string[];
-
-  if (chunkIds.length === 0) return [];
-
-  const relatedChunks = await prisma.$queryRaw<any[]>`
-    SELECT
-      c.id,
-      c.content,
-      c.metadata,
-      c."chunkType"
-    FROM chunks c
-    INNER JOIN documents d ON d.id = c."documentId"
-    INNER JOIN sources s ON s.id = d."sourceId"
-    WHERE c.id = ANY(${chunkIds})
-      AND d."deletedAt" IS NULL
-      AND (
-        s."activeVersionId" IS NULL
-        OR d."sourceVersionId" = s."activeVersionId"
-      )
-    LIMIT ${opts.topK}
-  `;
-
-  return relatedChunks.map((c) => {
-    const entity = (relevantEntities as any[]).find((e) => e.sourceChunkId === c.id);
-    return {
-      id: c.id,
-      content: c.content,
-      score: entity ? entity.similarity * 0.8 : 0.5,
-      metadata: {
-        ...(c.metadata as any),
-        entityName: entity?.name,
-        entityType: entity?.entityType,
-      },
-      chunkType: c.chunkType || "text",
-      source: "graph" as const,
-    };
-  });
 }
 
 // ─── Reciprocal Rank Fusion ──────────────────────────────────
@@ -1624,6 +1350,39 @@ ${candidates.map((r, i) => `[${i}] ${r.content.slice(0, 300)}`).join("\n\n")}`;
 
 // ─── Deduplication ───────────────────────────────────────────
 
+function attachGraphEvidence(results: RetrievalResult[], evidence: Awaited<ReturnType<typeof searchGraphChunks>>["evidence"]) {
+  return results.map((result) => {
+    const graph = result.source === "memory" ? undefined : evidence.get(result.id);
+    return graph ? { ...result, metadata: { ...result.metadata, graph } } : result;
+  });
+}
+
+type RelationView = { id: string; claims?: RelationEvidence[] };
+
+function relationViews(result: RetrievalResult): RelationView[] {
+  return result.metadata.graph?.relations ?? [];
+}
+
+function withClaimEvidence(result: RetrievalResult, evidence: Map<string, RelationEvidence[]>) {
+  const relations = relationViews(result);
+  if (!relations.some(({ id }) => evidence.has(id))) return result;
+  return {
+    ...result,
+    metadata: {
+      ...result.metadata,
+      graph: { ...result.metadata.graph, relations: relations.map((relation) => evidence.has(relation.id) ? { ...relation, claims: evidence.get(relation.id) } : relation) },
+    },
+  };
+}
+
+/** One query for every relation in the answer, so the payload never costs a query per hop. */
+async function attachClaimEvidence(results: RetrievalResult[], projectId: string | undefined) {
+  const ids = [...new Set(results.flatMap((result) => relationViews(result).map(({ id }) => id)))];
+  if (!ids.length) return results;
+  const evidence = await relationEvidence(projectId, ids, 3);
+  return results.map((result) => withClaimEvidence(result, evidence));
+}
+
 function deduplicateResults(results: RetrievalResult[]): RetrievalResult[] {
   const seen = new Map<string, RetrievalResult>();
 
@@ -1666,6 +1425,7 @@ function packContext(results: RetrievalResult[], maxTokens?: number): string {
 
 function buildChunkHeader(r: RetrievalResult): string {
   const parts: string[] = [];
+  if (r.project) parts.push(`Project: ${r.project}`);
 
   if (r.sourceName) parts.push(`Source: ${r.sourceName}`);
   if (r.documentTitle) parts.push(`Document: ${r.documentTitle}`);
@@ -1734,10 +1494,12 @@ async function enrichResults(results: RetrievalResult[]): Promise<RetrievalResul
 
   const chunkDocs = await prisma.$queryRaw`
     SELECT
-      c.id as "chunkId", d.title as "docTitle", d."webUrl" as "webUrl", d.path as "docPath", s.id as "sourceId", s.name as "sourceName"
+      c.id as "chunkId", d.title as "docTitle", d."webUrl" as "webUrl", d.path as "docPath", s.id as "sourceId", s.name as "sourceName", p.name as project,
+      ${knowledgeTagsSql()} AS tags
     FROM chunks c
     INNER JOIN documents d ON c."documentId" = d.id
     INNER JOIN sources s ON d."sourceId" = s.id
+    INNER JOIN projects p ON p.id = c."projectId"
     WHERE c.id = ANY(${chunkIds})
   `;
 
@@ -1750,8 +1512,10 @@ async function enrichResults(results: RetrievalResult[]): Promise<RetrievalResul
         ...r,
         documentTitle: enrichment.docTitle || undefined,
         sourceName: enrichment.sourceName || undefined,
+        project: enrichment.project,
         metadata: {
           ...r.metadata,
+          tags: enrichment.tags,
           source_id: enrichment.sourceId || r.metadata?.source_id,
           web_url: enrichment.webUrl || r.metadata?.web_url,
           path: enrichment.docPath || r.metadata?.path,
@@ -1766,29 +1530,23 @@ async function expandParentContexts(
   results: RetrievalResult[],
   opts: { query: string; includeParentContent: boolean }
 ): Promise<RetrievalResult[]> {
-  const parentIds = [...new Set(
-    results
-      .map((result) => result.metadata?.parent_chunk_id)
-      .filter((value): value is string => Boolean(value))
-  )];
-  if (parentIds.length === 0) return results;
+  const chunkIds = results.filter(result => result.source !== "memory" && result.metadata?.parent_chunk_id).map(result => result.id);
+  if (chunkIds.length === 0) return results;
 
-  const parents = await prisma.chunk.findMany({
-    where: { id: { in: parentIds } },
-    select: {
-      id: true,
-      content: true,
-      metadata: true,
-      sectionPath: true,
-      headingPath: true,
-    },
-  });
-  const parentMap = new Map(parents.map((parent) => [parent.id, parent]));
+  const parents = await prisma.$queryRaw<Array<{
+    childId: string; content: string; sectionPath: string | null; headingPath: string | null;
+  }>>`
+    SELECT child.id AS "childId", parent.content,
+      COALESCE(parent."sectionPath", parent.metadata->>'section_path') AS "sectionPath",
+      COALESCE(parent."headingPath", parent.metadata->>'heading_path') AS "headingPath"
+    FROM chunks child JOIN chunks parent
+      ON parent.id = COALESCE(child."parentChunkId", child.metadata->>'parent_chunk_id')
+      AND parent."documentId" = child."documentId" AND parent."projectId" = child."projectId"
+    WHERE child.id = ANY(${chunkIds}::text[])`;
+  const parentMap = new Map(parents.map(parent => [parent.childId, parent]));
 
   return results.map((result) => {
-    const parentId = result.metadata?.parent_chunk_id;
-    if (!parentId) return result;
-    const parent = parentMap.get(parentId);
+    const parent = parentMap.get(result.id);
     if (!parent) return result;
     const parentContent = String(parent.content || "");
     const parentExcerpt = buildParentExcerpt(parentContent, opts.query);
@@ -1798,8 +1556,8 @@ async function expandParentContexts(
         ...result.metadata,
         ...(opts.includeParentContent ? { parent_content: parentContent } : {}),
         parent_excerpt: parentExcerpt,
-        parent_section_path: parent.sectionPath || (parent.metadata as any)?.section_path || null,
-        parent_heading_path: parent.headingPath || (parent.metadata as any)?.heading_path || null,
+        parent_section_path: parent.sectionPath,
+        parent_heading_path: parent.headingPath,
       },
     };
   });
@@ -1854,7 +1612,7 @@ function attachLegacyTimingAliases(timing: NonNullable<ContextResponse["meta"]["
 }
 
 function emitStageTimingLog(params: {
-  projectId: string;
+  projectId?: string;
   query: string;
   topK: number;
   cacheHit: boolean;

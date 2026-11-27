@@ -8,6 +8,7 @@ import { prisma } from "../db/index.js";
 import { authMiddleware, type AuthContext } from "../middleware/auth.js";
 import { rateLimitMiddleware, RateLimits } from "../middleware/rate-limit.js";
 import { retrieve } from "../engine/retriever.js";
+import { exactDistanceOrder } from "../engine/vector-order.js";
 import { syncGitHub } from "../connectors/github.js";
 import { syncGitLab } from "../connectors/gitlab.js";
 import { syncUrl } from "../connectors/url.js";
@@ -27,18 +28,24 @@ import { syncHuggingFace } from "../connectors/huggingface.js";
 import { syncWeb } from "../connectors/web.js";
 import { ingestDocument } from "../engine/ingest.js";
 import { fireWebhookEvent } from "../engine/webhooks.js";
-import { embedSingle } from "../engine/embeddings.js";
+import { embedSingle, embedSingleWithModel } from "../engine/embeddings.js";
+import { ensureGraphEntityId, entityRelationType, saveGraphBatch, saveGraphEntity, saveGraphRelation } from "../engine/entity-graph-write.js";
+import { countGraphEntities, KNOWLEDGE_TAG_SELECTOR, searchEntityGraph } from "../engine/entity-graph.js";
+import { claimMetrics } from "../engine/knowledge/claims.js";
 import { ingestSession as ingestMemorySession, searchMemories } from "../engine/memory/index.js";
 import { writeMemoryCanonical } from "../engine/memory/write.js";
 import { nanoid } from "nanoid";
 import { createHash } from "crypto";
 import { memoryRoutes } from "./memory.js";
 import { contextRoutes } from "./context.js";
+import { nativeHookRoutes } from "./native-hooks.js";
 import { optimizationRoutes } from "./optimization.js";
 import { searchRoutes } from "./search.js";
 import { fileRoutes } from "./files.js";
 import { agentTaskRoutes } from "./agent-tasks.js";
 import { researchAgentRoutes } from "./research-agent.js";
+import { registerRepoIndexRoutes } from "./repo-index.js";
+import { registerRepoIndexAdminRoutes } from "./repo-index-admin.js";
 import { resolveProjectReference, ensureProject, getEffectiveOrgId } from "./helpers.js";
 import { getContractHeaders, getPublicContractMetadata } from "../contracts/runtime.mjs";
 import { getLatencySummary, getLatencyTraceConfig, getLatencyGateStatus, resetLatencySummary } from "../engine/latency-tracing.js";
@@ -193,7 +200,12 @@ api.use("/*", async (c, next) => {
   const routeMatrix = getNodeRouteMatrix();
   const control = getRouteControl(routeMatrix, c.req.method, c.req.path);
   if (!control) {
-    return c.json({ error: "Route control missing", trace_id: traceId }, 500);
+    // No control means the router does not serve this method/path combination, which is a client
+    // error: the request asked for something that does not exist. It used to answer 500 "Route
+    // control missing", so a wrong method on a real endpoint (GET on a POST-only route) read as a
+    // server fault. It still fails closed - no handler runs - and a registered route that is missing
+    // its control cannot reach here unnoticed, because the coverage test fails the build.
+    return c.json({ error: "Route not found", trace_id: traceId }, 404);
   }
   if (control.authMode === "admin_only" && !auth.isAdmin) {
     return c.json({ error: "Admin access required", trace_id: traceId }, 403);
@@ -207,11 +219,14 @@ api.use("/*", async (c, next) => {
 // Mount SOTA memory, context, and optimization APIs
 api.route("/", memoryRoutes);
 api.route("/", contextRoutes);
+api.route("/", nativeHookRoutes);
 api.route("/", optimizationRoutes);
 api.route("/", searchRoutes);
 api.route("/", fileRoutes);
 api.route("/", agentTaskRoutes);
 api.route("/", researchAgentRoutes);
+registerRepoIndexRoutes(api);
+registerRepoIndexAdminRoutes(api);
 
 // ─── Helper ──────────────────────────────────────────────────
 
@@ -228,7 +243,7 @@ function getNodeRouteMatrix() {
 
 function serializeSource(source: any, activeJob?: any) {
   const activeVersion = source.activeVersion || null;
-  const latestVersion = source.sourceVersions?.[0] || activeVersion;
+  const latestVersion = source.versions?.[0] || activeVersion;
   const jobResult = (activeJob?.result || {}) as Record<string, any>;
   return {
     id: String(source.id),
@@ -256,7 +271,7 @@ function serializeSource(source: any, activeJob?: any) {
         ? "failed"
         : "success",
     active_version: source.activeVersionId || null,
-    restore_until: null,
+    restore_until: source.restoreUntil ?? null,
   };
 }
 
@@ -278,7 +293,8 @@ const sourceSummarySelect = {
   createdAt: true,
   updatedAt: true,
   activeVersionId: true,
-  sourceVersions: {
+  restoreUntil: true,
+  versions: {
     take: 1,
     orderBy: { createdAt: "desc" as const },
     select: {
@@ -300,7 +316,7 @@ const sourceSummarySelect = {
       orgId: true,
     },
   },
-};
+} satisfies Prisma.SourceSelect;
 
 function serializeSyncJob(job: any) {
   const result = (job?.result || {}) as Record<string, any>;
@@ -620,8 +636,9 @@ function mergeIndexSourceConfig(input: z.infer<typeof indexApiSourceSchema>): Re
 
 async function ensureDirectIngestSource(projectId: string, orgId: string) {
   const directIngestName = `direct-ingest-${projectId}`;
-  let directSource = await prisma.source.findFirst({
+  const findSource = () => prisma.source.findFirst({
     where: {
+      orgId,
       projectId,
       connectorType: "custom",
       OR: [
@@ -630,9 +647,11 @@ async function ensureDirectIngestSource(projectId: string, orgId: string) {
       ],
     },
   });
+  const directSource = await findSource();
+  if (directSource) return directSource;
 
-  if (!directSource) {
-    directSource = await prisma.source.create({
+  try {
+    return await prisma.source.create({
       data: {
         orgId,
         projectId,
@@ -643,9 +662,13 @@ async function ensureDirectIngestSource(projectId: string, orgId: string) {
         status: "READY",
       },
     });
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "P2002") {
+      const concurrent = await findSource();
+      if (concurrent) return concurrent;
+    }
+    throw error;
   }
-
-  return directSource;
 }
 
 async function learnTextContent(params: {
@@ -653,6 +676,8 @@ async function learnTextContent(params: {
   project: { id: string; orgId: string; name: string; slug: string | null };
   traceId: string;
   input: z.infer<typeof learnRequestSchema> & { mode: "text" };
+  embedTexts?: (texts: string[]) => Promise<number[][]>;
+  embeddingModel?: string;
 }) {
   const { auth, project, traceId, input } = params;
   const asyncMode = input.options?.async !== false;
@@ -699,6 +724,8 @@ async function learnTextContent(params: {
     ingestionProfile: input.options?.ingestion_profile,
     strategyOverride: input.options?.strategy_override,
     profileConfig: input.options?.profile_config as any,
+    ...(params.embedTexts ? { embedTexts: params.embedTexts } : {}),
+    ...(params.embeddingModel ? { embeddingModel: params.embeddingModel } : {}),
   });
   return {
     success: true as const,
@@ -947,6 +974,99 @@ function normalizeMemoryType(memoryType?: string) {
 }
 
 
+// ─── Repository attribution ─────────────────────────────────
+
+/**
+ * The publication one repository result came from, as the query route answers it. Path and digest
+ * already travel in the chunk's own metadata (`repo_path`, `repo_digest`), written by
+ * materialisation; generation and revision belong to the publication and no chunk column holds
+ * them, so a client cannot tell which revision of a file it was handed. They are read here from the
+ * path row and the generation it points at, which is the same pairing the repository read routes
+ * serve, and attached to the result.
+ */
+interface RepositoryAttribution {
+  scope_id: string;
+  path: string;
+  digest: string;
+  generation: number;
+  revision: number;
+}
+
+/** The key one result's attribution is looked up under: a scope holds one path row per path. */
+function repositoryAttributionKey(result: { metadata?: Record<string, any> }): string {
+  const scopeId = String(result.metadata?.repo_scope_id ?? "");
+  const path = String(result.metadata?.repo_path ?? "");
+  return scopeId !== "" && path !== "" ? `${scopeId}\u0000${path}` : "";
+}
+
+/**
+ * Every repository result's publication, in one statement: the path row names the digest, and the
+ * generation row it points at names the number and revision a client reports. A result that is not
+ * repository content (no scope or no path in its metadata) is not looked up, and a query whose
+ * results carry none - the ordinary case - reaches no database at all.
+ */
+async function repositoryAttributionOf(
+  results: ReadonlyArray<{ metadata?: Record<string, any> }>,
+): Promise<Map<string, RepositoryAttribution>> {
+  const wanted = results.filter((result) => repositoryAttributionKey(result) !== "");
+  if (wanted.length === 0) return new Map();
+
+  // Prefer the generation the chunk itself recorded when it was staged: that value was written by the
+  // publication that produced this text, so it cannot disagree with the answer. Reading the path row
+  // instead is a race - a publication committing between the search and this lookup moves the path row
+  // to the newer generation, and the answer would then be labelled with a revision it did not come from.
+  const generationIds = [...new Set(
+    wanted
+      .map((result) => String(result.metadata?.repo_index_generation_id ?? ""))
+      .filter((id) => id !== ""),
+  )];
+  const byGeneration = generationIds.length === 0 ? [] : await prisma.$queryRaw<Array<{ id: string; scopeId: string; generation: number; revision: string }>>`
+    SELECT g.id, g."scopeId" AS "scopeId", g.generation, g.revision
+    FROM repo_index_generations g
+    WHERE g.id = ANY(${generationIds}::text[])
+  `;
+  const generationById = new Map(byGeneration.map((row) => [row.id, row]));
+
+  // Fallback for a result whose metadata carries no generation id: read the path row as before.
+  const needPath = wanted.filter((result) => !generationById.has(String(result.metadata?.repo_index_generation_id ?? "")));
+  const rows = needPath.length === 0 ? [] : await prisma.$queryRaw<Array<{ scopeId: string; path: string; digest: string; generation: number; revision: string }>>`
+    SELECT p."scopeId" AS "scopeId", p.path, p.digest, g.generation, g.revision
+    FROM repo_index_paths p
+    INNER JOIN repo_index_generations g ON g.id = p."generationId"
+    WHERE p.state = 'present'
+      AND p."scopeId" = ANY(${needPath.map((result) => String(result.metadata?.repo_scope_id))}::text[])
+      AND p.path = ANY(${needPath.map((result) => String(result.metadata?.repo_path))}::text[])
+  `;
+
+  const attribution = new Map<string, RepositoryAttribution>();
+  for (const result of wanted) {
+    const key = repositoryAttributionKey(result);
+    const path = String(result.metadata?.repo_path);
+    const digest = String(result.metadata?.repo_digest ?? "");
+    const generationId = String(result.metadata?.repo_index_generation_id ?? "");
+    const recorded = generationById.get(generationId);
+    if (recorded) {
+      attribution.set(key, {
+        scope_id: recorded.scopeId,
+        path,
+        digest,
+        generation: Number(recorded.generation),
+        revision: Number(recorded.revision),
+      });
+    }
+  }
+  for (const row of rows) {
+    attribution.set(`${row.scopeId}\u0000${row.path}`, {
+      scope_id: row.scopeId,
+      path: row.path,
+      digest: row.digest,
+      generation: Number(row.generation),
+      revision: Number(row.revision),
+    });
+  }
+  return attribution;
+}
+
 // ─── Query Context ───────────────────────────────────────────
 
 api.post(
@@ -961,6 +1081,7 @@ api.post(
       threshold: z.number().min(0).max(1).optional().default(0.3),
       chunk_types: z.array(z.string()).optional(),
       source_ids: z.array(z.string()).optional(),
+      tags: z.array(z.string().trim().min(1).max(512)).max(32).optional(),
       metadata_filter: z.record(z.any()).optional(),
       // Oracle prefilter (structure-aware scope selection)
       oracle_mode: z.enum(["off", "auto", "force"]).optional(),
@@ -982,6 +1103,7 @@ api.post(
       agent_id: z.string().optional(),
       // Graph
       include_graph: z.boolean().optional().default(false),
+      include_evidence: z.boolean().optional().default(false),
       graph_depth: z.number().int().min(1).max(3).optional(),
       // Context packing
       max_tokens: z.number().int().optional(),
@@ -1002,12 +1124,18 @@ api.post(
     c.header("x-retaindb-stack", STACK_NAME);
     c.header("x-whisper-stack", STACK_NAME);
 
-    const project = await ensureProject(auth.orgId, body.project, auth.isAdmin);
-
-    console.log(`[Context] Query project: ${project.name} (${project.id})`);
+    const projectRef = body.project?.trim();
+    if ((body.project !== undefined || body.include_memories) && !projectRef) {
+      return c.json({ error: "A project is required for an explicit filter or personal memory retrieval", code: "PROJECT_REQUIRED" }, 400);
+    }
+    if (body.tags?.length && body.include_memories) {
+      return c.json({ error: "Knowledge tags do not filter personal memories", code: "TAGS_WITH_PERSONAL_MEMORIES" }, 400);
+    }
+    const project = projectRef ? await resolveProjectReference(auth.orgId, projectRef) : null;
+    if (projectRef && !project) return c.json({ error: "Project not found", code: "PROJECT_NOT_FOUND" }, 404);
 
     const result = await retrieve({
-      projectId: project.id,
+      scope: { orgId: auth.orgId, projectId: project?.id, tags: body.tags },
       query: body.query,
       topK: body.top_k,
       threshold: body.threshold,
@@ -1029,6 +1157,7 @@ api.post(
       sessionId: body.session_id,
       agentId: body.agent_id,
       includeGraph: body.include_graph,
+      includeEvidence: body.include_evidence,
       graphDepth: body.graph_depth,
       maxTokens: body.max_tokens,
       compress: body.compress,
@@ -1042,6 +1171,7 @@ api.post(
     // usage tracking not available in OSS
 
     const consistencyState = body.include_memories ? "eventual" : "fresh";
+    const repositoryAttribution = await repositoryAttributionOf(result.results);
 
     return c.json({
       results: result.results.map((r) => ({
@@ -1051,12 +1181,18 @@ api.post(
         metadata: r.metadata,
         source: r.sourceName,
         document: r.documentTitle,
+        project: r.project,
         type: r.chunkType,
         retrieval_source: r.source,
+        // Absent for ordinary content: JSON drops an undefined value, so a non-repository answer
+        // keeps exactly the shape it had. A repository hit names the publication it came from.
+        repository: repositoryAttribution.get(repositoryAttributionKey(r)),
       })),
       context: result.context,
       meta: {
         query: body.query,
+        project_scope: project ? "project" : "organization",
+        applied_tags: body.tags?.length ? body.tags : undefined,
         total: result.meta.totalResults,
         latency_ms: result.meta.latencyMs,
         cache_hit: result.meta.cacheHit,
@@ -1073,6 +1209,9 @@ api.post(
         compression: result.meta.compression,
         profile: result.meta.profile || "balanced",
         retrieval_profile: result.meta.retrievalProfile,
+        // Which halves of the answer were consulted, and why not when they were not: a client that
+        // receives the fused order instead of a reranked one has to be able to tell.
+        degraded: result.meta.degraded,
         region: DEPLOY_REGION,
         consistency_state: consistencyState,
         timing: result.meta.timing,
@@ -1178,6 +1317,8 @@ const batchLearnItemSchema = z.discriminatedUnion("type", [
     type: z.literal("text"),
     title: z.string().min(1),
     content: z.string().min(1),
+    embedding: z.array(z.number().finite()).length(1024).optional(),
+    embedding_model: z.string().max(120).optional(),
     metadata: z.record(z.any()).optional(),
     tags: z.array(z.string()).optional(),
     custom_id: z.string().max(100).optional(),
@@ -1232,6 +1373,7 @@ api.post(
         const itemTags = [...(body.tags || []), ...(("tags" in item && item.tags) ? item.tags : [])];
         try {
           if (item.type === "text") {
+            const clientVector = item.embedding;
             const result = await learnTextContent({
               auth,
               project,
@@ -1244,10 +1386,25 @@ api.post(
                 metadata: { ...(item.metadata || {}), ...(item.custom_id ? { custom_id: item.custom_id } : {}) },
                 namespace: body.namespace,
                 tags: itemTags,
-                options: { async: body.async !== false },
+                options: { async: clientVector ? false : body.async !== false },
               },
+              embeddingModel: clientVector ? item.embedding_model : undefined,
+              embedTexts: clientVector
+                ? async (texts: string[]) => {
+                    if (texts.length !== 1) {
+                      throw new Error(
+                        `client embedding covers one chunk, this item split into ${texts.length}: send one chunk per item`,
+                      );
+                    }
+                    return [clientVector];
+                  }
+                : undefined,
             });
-            accepted.push({ index, type: "text", custom_id: item.custom_id, status: "queued", job_id: result.job_id });
+            accepted.push({
+              index, type: "text", custom_id: item.custom_id,
+              status: clientVector ? "completed" : "queued",
+              job_id: (result as { job_id?: string }).job_id,
+            });
 
           } else if (item.type === "url") {
             const result = await learnSourceContent({
@@ -1299,6 +1456,68 @@ api.post(
       items: accepted,
       trace_id: traceId,
     }, 202);
+  }
+);
+
+// ─── Chunk vectors ───────────────────────────────────────────
+
+/**
+ * Hands out the chunks whose vector came from a different model, so a client can embed them
+ * where the files live. One model per corpus is the goal; these two routes are how an existing
+ * corpus moves to it without re-reading a single file on the server.
+ */
+api.get(
+  "/v1/chunks/stale",
+  rateLimitMiddleware(RateLimits.ingest),
+  async (c) => {
+    const auth = c.get("auth") as AuthContext;
+    const project = await ensureLearnProject(auth, c.req.query("project"));
+    const model = String(c.req.query("model") || "");
+    if (!model) return c.json({ error: "model query parameter is required" }, 400);
+    const limit = Math.min(Number(c.req.query("limit") || 64), 256);
+    const rows = await prisma.$queryRaw<Array<{ id: string; content: string }>>`
+      SELECT id, content FROM chunks
+      WHERE "projectId" = ${project.id}
+        AND embedding IS NOT NULL
+        AND (metadata->>'embedding_model' IS NULL OR metadata->>'embedding_model' <> ${model})
+      ORDER BY id LIMIT ${limit}
+    `;
+    const [{ remaining }] = await prisma.$queryRaw<Array<{ remaining: bigint }>>`
+      SELECT count(*) AS remaining FROM chunks
+      WHERE "projectId" = ${project.id}
+        AND embedding IS NOT NULL
+        AND (metadata->>'embedding_model' IS NULL OR metadata->>'embedding_model' <> ${model})
+    `;
+    return c.json({ model, remaining: Number(remaining), chunks: rows });
+  }
+);
+
+api.post(
+  "/v1/chunks/vectors",
+  rateLimitMiddleware(RateLimits.ingest),
+  zValidator("json", z.object({
+    project: z.string().optional(),
+    model: z.string().min(1).max(120),
+    vectors: z.array(z.object({
+      id: z.string().uuid(),
+      embedding: z.array(z.number().finite()).length(1024),
+    })).min(1).max(256),
+  })),
+  async (c) => {
+    const auth = c.get("auth") as AuthContext;
+    const body = c.req.valid("json");
+    const project = await ensureLearnProject(auth, body.project);
+    let updated = 0;
+    for (const row of body.vectors) {
+      const literal = `[${row.embedding.join(",")}]`;
+      updated += await prisma.$executeRaw`
+        UPDATE chunks SET embedding = ${literal}::vector,
+               metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), '{embedding_model}', to_jsonb(${body.model}::text), true),
+               "updatedAt" = NOW()
+        WHERE id = ${row.id} AND "projectId" = ${project.id}
+      `;
+    }
+    return c.json({ success: true, model: body.model, updated });
   }
 );
 
@@ -1648,7 +1867,7 @@ api.get("/v1/projects/:id/stats", async (c) => {
     prisma.chunk.count({ where: { document: { projectId: project.id } } }),
     prisma.source.count({ where: { projectId: project.id } }),
     prisma.memory.count({ where: { projectId: project.id, isActive: true } }),
-    prisma.entity.count({ where: { projectId: project.id } }),
+    countGraphEntities(project.id),
   ]);
 
   return c.json({
@@ -2299,24 +2518,24 @@ api.get("/v1/sources/:sourceId/status", async (c) => {
       entities_extracted: result.entitiesExtracted ?? [],
       last_error: source.syncError || source.lastSyncError || activeJob?.error || null,
       updated_at: source.updatedAt,
-      partial_failure: result.partialFailure ?? source.sourceVersions?.[0]?.partialFailure ?? false,
-      documents_total: result.documentsTotal ?? source.sourceVersions?.[0]?.documentCount ?? source.documentCount ?? null,
-      documents_indexed: result.documentsIndexed ?? source.sourceVersions?.[0]?.documentCount ?? source.documentCount ?? null,
+      partial_failure: result.partialFailure ?? source.versions?.[0]?.partialFailure ?? false,
+      documents_total: result.documentsTotal ?? source.versions?.[0]?.documentCount ?? source.documentCount ?? null,
+      documents_indexed: result.documentsIndexed ?? source.versions?.[0]?.documentCount ?? source.documentCount ?? null,
       documents_failed: result.documentsFailed ?? 0,
-      warning_codes: result.warningCodes ?? source.sourceVersions?.[0]?.warningCodes ?? [],
-      error_code: result.errorCode ?? source.sourceVersions?.[0]?.errorCode ?? null,
+      warning_codes: result.warningCodes ?? source.versions?.[0]?.warningCodes ?? [],
+      error_code: result.errorCode ?? source.versions?.[0]?.errorCode ?? null,
       outcome:
         result.outcome ||
-        ((result.partialFailure ?? source.sourceVersions?.[0]?.partialFailure)
+        ((result.partialFailure ?? source.versions?.[0]?.partialFailure)
           ? "partial_failure"
-          : (result.errorCode ?? source.sourceVersions?.[0]?.errorCode)
+          : (result.errorCode ?? source.versions?.[0]?.errorCode)
             ? "failed"
             : "success"),
       mode: result.mode ?? activeJob?.mode ?? null,
       effective_mode: result.effectiveMode ?? activeJob?.effectiveMode ?? null,
       active_version: source.activeVersionId ?? null,
       restore_until: source.restoreUntil ?? null,
-      latest_version: source.sourceVersions?.[0] ? serializeSourceVersion(source.sourceVersions[0]) : null,
+      latest_version: source.versions?.[0] ? serializeSourceVersion(source.versions[0]) : null,
     })
   );
 });
@@ -2727,17 +2946,16 @@ api.post(
 
     const whereSql = Prisma.join(conditions, " AND ");
 
-    const memories = await prisma.$queryRaw(Prisma.sql`
-      SELECT
-        id, content, "memoryType", "userId",
-        "sessionId", "agentId", importance,
-        metadata, "accessCount", "createdAt",
-        1 - (embedding <=> ${queryEmbedding}::vector) as similarity
-      FROM memories
-      WHERE ${whereSql}
-      ORDER BY embedding <=> ${queryEmbedding}::vector
-      LIMIT ${body.top_k}
-    `);
+    const memories = await prisma.$queryRaw(exactDistanceOrder({
+      table: "memories",
+      alias: "m",
+      columns: Prisma.sql`m.id, m.content, m."memoryType", m."userId",
+        m."sessionId", m."agentId", m.importance,
+        m.metadata, m."accessCount", m."createdAt"`,
+      scope: whereSql,
+      embedding: `[${queryEmbedding.join(",")}]`,
+      limit: body.top_k,
+    }));
 
     // Update access counts
     const memoryIds = (memories as any[]).map((r: any) => r.id);
@@ -3042,187 +3260,113 @@ api.post(
 
 api.post(
   "/v1/entities",
-  zValidator(
-    "json",
-    z.object({
-      project: z.string().optional(),
-      name: z.string().min(1),
-      entity_type: z.string().min(1),
-      description: z.string().optional(),
-      metadata: z.record(z.any()).optional(),
-    })
-  ),
+  zValidator("json", z.object({
+    project: z.string().optional(),
+    name: z.string().min(1),
+    entity_type: z.string().min(1),
+    description: z.string().optional(),
+    metadata: z.record(z.any()).optional(),
+  })),
   async (c) => {
-    const auth = c.get("auth") as AuthContext;
+    const auth = c.get("auth");
     const body = c.req.valid("json");
-
     const project = await ensureProject(auth.orgId, body.project, auth.isAdmin);
-
-    const embedding = await embedSingle(`${body.entity_type}: ${body.name}${body.description ? ` - ${body.description}` : ""}`);
-
-    const entity = await prisma.entity.upsert({
-      where: {
-        projectId_name_entityType: {
-          projectId: project.id,
-          name: body.name,
-          entityType: body.entity_type,
-        },
-      },
-      update: {
-        description: body.description,
-        metadata: body.metadata || {},
-        embedding,
-        updatedAt: new Date(),
-      } as any,
-      create: {
-        projectId: project.id,
-        name: body.name,
-        entityType: body.entity_type,
-        description: body.description,
-        metadata: body.metadata || {},
-        embedding,
-      } as any,
+    const entity = await saveGraphEntity({
+      projectId: project.id, name: body.name, entityType: body.entity_type,
+      description: body.description, metadata: body.metadata,
     });
-
     return c.json(entity, 201);
   }
 );
 
 api.post(
-  "/v1/relations",
-  zValidator(
-    "json",
-    z.object({
-      project: z.string().optional(),
-      from_entity: z.string(),
-      from_type: z.string(),
-      to_entity: z.string(),
-      to_type: z.string(),
-      relation_type: z.enum([
-        "imports", "exports", "calls", "implements", "extends",
-        "references", "depends_on", "related_to", "part_of",
-        "contradicts", "supersedes",
-      ]),
-      weight: z.number().min(0).max(1).optional(),
-      metadata: z.record(z.any()).optional(),
-    })
-  ),
+  "/v1/graph/batch",
+  zValidator("json", z.object({
+    project: z.string().optional(),
+    entities: z.array(z.object({
+      name: z.string().min(1),
+      entity_type: z.string().min(1),
+      description: z.string().optional(),
+    })).default([]),
+    relations: z.array(z.object({
+      from_entity: z.string().min(1),
+      from_type: z.string().min(1),
+      to_entity: z.string().min(1),
+      to_type: z.string().min(1),
+      relation_type: entityRelationType,
+      source_chunk_id: z.string().optional(),
+    })).default([]),
+  })),
   async (c) => {
-    const auth = c.get("auth") as AuthContext;
+    const auth = c.get("auth");
     const body = c.req.valid("json");
-
     const project = await ensureProject(auth.orgId, body.project, auth.isAdmin);
-
-    // Find or create entities
-    const findOrCreateEntity = async (name: string, type: string) => {
-      const existing = await prisma.entity.findFirst({
-        where: {
-          projectId: project.id,
-          name,
-          entityType: type,
-        },
-      });
-
-      if (existing) return existing;
-
-      const embedding = await embedSingle(`${type}: ${name}`);
-      return await prisma.entity.create({
-        data: { projectId: project.id, name, entityType: type, embedding } as any,
-      });
-    };
-
-    const fromEntity = await findOrCreateEntity(body.from_entity, body.from_type);
-    const toEntity = await findOrCreateEntity(body.to_entity, body.to_type);
-
-    const relation = await prisma.entityRelation.upsert({
-      where: {
-        fromEntityId_toEntityId_relationType: {
-          fromEntityId: fromEntity.id,
-          toEntityId: toEntity.id,
-          relationType: body.relation_type,
-        },
-      },
-      update: {
-        weight: body.weight,
-        metadata: body.metadata || {},
-      },
-      create: {
-        projectId: project.id,
-        fromEntityId: fromEntity.id,
-        toEntityId: toEntity.id,
-        relationType: body.relation_type,
-        weight: body.weight,
-        metadata: body.metadata || {},
-      },
+    const written = await saveGraphBatch(project.id, {
+      entities: body.entities.map((entity) => ({
+        name: entity.name, entityType: entity.entity_type, description: entity.description,
+      })),
+      relations: body.relations.map((relation) => ({
+        from: { name: relation.from_entity, entityType: relation.from_type },
+        to: { name: relation.to_entity, entityType: relation.to_type },
+        type: relation.relation_type,
+        sourceChunkId: relation.source_chunk_id,
+      })),
     });
+    return c.json(written, 201);
+  }
+);
 
+api.post(
+  "/v1/relations",
+  zValidator("json", z.object({
+    project: z.string().optional(),
+    from_entity: z.string().min(1),
+    from_type: z.string().min(1),
+    to_entity: z.string().min(1),
+    to_type: z.string().min(1),
+    relation_type: entityRelationType,
+    weight: z.number().min(0).max(1).optional(),
+    metadata: z.record(z.any()).optional(),
+  })),
+  async (c) => {
+    const auth = c.get("auth");
+    const body = c.req.valid("json");
+    const project = await ensureProject(auth.orgId, body.project, auth.isAdmin);
+    const fromEntityId = await ensureGraphEntityId({ projectId: project.id, name: body.from_entity, entityType: body.from_type }, "manual");
+    const toEntityId = await ensureGraphEntityId({ projectId: project.id, name: body.to_entity, entityType: body.to_type }, "manual");
+    const relation = await saveGraphRelation({
+      projectId: project.id, fromEntityId, toEntityId, relationType: body.relation_type,
+      weight: body.weight, metadata: body.metadata,
+    });
     return c.json(relation, 201);
   }
 );
 
 api.post(
   "/v1/graph/search",
-  zValidator(
-    "json",
-    z.object({
-      project: z.string().optional(),
-      query: z.string().min(1),
-      entity_types: z.array(z.string()).optional(),
-      depth: z.number().int().min(1).max(3).optional().default(1),
-      top_k: z.number().int().min(1).max(50).optional().default(10),
-    })
-  ),
+  zValidator("json", z.object({
+    project: z.string().trim().min(1).optional(),
+    query: z.string().min(1),
+    entity_types: z.array(z.string()).optional(),
+    depth: z.number().int().min(1).max(3).optional().default(1),
+    top_k: z.number().int().min(1).max(50).optional().default(10),
+  })),
   async (c) => {
-    const auth = c.get("auth") as AuthContext;
+    const auth = c.get("auth");
     const body = c.req.valid("json");
-
-    const project = await ensureProject(auth.orgId, body.project, auth.isAdmin);
-
-    const queryEmbedding = await embedSingle(body.query);
-
-    // Entity search with proper parameterization
-    const relevantEntities = await prisma.$queryRaw(Prisma.sql`
-      SELECT
-        id, name, "entityType", description, metadata,
-        1 - (embedding <=> ${queryEmbedding}::vector) as similarity
-      FROM entities
-      WHERE "projectId" = ${project.id}
-        ${body.entity_types && body.entity_types.length > 0 
-          ? Prisma.sql`AND "entityType" IN (${Prisma.join(body.entity_types)})` 
-          : Prisma.sql``}
-      ORDER BY embedding <=> ${queryEmbedding}::vector
-      LIMIT ${body.top_k}
-    `);
-
-    // Get relations for found entities
-    const entityIds = (relevantEntities as any[]).map((e: any) => e.id);
-    let rels: any[] = [];
-
-    if (entityIds.length > 0) {
-      rels = await prisma.entityRelation.findMany({
-        where: {
-          projectId: project.id,
-          OR: [
-            { fromEntityId: { in: entityIds } },
-            { toEntityId: { in: entityIds } },
-          ],
-        },
-        select: {
-          id: true,
-          fromEntityId: true,
-          toEntityId: true,
-          relationType: true,
-          weight: true,
-        },
-      });
-    }
-
+    const project = body.project ? await resolveProjectReference(auth.orgId, body.project) : null;
+    if (body.project && !project) return c.json({ error: "Project not found", code: "PROJECT_NOT_FOUND" }, 404);
+    const tagLookup = body.entity_types?.length && body.entity_types.every(type => type === KNOWLEDGE_TAG_SELECTOR);
+    const { vector, model } = tagLookup ? { vector: [], model: null } : await embedSingleWithModel(body.query);
+    const { entities, relations } = await searchEntityGraph({
+      scope: { orgId: auth.orgId, projectId: project?.id }, query: body.query, embedding: vector, embeddingModel: model,
+      depth: body.depth, topK: body.top_k, entityTypes: body.entity_types,
+    });
     return c.json({
-      entities: (relevantEntities as any[]).map((e: any) => ({
-        ...e,
-        score: Math.round(e.similarity * 1000) / 1000,
+      entities: entities.map((entity) => ({
+        ...entity, score: Math.round(entity.similarity * 1000) / 1000,
       })),
-      relations: rels,
+      relations,
     });
   }
 );
@@ -3460,6 +3604,7 @@ api.get("/v1/admin/ops/routes", async (c) => {
   return c.json({
     routes: getNodeRouteMatrix(),
     latency: getLatencySummary({ top: 100, minCount: 1, includeSlowEvents: false }),
+    claims: await claimMetrics(),
   });
 });
 
@@ -3601,4 +3746,3 @@ api.post(
 );
 
 // ─── SimpleClaw Provisioning (Admin only) ────────────────────
-

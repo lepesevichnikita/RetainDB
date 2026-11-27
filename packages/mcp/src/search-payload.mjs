@@ -32,6 +32,7 @@ export function normalizeSearchResults(results) {
                 : null,
       source: result?.source ? String(result.source) : result?.chunk ? "memory" : null,
       document: result?.document ? String(result.document) : result?.chunk?.id ? String(result.chunk.id) : null,
+      ...(typeof result?.project === "string" ? { project: result.project } : {}),
       metadata:
         result?.metadata && typeof result.metadata === "object" && !Array.isArray(result.metadata)
           ? result.metadata
